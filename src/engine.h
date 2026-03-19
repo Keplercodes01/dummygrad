@@ -1,0 +1,545 @@
+//Dummygrad
+
+#include<unordered_set>
+#include<memory>
+#include<set>
+#include<cmath>
+#include<random>
+#include<iostream>
+#include<vector>
+#include<functional>
+
+//Tensor 
+class Tensor {
+    public:
+        std::vector<float> data;
+        std::vector<float> grad;
+        std::vector<int> shape;
+        std::function<void()> backward_fn;
+        std::vector<std::shared_ptr<Tensor>> prev;
+
+        Tensor(std::vector<int> s) : shape(s) {  
+
+            //get total elements of tensor 
+            int total = 1;  
+            for (int dim : shape) {
+                total *= dim;
+            }
+
+            //allocate and initialise
+            data.resize(total, 0.0f);
+            grad.resize(total, 0.0f);
+        };
+
+        float get(int i) { return data[i]; }
+        void set(int i, float val) { data[i] = val; }
+        int size() { return data.size(); } 
+
+        void zero_grad() {
+            for(int i=0; i<grad.size(); i++) {
+                grad[i] = 0.0f; 
+            }
+        }    
+
+        void fill(std::vector<float> values) {
+            if (values.size() != data.size()) {
+                throw std::runtime_error("size mismatch..."); 
+            }
+            data = values;
+        }
+
+        void show() {
+            int r = shape[0];
+            int c = shape[1];
+
+            std::cout<<"Tensor(";
+            for(int i = 0; i<r; i++) {
+                std::cout<< (i==0 ? "[[" : "        [");       
+                
+                for(int j = 0; j<c; j++) {
+                    std::cout<< data[i*c + j] << (j==c-1 ? "" : ",");
+                }
+                std::cout<<(i == r-1 ? "]]" : "],\n");
+            }
+            std::cout<<", shape=("<<r<<","<<c<<"))"<<std::endl;
+        }
+        void show_grad() {
+            int r = shape[0];
+            int c = shape[1];
+
+            std::cout<<"Tensor(";
+            for(int i = 0; i<r; i++) {
+                std::cout<< (i==0 ? "[[" : "        [");       
+                
+                for(int j = 0; j<c; j++) {
+                    std::cout<< grad[i*c + j] << (j==c-1 ? "" : ",");
+                }
+                std::cout<<(i == r-1 ? "]]" : "],\n");
+            }
+            std::cout<<", shape=("<<r<<","<<c<<"))"<<std::endl;
+        }
+
+        //autograd 
+        void backward() {
+
+            if(this->size() > 1) {
+                throw std::runtime_error("Grad can only be initialized to 1.0 for scalars (size 1). Sum or mean your tensor first, man!");
+            }
+
+            this->grad[0] = 1.0f;
+
+            std::vector<Tensor*> topo;
+            std::unordered_set<Tensor*> visited;
+
+            std::function<void(Tensor*)> build_topo = [&](Tensor* t) {
+                if(visited.count(t)) return;
+                visited.insert(t);
+
+                for(auto& parent : t->prev) {
+                    build_topo(parent.get());
+                }
+                topo.push_back(t);
+            };
+            build_topo(this);
+
+            for(int i=topo.size()-1; i>=0; i--) {
+                if(topo[i]->backward_fn) {
+                    topo[i]->backward_fn();
+                }
+            }
+        }
+};
+
+//randn        
+inline std::mt19937 g_gen(std::random_device{}());
+
+inline void manual_seed(unsigned int seed) {
+    g_gen.seed(seed);
+}
+
+inline std::shared_ptr<Tensor> randn(std::vector<int> shape) {
+
+    auto t = std::make_shared<Tensor>(shape);
+    float k = std::sqrt(1.0f/(float)shape[0]);
+
+    std::uniform_real_distribution<float> dis(-k, k);
+
+    for(int i=0; i<t->size(); i++) {
+        t->data[i] = dis(g_gen);
+    }
+
+    return t;
+}
+
+//Operations
+
+//add
+inline std::shared_ptr<Tensor> add(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
+
+    if(a->shape != b->shape) {
+        throw std::runtime_error("Shape mismatch in addition. Cmon man..");
+    }
+
+    auto out = std::make_shared<Tensor>(a->shape);
+
+    for(int i=0; i<out->size(); i++) {
+        out->data[i] = a->data[i] + b->data[i];
+    }
+
+    out->prev.push_back(a);
+    out->prev.push_back(b);
+
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [a, b, weak_out]() {
+        if(auto self = weak_out.lock()) {
+            for(int i=0; i<a->size(); i++) {
+                a->grad[i] += self->grad[i];
+                b->grad[i] += self->grad[i];
+            }
+        }    
+    };
+
+    return out;
+}
+                         
+//sub
+inline std::shared_ptr<Tensor> sub(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
+
+    if(a->shape != b->shape) {
+        throw std::runtime_error("Shape mismatch in subtraction. Cmon man..");
+    }
+
+    auto out = std::make_shared<Tensor>(a->shape);
+
+    for(int i=0; i<out->size(); i++) {
+        out->data[i] = a->data[i] - b->data[i];
+    }
+
+    out->prev.push_back(a);
+    out->prev.push_back(b);
+
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [a, b, weak_out]() {
+        if(auto self = weak_out.lock()) {
+            for(int i=0; i<a->size(); i++) {
+                a->grad[i] += self->grad[i];
+                b->grad[i] -= self->grad[i];
+            }
+        }
+    };
+
+    return out;
+}
+
+//mul
+inline std::shared_ptr<Tensor> mul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
+
+    if(a->shape != b->shape) {
+        throw std::runtime_error("Shape mismatch in multiplication. Cmon man..");
+    }
+
+    auto out = std::make_shared<Tensor>(a->shape);
+
+    for(int i=0; i<out->size(); i++) {
+        out->data[i] = a->data[i] * b->data[i];
+    }
+
+    out->prev.push_back(a);
+    out->prev.push_back(b);
+
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [a, b, weak_out]() {
+        if(auto self = weak_out.lock()) {
+            for(int i=0; i<a->size(); i++) {
+                a->grad[i] += b->data[i] * self->grad[i];
+                b->grad[i] += a->data[i] * self->grad[i];
+            }
+        }
+    };
+
+    return out;
+}
+
+//divide
+inline std::shared_ptr<Tensor> div(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
+
+    if(a->shape != b->shape) {
+        throw std::runtime_error("Shape mismatch in division. Cmon man..");
+    }
+
+    auto out = std::make_shared<Tensor>(a->shape);
+
+    for(int i=0; i<out->size(); i++) {
+        out->data[i] = a->data[i] / b->data[i];
+    }
+
+    out->prev.push_back(a);
+    out->prev.push_back(b);
+
+    std::weak_ptr<Tensor> weak_out = out; 
+
+    out->backward_fn = [a, b, weak_out]() {
+        if(auto self = weak_out.lock()) {
+            for(int i=0; i<a->size(); i++) {
+                a->grad[i] += self->grad[i] / b->data[i];
+                b->grad[i] -= a->data[i] * self->grad[i] / (b->data[i] * b->data[i]);
+            }
+        }
+    };
+
+    return out;
+}
+
+//transpose 
+inline std::shared_ptr<Tensor> transpose(const std::shared_ptr<Tensor>& a) {
+
+    int r = a->shape[0];
+    int c = a->shape[1];
+
+    auto out = std::make_shared<Tensor>(std::vector<int>{c, r});
+    
+    for(int i=0; i<r; i++) {
+        for(int j=0; j<c; j++) {
+            out->data[j*r + i] = a->data[i*c + j];
+        }
+    }
+
+    out->prev.push_back(a);
+
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [a, weak_out, r, c]() {
+        if(auto self = weak_out.lock()) {
+            for(int i=0; i<r; i++) {
+                for(int j=0; j<c; j++) {
+                    a->grad[i * c + j] += self->grad[j * r + i];
+                }
+            }
+        }
+    };
+
+    return out;
+}
+
+//the mighty matmul
+inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
+
+    int r1 = a->shape[0];
+    int c1 = a->shape[1];
+    int r2 = b->shape[0];
+    int c2 = b->shape[1];
+
+    if(c1 != r2) throw std::runtime_error("Matmul dimension mismatch...cmon man");
+
+    auto out = std::make_shared<Tensor>(std::vector<int>{r1, c2});
+
+    for(int i=0; i<r1; i++) {
+        for(int j = 0; j<c2; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < c1; k++) {
+                sum += a->data[i*c1 + k] * b->data[k*c2 + j];
+            }
+            out->data[i*c2 + j] = sum;
+        }
+    }
+
+    out->prev.push_back(a);
+    out->prev.push_back(b);
+
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [a, b, weak_out, r1, c1, r2, c2]() {
+        if(auto self = weak_out.lock()) {
+            //a.grad
+            for(int i=0; i<r1; i++) {
+                for(int j=0; j<c1; j++) {
+                    float sum = 0.0f;
+                    for(int k=0; k<c2; k++) {
+                        sum += self->grad[i*c2 + k] * b->data[j*c2 + k];
+                    }
+                    a->grad[i*c1 + j] += sum;
+                }
+            }
+            //b.grad
+            for(int i=0; i<r2; i++) {
+                for(int j=0; j<c2; j++) {
+                    float sum = 0.0f;
+                    for(int k=0; k<r1; k++) {
+                        sum += a->data[k*c1 + i] * self->grad[k*c2 + j];
+                    }
+                    b->grad[i*c2 + j] += sum;
+                }    
+            }
+        }
+    };
+
+    return out;
+}
+
+//log
+inline std::shared_ptr<Tensor> log(const std::shared_ptr<Tensor>& a) {
+
+    auto out = std::make_shared<Tensor>(a->shape); 
+
+    float epsilon = 1e-8f;
+    for(int i=0; i<out->size(); i++) {
+        out->data[i] = std::log(a->data[i] + epsilon);
+    }
+    out->prev.push_back(a);
+
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [a, weak_out, epsilon]() {
+        if(auto self = weak_out.lock()) {
+            for(int i=0; i<a->size(); i++) {
+                a->grad[i] += self->grad[i] * (1.0f / (a->data[i] + epsilon));
+            }
+        }
+    };
+    return out;
+}
+
+//exp
+inline std::shared_ptr<Tensor> exp(const std::shared_ptr<Tensor>& a) {
+
+    auto out = std::make_shared<Tensor>(a->shape);
+
+    for(int i=0; i<out->size(); i++) {
+        out->data[i] = std::exp(a->data[i]);
+    }
+    out->prev.push_back(a);
+
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [a, weak_out]() {
+        if(auto self = weak_out.lock()) {
+            for(int i=0; i<a->size(); i++) {
+                a->grad[i] += self->grad[i] * self->data[i];
+            }
+        }
+    };
+    return out; 
+}
+
+//sum
+inline std::shared_ptr<Tensor> sum(const std::shared_ptr<Tensor>& a) {
+    int r = a->shape[0];
+    int c = a->shape[1];
+
+    auto out = std::make_shared<Tensor>(std::vector<int>{1, 1}); 
+
+    float total = 0.0f;
+    for(float val : a->data) {
+        total += val;
+    }
+    out->data[0] = total;
+
+    out->prev.push_back(a);
+
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [a, weak_out]() {
+        if(auto self = weak_out.lock()) {
+            for(float &g : a->grad) {
+                g += self->grad[0];
+            }
+        }
+    };
+    return out;
+}
+
+//mean
+inline std::shared_ptr<Tensor> mean(const std::shared_ptr<Tensor>& a) {
+
+    auto out = std::make_shared<Tensor>(std::vector<int>{1, 1}); 
+
+    float sum = 0.0f;
+    for(int i=0; i<a->size(); i++) {
+        sum += a->data[i];
+    }
+    out->data[0] = sum/(a->size());
+
+    out->prev.push_back(a);
+
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [a, weak_out]() {
+        if(auto self = weak_out.lock()) {
+            float gradient = self->grad[0] / a->size();
+            for(float &g : a->grad) {
+                g += gradient; 
+            }
+        }
+    };
+
+    return out;
+}
+
+//Activation functions
+
+//relu
+inline std::shared_ptr<Tensor> relu(const std::shared_ptr<Tensor>& a) {
+
+    auto out = std::make_shared<Tensor>(a->shape);
+
+    for(int i = 0; i<a->size(); i++) {
+        out->data[i] = std::max(0.0f, a->data[i]); 
+    }
+    out->prev.push_back(a);
+
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [a, weak_out]() {
+        if(auto self = weak_out.lock()) {
+            for(int i=0; i<a->size(); i++) {
+                if(a->data[i]>0.0f) {
+                    a->grad[i] += self->grad[i];
+                }
+            }
+        }
+    };
+
+    return out;
+}
+
+//Loss functions
+
+//CrossEntropyLoss
+inline std::shared_ptr<Tensor> CrossEntropyLoss(const std::shared_ptr<Tensor>& pred, const std::shared_ptr<Tensor>& target) {
+    if(pred->shape != target->shape) {
+        throw std::runtime_error("The shape of your prediction and target doesn't match man..");
+    }
+
+    float sum_loss = 0.0f;
+    for(int i=0; i<pred->size(); i++) {
+        sum_loss -= target->data[i] * std::log(pred->data[i]);
+    }
+
+    auto out = std::make_shared<Tensor>(std::vector<int>{1, 1});
+
+    float n = static_cast<float>(pred->size());
+
+    out->data[0] = sum_loss / n; 
+
+    out->prev.push_back(pred);
+
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [pred, target, weak_out, n]() {
+        if(auto self = weak_out.lock()) {
+            for(int i=0; i<pred->size(); i++) {
+                pred->grad[i] += -(target->data[i] / (pred->data[i] * n)) * self->grad[0]; 
+            }
+        }
+    };
+
+    return out;
+}
+
+//Optimizers
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
