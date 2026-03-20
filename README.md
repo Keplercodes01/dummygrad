@@ -4,7 +4,7 @@ Inspired by Karpathy's micrograd but for real tensors.
 
 ## Features
 - Forward and backward pass
-- Matmul, add, sub, mul, div, relu, softmax, log, exp
+- Matmul, add, sub, mul, div, relu, softmax, log, exp and more
 - Topological sort for automatic gradient computation
 
 ## Usage
