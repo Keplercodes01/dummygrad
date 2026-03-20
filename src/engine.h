@@ -438,6 +438,52 @@ inline std::shared_ptr<Tensor> mean(const std::shared_ptr<Tensor>& a) {
     return out;
 }
 
+//softmax
+inline std::shared_ptr<Tensor> softmax(const std::shared_ptr<Tensor>& a) {
+    int r = a->shape[0];
+    int c = a->shape[1];
+
+    auto out = std::make_shared<Tensor>(a->shape);
+
+    for(int i = 0; i<r; i++) {
+        float max_val = a->data[i*c];
+        for(int m = 1; m<c; m++) {
+            max_val = std::max(max_val, a->data[i*c + m]);
+        }
+        float sum = 0.0f;
+        for(int j = 0; j<c; j++) {
+            sum += std::exp(a->data[i*c + j] - max_val);
+        }
+        for(int k = 0; k<c; k++) {
+            out->data[i*c + k] = std::exp(a->data[i*c + k] - max_val) / sum;
+        }
+    }
+    out->prev.push_back(a);
+
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [a, weak_out, r, c]() {
+        if(auto self = weak_out.lock()) {
+            for(int i = 0; i<r; i++) {
+                float max_val = a->data[i*c];
+                for(int m = 1; m<c; m++) {
+                    max_val = std::max(max_val, a->data[i*c + m]);
+                }
+                float sum = 0.0f;
+                for(int j = 0; j<c; j++) {
+                    sum += std::exp(a->data[i*c + j] - max_val);
+                }
+                for(int k = 0; k<c; k++) {
+                    float y_k = std::exp(a->data[i*c + k] - max_val);
+                    a->grad[i*c + k] += (y_k * (sum - y_k) / (sum*sum)) * self->grad[i*c + k];
+                }
+            }
+        }
+    };
+
+    return out;
+}
+
 //Activation functions
 
 //relu
@@ -500,9 +546,6 @@ inline std::shared_ptr<Tensor> CrossEntropyLoss(const std::shared_ptr<Tensor>& p
 }
 
 //Optimizers
-
-
-
 
 
 

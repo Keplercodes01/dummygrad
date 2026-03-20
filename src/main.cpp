@@ -15,7 +15,7 @@ int main() {
     auto d = randn({3,3});
     auto e = mul(c, d);
 
-    auto l = sum(e);
+    auto l = mean(e);
 
     l->backward();
 
