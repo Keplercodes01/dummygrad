@@ -7,43 +7,19 @@ int main() {
 
     manual_seed(42);
 
-    auto a = randn({3,3}); 
-    auto b = randn({3,3});
+    auto w = randn({3, 3});
+    auto optimizer = Adam(0.001f); 
 
-    auto c = matmul(a, b); 
+    for(int i = 0; i<100; i++) {
+        auto l = mean(w);
+        l->backward();
+        optimizer.step(w);
+        w->zero_grad();
 
-    auto d = randn({3,3});
-    auto e = mul(c, d);
-
-    auto l = mean(e);
-
-    l->backward();
-
-    std::cout<<"e: "<<std::endl;
-    e->show();
-    std::cout<<"d: "<<std::endl;
-    d->show();
-    std::cout<<"c: "<<std::endl;
-    c->show();
-    std::cout<<"b: "<<std::endl;
-    b->show();
-    std::cout<<"a: "<<std::endl;
-    a->show();
-    std::cout<<"l: "<<std::endl;
-    l->show();
-
-    std::cout<<"grad of e: "<<std::endl;
-    e->show_grad();
-    std::cout<<"grad of d: "<<std::endl;
-    d->show_grad();
-    std::cout<<"grad of c: "<<std::endl;
-    c->show_grad();
-    std::cout<<"grad of b: "<<std::endl;
-    b->show_grad();
-    std::cout<<"grad of a: "<<std::endl;
-    a->show_grad();
-    std::cout<<"grad of l: "<<std::endl;
-    l->show_grad();
+        if(i%10 == 0) {
+            std::cout<<"step "<<i<<" loss: "<<l->data[0]<<std::endl;
+        }
+    }
     
     return 0;
 }

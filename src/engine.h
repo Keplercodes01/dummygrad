@@ -131,6 +131,112 @@ inline std::shared_ptr<Tensor> randn(std::vector<int> shape) {
     return t;
 }
 
+//Broadcasting 
+
+//broadcast
+inline std::shared_ptr<Tensor> broadcast(const std::shared_ptr<Tensor>& a, int axis, int n) {
+    int r = a->shape[0];
+    int c = a->shape[1];
+
+    auto out = std::make_shared<Tensor>(
+            axis == 0 ? std::vector<int>{n, c} : std::vector<int>{r, n}
+    );
+
+    if(axis == 0) {
+        for(int i = 0; i<n; i++) {
+            for(int j = 0; j<c; j++) {
+                out->data[i*c + j] = a->data[j];
+            }
+        }
+    }
+    else {
+        for(int i = 0; i<r; i++) {
+            for(int j = 0; j<n; j++) {
+                out->data[i*n + j] = a->data[i];
+            }
+        }
+    }
+
+    out->prev.push_back(a);
+
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [a, weak_out, r, c, n, axis]() {
+        if(auto self = weak_out.lock()) {
+            if(axis == 0) {
+                for(int i = 0; i<n; i++) {
+                    for(int j = 0; j<c; j++) {
+                        a->grad[j] += self->grad[i*c + j];
+                    }
+                }
+            }
+            else {
+                for(int i = 0; i<r; i++) {
+                    for(int j = 0; j<n; j++) {
+                        a->grad[i] += self->grad[i*n + j];
+                    }
+                }
+            }
+        }
+    };
+
+    return out;
+}
+
+//collapse
+inline std::shared_ptr<Tensor> collapse(const std::shared_ptr<Tensor>& a, int axis) {
+    int r = a->shape[0];
+    int c = a->shape[1];
+
+    auto out = std::make_shared<Tensor>(
+            axis == 0 ? std::vector<int>{1, c} : std::vector<int>{r, 1}
+    );
+
+    if(axis == 0) {
+        for(int i = 0; i<c; i++) {
+            float total = 0.0f; 
+            for(int j = 0; j<r; j++) {
+                total += a->data[j*c + i];
+            }
+            out->data[i] = total;
+        }
+    }
+    else {
+        for(int i = 0; i<r; i++) {
+            float total = 0.0f;
+            for(int j = 0; j<c; j++) {
+                total += a->data[i*c + j];
+            }
+            out->data[i] = total;
+        }
+    }
+
+    out->prev.push_back(a);
+
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [a, weak_out, r, c, axis]() {
+        if(auto self = weak_out.lock()) {
+            if(axis == 0) {
+                for(int i = 0; i<c; i++) {
+                    for(int j = 0; j<r; j++) {
+                        a->grad[j*c + i] += self->grad[i];
+                    }
+                }
+            }
+            else {
+                for(int i = 0; i<r; i++) {
+                    for(int j = 0; j<c; j++) {
+                        a->grad[i*c + j] += self->grad[i];
+                    }
+                }
+            }
+        }
+    };
+
+    return out;
+}
+
 //Operations
 
 //add
@@ -547,8 +653,41 @@ inline std::shared_ptr<Tensor> CrossEntropyLoss(const std::shared_ptr<Tensor>& p
 
 //Optimizers
 
+//SGD
+inline void SGD(const std::shared_ptr<Tensor>& param, const float& lr) {
+    for(int i = 0; i<param->size(); i++) {
+        param->data[i] -= lr * param->grad[i];
+    }
+}
 
+//Adam the great 
+class Adam {
+    std::vector<float> m, v;
+    int t = 0; 
+    float lr, b1, b2, E;
 
+    public:
+        Adam(float lr = 0.001f, float b1 = 0.9f, float b2 = 0.999f, float E = 1e-8f)
+            : lr(lr), b1(b1), b2(b2), E(E) {}
+
+        void step(const std::shared_ptr<Tensor>& param) {
+            if(m.empty()) {
+                m.resize(param->size(), 0.0f);
+                v.resize(param->size(), 0.0f);
+            }
+            t++;
+            for(int i = 0; i<param->size(); i++) {
+                m[i] = b1*m[i] + (1-b1)*param->grad[i];
+                v[i] = b2*v[i] + (1-b2)*param->grad[i]*param->grad[i];
+
+                float m_hat = m[i] / (1 - std::pow(b1, t)); 
+                float v_hat = v[i] / (1 - std::pow(b2, t)); 
+
+                //update
+                param->data[i] -= lr * m_hat / (std::sqrt(v_hat) + E);
+            }
+        }
+};
 
 
 
