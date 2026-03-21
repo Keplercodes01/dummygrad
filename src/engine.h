@@ -445,6 +445,52 @@ inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const st
     return out;
 }
 
+//pow
+inline std::shared_ptr<Tensor> pow(const std::shared_ptr<Tensor>& a, const int n) {
+    auto out = std::make_shared<Tensor>(a->shape);
+
+    for(int i = 0; i<a->size(); i++) {
+        out->data[i] = std::pow(a->data[i], n);
+    }
+
+    out->prev.push_back(a);
+
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [a, weak_out, n]() {
+        if(auto self = weak_out.lock()) {
+            for(int i = 0; i<a->size(); i++) {
+                a->grad[i] += n * std::pow(a->data[i], n-1) * self->grad[i];
+            }
+        }
+    };
+
+    return out;
+}
+
+//sqrt
+inline std::shared_ptr<Tensor> sqrt(const std::shared_ptr<Tensor>& a) {
+    auto out = std::make_shared<Tensor>(a->shape);
+
+    for(int i = 0; i<a->size(); i++) {
+        out->data[i] = std::sqrt(a->data[i]);
+    }
+
+    out->prev.push_back(a);
+
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [a, weak_out]() {
+        if(auto self = weak_out.lock()) {
+            for(int i = 0; i<a->size(); i++) {
+                a->grad[i] += (0.5f / std::sqrt(a->data[i])) * self->grad[i];
+            }
+        }
+    };
+
+    return out;
+}
+
 //log
 inline std::shared_ptr<Tensor> log(const std::shared_ptr<Tensor>& a) {
 
