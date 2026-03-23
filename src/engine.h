@@ -73,6 +73,7 @@ class Tensor {
                 std::cout<<(i == r-1 ? "]]" : "],\n");
             }
             std::cout<<", shape=("<<r<<","<<c<<"))"<<std::endl;
+            std::cout.flush();
         }
 
         //show the gradients of the tensor
@@ -90,6 +91,7 @@ class Tensor {
                 std::cout<<(i == r-1 ? "]]" : "],\n");
             }
             std::cout<<", shape=("<<r<<","<<c<<"))"<<std::endl;
+            std::cout.flush();
         }
 
         //autograd 
