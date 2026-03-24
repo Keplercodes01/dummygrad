@@ -58,42 +58,6 @@ class Tensor {
             data = values;
         }
 
-        //show the tensor
-        void show() {
-            int r = shape[0];
-            int c = shape[1];
-
-            std::cout<<"Tensor(";
-            for(int i = 0; i<r; i++) {
-                std::cout<< (i==0 ? "[[" : "        [");       
-                
-                for(int j = 0; j<c; j++) {
-                    std::cout<< data[i*c + j] << (j==c-1 ? "" : ",");
-                }
-                std::cout<<(i == r-1 ? "]]" : "],\n");
-            }
-            std::cout<<", shape=("<<r<<","<<c<<"))"<<std::endl;
-            std::cout.flush();
-        }
-
-        //show the gradients of the tensor
-        void show_grad() {
-            int r = shape[0];
-            int c = shape[1];
-
-            std::cout<<"Tensor(";
-            for(int i = 0; i<r; i++) {
-                std::cout<< (i==0 ? "[[" : "        [");       
-                
-                for(int j = 0; j<c; j++) {
-                    std::cout<< grad[i*c + j] << (j==c-1 ? "" : ",");
-                }
-                std::cout<<(i == r-1 ? "]]" : "],\n");
-            }
-            std::cout<<", shape=("<<r<<","<<c<<"))"<<std::endl;
-            std::cout.flush();
-        }
-
         //autograd 
         void backward() {
 
