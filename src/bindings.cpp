@@ -11,8 +11,7 @@ PYBIND11_MODULE(dummygrad, m) {
         .def(py::init<std::vector<int>>())
         .def("__repr__", [](Tensor& t) {
             std::function<std::string(std::vector<float>&, std::vector<int>&, int, int)> fmt;
-            fmt = [&](std::vector<float>& data, std::vector<int>& shape, int offset, int depth) -> std::string {
-                std::string indent(depth * 2, ' ');
+            fmt = [&](std::vector<float>& data, std::vector<int>& shape, int offset, int indent) -> std::string {
                 if(shape.size() == 1) {
                     std::string s = "[";
                     for(int i = 0; i < shape[0]; i++) {
@@ -23,16 +22,19 @@ PYBIND11_MODULE(dummygrad, m) {
                 }
                 int stride = 1;
                 for(int i = 1; i < shape.size(); i++) stride *= shape[i];
-                std::vector<int> inner_shape(shape.begin()+1, shape.end());
-                std::string s = "[\n";
+                std::vector<int> inner(shape.begin()+1, shape.end());
+                std::string pad(indent + 1, ' ');
+                std::string s = "[";
                 for(int i = 0; i < shape[0]; i++) {
-                    s += indent + "  " + fmt(data, inner_shape, offset + i*stride, depth+1);
-                    if(i < shape[0]-1) s += ",";
-                    s += "\n";
+                    if(i > 0) s += pad;
+                    s += fmt(data, inner, offset + i*stride, indent + 1);
+                    if(i < shape[0]-1) s += ",\n";
                 }
-                return s + indent + "]";
+                return s + "]";
             };
-            std::string result = "Tensor(" + fmt(t.data, t.shape, 0, 0) + ", shape=[";
+            std::string result = "Tensor(";
+            result += fmt(t.data, t.shape, 0, 7);  // 7 = length of "Tensor("
+            result += ", shape=[";
             for(int i = 0; i < t.shape.size(); i++) {
                 result += std::to_string(t.shape[i]);
                 if(i < t.shape.size()-1) result += ", ";
