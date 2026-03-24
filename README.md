@@ -22,6 +22,7 @@ Supports n-dimensional tensors, automatic differentiation, and a full suite of o
 
 ## Installation
 
+### Linux
 ```bash
 git clone https://github.com/Keplercodes01/dummygrad.git
 cd dummygrad
@@ -29,7 +30,26 @@ pip install pybind11
 pip install .
 ```
 
----
+### macOS
+```bash
+xcode-select --install
+git clone https://github.com/Keplercodes01/dummygrad.git
+cd dummygrad
+pip install pybind11
+pip install .
+```
+
+### Google Colab
+```python
+!git clone https://github.com/Keplercodes01/dummygrad.git
+%cd dummygrad
+!apt-get install -y build-essential
+!pip install pybind11
+!pip install .
+```
+
+### Windows
+i feel for you man. Stop using windows.
 
 ## Usage
 
