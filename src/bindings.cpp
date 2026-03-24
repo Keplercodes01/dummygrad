@@ -9,6 +9,8 @@ PYBIND11_MODULE(dummygrad, m) {
 
     py::class_<Tensor, std::shared_ptr<Tensor>>(m, "Tensor")
         .def(py::init<std::vector<int>>())
+
+        //repr
         .def("__repr__", [](Tensor& t) {
             std::function<std::string(std::vector<float>&, std::vector<int>&, int, int)> fmt;
             fmt = [&](std::vector<float>& data, std::vector<int>& shape, int offset, int indent) -> std::string {
@@ -41,6 +43,41 @@ PYBIND11_MODULE(dummygrad, m) {
             }
             return result + "])";
         })
+        
+        //show_grad
+        .def("show_grad", [](Tensor& t) {
+            std::function<std::string(std::vector<float>&, std::vector<int>&, int, int)> fmt;
+            fmt = [&](std::vector<float>& data, std::vector<int>& shape, int offset, int indent) -> std::string {
+                if(shape.size() == 1) {
+                    std::string s = "[";
+                    for(int i = 0; i < shape[0]; i++) {
+                        s += std::to_string(data[offset + i]);
+                        if(i < shape[0]-1) s += ", ";
+                    }
+                    return s + "]";
+                }
+                int stride = 1;
+                for(int i = 1; i < shape.size(); i++) stride *= shape[i];
+                std::vector<int> inner(shape.begin()+1, shape.end());
+                std::string pad(indent + 1, ' ');
+                std::string s = "[";
+                for(int i = 0; i < shape[0]; i++) {
+                    if(i > 0) s += pad;
+                    s += fmt(data, inner, offset + i*stride, indent + 1);
+                    if(i < shape[0]-1) s += ",\n";
+                }
+                return s + "]";
+            };
+            std::string result = "Grad(";
+            result += fmt(t.grad, t.shape, 0, 5);  // 5 = length of "Grad("
+            result += ", shape=[";
+            for(int i = 0; i < t.shape.size(); i++) {
+                result += std::to_string(t.shape[i]);
+                if(i < t.shape.size()-1) result += ", ";
+            }
+            return result + "])";
+        })
+
         .def("backward", &Tensor::backward)
         .def("zero_grad", &Tensor::zero_grad)
         .def("get", &Tensor::get)
