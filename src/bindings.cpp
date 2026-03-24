@@ -9,6 +9,36 @@ PYBIND11_MODULE(dummygrad, m) {
 
     py::class_<Tensor, std::shared_ptr<Tensor>>(m, "Tensor")
         .def(py::init<std::vector<int>>())
+        .def("__repr__", [](Tensor& t) {
+            std::function<std::string(std::vector<float>&, std::vector<int>&, int, int)> fmt;
+            fmt = [&](std::vector<float>& data, std::vector<int>& shape, int offset, int depth) -> std::string {
+                std::string indent(depth * 2, ' ');
+                if(shape.size() == 1) {
+                    std::string s = "[";
+                    for(int i = 0; i < shape[0]; i++) {
+                        s += std::to_string(data[offset + i]);
+                        if(i < shape[0]-1) s += ", ";
+                    }
+                    return s + "]";
+                }
+                int stride = 1;
+                for(int i = 1; i < shape.size(); i++) stride *= shape[i];
+                std::vector<int> inner_shape(shape.begin()+1, shape.end());
+                std::string s = "[\n";
+                for(int i = 0; i < shape[0]; i++) {
+                    s += indent + "  " + fmt(data, inner_shape, offset + i*stride, depth+1);
+                    if(i < shape[0]-1) s += ",";
+                    s += "\n";
+                }
+                return s + indent + "]";
+            };
+            std::string result = "Tensor(" + fmt(t.data, t.shape, 0, 0) + ", shape=[";
+            for(int i = 0; i < t.shape.size(); i++) {
+                result += std::to_string(t.shape[i]);
+                if(i < t.shape.size()-1) result += ", ";
+            }
+            return result + "])";
+        })
         .def("backward", &Tensor::backward)
         .def("zero_grad", &Tensor::zero_grad)
         .def("get", &Tensor::get)
