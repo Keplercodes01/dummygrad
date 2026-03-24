@@ -49,7 +49,7 @@ pip install .
 ```
 
 ### Windows
-i feel for you man. Stop using windows.
+Stop using windows.
 
 ## Usage
 
