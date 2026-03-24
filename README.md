@@ -126,7 +126,7 @@ for step in range(100):
 
 No excessive abstraction. Every major step is explicit — if you don't know what softmax does before a cross entropy loss, you shouldn't be touching the engine. Sharp tools for sharp engineers.
 
-The core autograd loop is ~835 lines of pure C++. No dependencies except the standard library.
+The core autograd loop is ~800 lines of pure C++. No dependencies except the standard library.
 
 ---
 
