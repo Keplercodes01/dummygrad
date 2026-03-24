@@ -9,8 +9,6 @@ PYBIND11_MODULE(dummygrad, m) {
 
     py::class_<Tensor, std::shared_ptr<Tensor>>(m, "Tensor")
         .def(py::init<std::vector<int>>())
-        .def("show", &Tensor::show)
-        .def("show_grad", &Tensor::show_grad)
         .def("backward", &Tensor::backward)
         .def("zero_grad", &Tensor::zero_grad)
         .def("get", &Tensor::get)
