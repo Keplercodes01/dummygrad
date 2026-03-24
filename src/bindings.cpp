@@ -75,7 +75,7 @@ PYBIND11_MODULE(dummygrad, m) {
                 result += std::to_string(t.shape[i]);
                 if(i < t.shape.size()-1) result += ", ";
             }
-            result + "])";
+            result += "])";
             py::print(result);
         })
 
