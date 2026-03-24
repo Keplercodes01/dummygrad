@@ -79,6 +79,7 @@ PYBIND11_MODULE(dummygrad, m) {
             py::print(result);
         })
 
+        .def("__matmul__", [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return matmul(a, b); })
         .def("backward", &Tensor::backward)
         .def("zero_grad", &Tensor::zero_grad)
         .def("get", &Tensor::get)
