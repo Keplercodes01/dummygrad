@@ -14,7 +14,7 @@ Supports n-dimensional tensors, automatic differentiation, and a full suite of o
 - Broadcasting and collapsing along axes. Both are kindoff primitive for now. its not n dimensional and works with only row or column vectors . 
 - Adam and SGD optimizers
 - Common ops: add, sub, mul, div, pow, sqrt, log, exp, sum, mean, transpose, matmul
-- Activations: relu, tanh, softmax(softmax is also not n dimensional for now. only 2d tensors are supported . 
+- Activations: relu, tanh, softmax(softmax is also not n dimensional for now. only 2d tensors are supported)
 - Loss: CrossEntropyLoss
 - Python bindings via pybind11 — use it like a Python library
 
