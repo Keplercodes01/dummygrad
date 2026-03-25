@@ -22,6 +22,7 @@ Supports n-dimensional tensors, automatic differentiation, and a full suite of o
 
 ## Installation
 
+### Linux
 ```bash
 git clone https://github.com/Keplercodes01/dummygrad.git
 cd dummygrad
@@ -29,7 +30,28 @@ pip install pybind11
 pip install .
 ```
 
----
+### macOS
+```bash
+xcode-select --install
+git clone https://github.com/Keplercodes01/dummygrad.git
+cd dummygrad
+pip install pybind11
+pip install .
+```
+
+### Google Colab
+```python
+!git clone https://github.com/Keplercodes01/dummygrad.git
+%cd dummygrad
+!apt-get install -y build-essential
+!pip install pybind11
+!pip install .
+```
+
+### Windows
+```bash
+Stop using windows.
+```
 
 ## Usage
 
@@ -76,7 +98,7 @@ optimizer.step(param)
 v = dummy.randn([1, 3])
 v_broadcast = dummy.broadcast(v, axis=0, n=4)
 
-# collapse back along axis
+# collapse back along axis adding all the elements along 
 v_collapsed = dummy.collapse(v_broadcast, axis=0)
 ```
 
@@ -88,45 +110,11 @@ dummy.manual_seed(42)
 
 ---
 
-## Training a simple MLP
-
-```python
-import dummygrad as dummy
-
-dummy.manual_seed(42)
-
-# weights and biases
-W1 = dummy.randn([784, 128])
-b1 = dummy.randn([1, 128])
-W2 = dummy.randn([128, 10])
-b2 = dummy.randn([1, 10])
-
-optimizer = dummy.Adam(lr=0.001)
-
-for step in range(100):
-    # forward
-    x = dummy.randn([32, 784])  # batch of 32
-    h = dummy.relu(dummy.add(dummy.matmul(x, W1), dummy.broadcast(b1, 0, 32)))
-    logits = dummy.add(dummy.matmul(h, W2), dummy.broadcast(b2, 0, 32))
-    probs = dummy.softmax(logits)
-
-    # loss (you provide one-hot targets)
-    loss = dummy.CrossEntropyLoss(probs, targets)
-    loss.backward()
-
-    # update
-    for param in [W1, b1, W2, b2]:
-        optimizer.step(param)
-        param.zero_grad()
-```
-
----
-
 ## Design Philosophy
 
 No excessive abstraction. Every major step is explicit — if you don't know what softmax does before a cross entropy loss, you shouldn't be touching the engine. Sharp tools for sharp engineers.
 
-The core autograd loop is ~835 lines of pure C++. No dependencies except the standard library.
+The core autograd loop is ~800 lines of pure C++. No dependencies except the standard library.
 
 ---
 
