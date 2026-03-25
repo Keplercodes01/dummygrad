@@ -93,7 +93,6 @@ PYBIND11_MODULE(dummygrad, m) {
 
     m.def("manual_seed", [](unsigned int seed) { manual_seed(seed); });
     m.def("randn", [](std::vector<int> shape) { return randn(shape); });
-    m.def("get_row", [](const std::shared_ptr<Tensor>& a, int row) { return get_row(a, row); });
     m.def("add", [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return add(a, b); });
     m.def("sub", [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return sub(a, b); });
     m.def("mul", [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return mul(a, b); });
