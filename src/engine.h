@@ -8,6 +8,7 @@
 #include<iostream>
 #include<vector>
 #include<functional>
+#include<algorithm>
 
 //Tensor 
 class Tensor {
@@ -257,46 +258,32 @@ inline std::shared_ptr<Tensor> div(const std::shared_ptr<Tensor>& a, const std::
 
 //transpose 
 inline std::shared_ptr<Tensor> transpose(const std::shared_ptr<Tensor>& a) {
-
     int n = a->shape.size();
 
-    int r = a->shape[n - 2];
-    int c = a->shape[n - 1];
+    auto out = std::make_shared<Tensor>(a->shape);
+    out->data = a->data;
+    out->strides = a->strides;
 
-    //copy batch dimensions from a
-    std::vector<int> out_shape;
-    for(int i = 0; i<n-2; i++) {
-        out_shape.push_back(a->shape[i]);
-    }
-    //swap the rows and columns 
-    out_shape.push_back(c);
-    out_shape.push_back(r);
+    //swap the last two dims and strides
+    std::swap(out->shape[n-2], out->shape[n-1]);
+    std::swap(out->strides[n-2], out->strides[n-1]);
 
-    auto out = std::make_shared<Tensor>(std::vector<int>(out_shape));
-
-    int batch_size = 1;
-    for(int i = 0; i<n-2; i++) { batch_size *= a->shape[i]; }
-
-    for(int batch = 0; batch<batch_size; batch++) {
-        int off = batch * r * c;
-
-        for(int i = 0; i<r; i++) {
-            for(int j = 0; j<c; j++) {
-                out->data[off + j*r + i] = a->data[off + i*c + j];
-            }
-        }
-    }
     out->prev.push_back(a);
 
     std::weak_ptr<Tensor> weak_out = out;
 
-    out->backward_fn = [a, weak_out, r, c, batch_size]() {
+    out->backward_fn = [a, weak_out, n]() {
         if(auto self = weak_out.lock()) {
+            int r = a->shape[n-2];
+            int c = a->shape[n-1];
+            int batch_size = 1;
+            for(int i = 0; i<n-2; i++) { batch_size *= a->shape[i]; }
+
             for(int batch = 0; batch<batch_size; batch++) {
-                int off = batch * r * c;
                 for(int i=0; i<r; i++) {
                     for(int j=0; j<c; j++) {
-                        a->grad[off + i*c + j] += self->grad[off + j*r + i];
+                        a->grad[a->strides[n-2]*i + a->strides[n-1]*j + batch*r*c] 
+                            += self->grad[self->strides[n-2]*j + self->strides[n-1]*i + batch*r*c];
                     }
                 }
             }
@@ -320,12 +307,12 @@ inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const st
     //check the batch dimensions match 
     for(int i = 0; i < n1-2; i++) {
         if(a->shape[i] != b->shape[i]) {
-            throw std::runtime_error("Batch dimensions mismatch for matmul.. cmon man.");
+            throw std::runtime_error("Batch dimensions mismatch for matmul.. CMON MAN.");
         }
     }
     //check inner dimensions match
     if(c1 != r2) {
-        throw std::runtime_error("Matmul dimensions mismatch.. cmon man.");  
+        throw std::runtime_error("Matmul dimensions mismatch.. CMON MAN.");  
     }
 
     //copy the batch dimensions from a 
@@ -337,22 +324,20 @@ inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const st
     out_shape.push_back(c2);
 
     auto out = std::make_shared<Tensor>(out_shape);
+    int nout = out->shape.size();
 
     int batch_size = 1;
     for(int i = 0; i<n1-2; i++) { batch_size *= a->shape[i]; }
 
     for(int batch = 0; batch<batch_size; batch++) {
-        int a_off = batch * r1 * c1;
-        int b_off = batch * r2 * c2;
-        int o_off = batch * r1 * c2;
-
         for(int i = 0; i<r1; i++) {
             for(int j = 0; j<c2; j++) {
                 float sum = 0.0f;
                 for(int k = 0; k<c1; k++) {
-                    sum += a->data[a_off + i*c1 + k] * b->data[b_off + k*c2 + j]; 
+                    sum += a->data[a->strides[n1-2]*i + a->strides[n1-1]*k + batch*r1*c1] 
+                         * b->data[b->strides[n2-2]*k + b->strides[n2-1]*j + batch*r2*c2];                       
                 }
-                out->data[o_off + i*c2 + j] = sum;
+                out->data[out->strides[nout-2]*i + out->strides[nout-1]*j + batch*r1*c2] = sum;
             }
         }
     }
@@ -362,21 +347,18 @@ inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const st
 
     std::weak_ptr<Tensor> weak_out = out;
 
-    out->backward_fn = [a, b, weak_out, r1, c1, r2, c2, batch_size]() {
+    out->backward_fn = [a, b, weak_out, r1, c1, r2, c2, batch_size, n1, n2, nout]() {
         if(auto self = weak_out.lock()) {
             for(int batch = 0; batch<batch_size; batch++) {
-                int a_off = batch * r1 * c1;
-                int b_off = batch * r2 * c2;
-                int o_off = batch * r1 * c2;
-
                 //a.grad
                 for(int i=0; i<r1; i++) {
                     for(int j=0; j<c1; j++) {
                         float sum = 0.0f;
                         for(int k=0; k<c2; k++) {
-                            sum += self->grad[o_off + i*c2 + k] * b->data[b_off + j*c2 + k];
+                            sum += self->grad[self->strides[nout-2]*i + self->strides[nout-1]*k + batch*r1*c2] 
+                                 * b->data[b->strides[n2-2]*j + b->strides[n2-1]*k + batch*r2*c2];
                         }
-                        a->grad[a_off + i*c1 + j] += sum;
+                        a->grad[a->strides[n1-2]*i + a->strides[n1-1]*j + batch*r1*c1] += sum;
                     }
                 }
                 //b.grad
@@ -384,9 +366,10 @@ inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const st
                     for(int j=0; j<c2; j++) {
                         float sum = 0.0f;
                         for(int k=0; k<r1; k++) {
-                            sum += a->data[a_off + k*c1 + i] * self->grad[o_off + k*c2 + j];
+                            sum += a->data[a->strides[n1-2]*k + a->strides[n1-1]*i + batch*r1*c1] 
+                                 * self->grad[self->strides[nout-2]*k + self->strides[nout-1]*j + batch*r1*c2];
                         }
-                        b->grad[b_off + i*c2 + j] += sum;
+                        b->grad[b->strides[n2-2]*i + b->strides[n2-1]*j + batch*r2*c2] += sum;
                     }    
                 }
             }
@@ -489,9 +472,6 @@ inline std::shared_ptr<Tensor> exp(const std::shared_ptr<Tensor>& a) {
 
 //sum
 inline std::shared_ptr<Tensor> sum(const std::shared_ptr<Tensor>& a) {
-    int r = a->shape[0];
-    int c = a->shape[1];
-
     auto out = std::make_shared<Tensor>(std::vector<int>{1, 1}); 
 
     float total = 0.0f;
@@ -516,6 +496,7 @@ inline std::shared_ptr<Tensor> sum(const std::shared_ptr<Tensor>& a) {
 
 //mean
 inline std::shared_ptr<Tensor> mean(const std::shared_ptr<Tensor>& a) {
+    if(a->shape
 
     auto out = std::make_shared<Tensor>(std::vector<int>{1, 1}); 
 
