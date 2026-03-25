@@ -39,8 +39,6 @@ class Tensor {
             }
         }
 
-        float get(int i) { return data[i]; }
-        void set(int i, float val) { data[i] = val; }
         int size() { return data.size(); } 
 
         //zero_grad
@@ -260,26 +258,46 @@ inline std::shared_ptr<Tensor> div(const std::shared_ptr<Tensor>& a, const std::
 //transpose 
 inline std::shared_ptr<Tensor> transpose(const std::shared_ptr<Tensor>& a) {
 
-    int r = a->shape[0];
-    int c = a->shape[1];
+    int n = a->shape.size();
 
-    auto out = std::make_shared<Tensor>(std::vector<int>{c, r});
-    
-    for(int i=0; i<r; i++) {
-        for(int j=0; j<c; j++) {
-            out->data[j*r + i] = a->data[i*c + j];
+    int r = a->shape[n - 2];
+    int c = a->shape[n - 1];
+
+    //copy batch dimensions from a
+    std::vector<int> out_shape;
+    for(int i = 0; i<n-2; i++) {
+        out_shape.push_back(a->shape[i]);
+    }
+    //swap the rows and columns 
+    out_shape.push_back(c);
+    out_shape.push_back(r);
+
+    auto out = std::make_shared<Tensor>(std::vector<int>(out_shape));
+
+    int batch_size = 1;
+    for(int i = 0; i<n-2; i++) { batch_size *= a->shape[i]; }
+
+    for(int batch = 0; batch<batch_size; batch++) {
+        int off = batch * r * c;
+
+        for(int i = 0; i<r; i++) {
+            for(int j = 0; j<c; j++) {
+                out->data[off + j*r + i] = a->data[off + i*c + j];
+            }
         }
     }
-
     out->prev.push_back(a);
 
     std::weak_ptr<Tensor> weak_out = out;
 
-    out->backward_fn = [a, weak_out, r, c]() {
+    out->backward_fn = [a, weak_out, r, c, batch_size]() {
         if(auto self = weak_out.lock()) {
-            for(int i=0; i<r; i++) {
-                for(int j=0; j<c; j++) {
-                    a->grad[i * c + j] += self->grad[j * r + i];
+            for(int batch = 0; batch<batch_size; batch++) {
+                int off = batch * r * c;
+                for(int i=0; i<r; i++) {
+                    for(int j=0; j<c; j++) {
+                        a->grad[off + i*c + j] += self->grad[off + j*r + i];
+                    }
                 }
             }
         }
