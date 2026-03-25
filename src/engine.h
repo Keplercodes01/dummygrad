@@ -496,8 +496,6 @@ inline std::shared_ptr<Tensor> sum(const std::shared_ptr<Tensor>& a) {
 
 //mean
 inline std::shared_ptr<Tensor> mean(const std::shared_ptr<Tensor>& a) {
-    if(a->shape
-
     auto out = std::make_shared<Tensor>(std::vector<int>{1, 1}); 
 
     float sum = 0.0f;
