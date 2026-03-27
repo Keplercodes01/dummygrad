@@ -109,31 +109,6 @@ inline std::shared_ptr<Tensor> randn(std::vector<int> shape) {
     return t;
 }
 
-//get the specific row 
-inline std::shared_ptr<Tensor> get_row(const std::shared_ptr<Tensor>& a, int row) {
-    int c = a->shape[1];
-
-    auto out = std::make_shared<Tensor>(std::vector<int>{1, c}); 
-
-    for(int i = 0; i<c; i++) {
-        out->data[i] = a->data[row*c + i];
-    }
-
-    out->prev.push_back(a);
-
-    std::weak_ptr<Tensor> weak_out = out;
-
-    out->backward_fn = [a, weak_out, row, c]() {
-        if(auto self = weak_out.lock()) {
-            for(int i = 0; i<c; i++) {
-                a->grad[row*c + i] += self->grad[i]; 
-            }
-        }
-    };
-
-    return out;
-}
-
 //Operations
 
 //add
@@ -148,7 +123,6 @@ inline std::shared_ptr<Tensor> add(const std::shared_ptr<Tensor>& a, const std::
     for(int i=0; i<out->size(); i++) {
         out->data[i] = a->data[i] + b->data[i];
     }
-
     out->prev.push_back(a);
     out->prev.push_back(b);
 
@@ -178,7 +152,6 @@ inline std::shared_ptr<Tensor> sub(const std::shared_ptr<Tensor>& a, const std::
     for(int i=0; i<out->size(); i++) {
         out->data[i] = a->data[i] - b->data[i];
     }
-
     out->prev.push_back(a);
     out->prev.push_back(b);
 
@@ -208,7 +181,6 @@ inline std::shared_ptr<Tensor> mul(const std::shared_ptr<Tensor>& a, const std::
     for(int i=0; i<out->size(); i++) {
         out->data[i] = a->data[i] * b->data[i];
     }
-
     out->prev.push_back(a);
     out->prev.push_back(b);
 
@@ -238,7 +210,6 @@ inline std::shared_ptr<Tensor> div(const std::shared_ptr<Tensor>& a, const std::
     for(int i=0; i<out->size(); i++) {
         out->data[i] = a->data[i] / b->data[i];
     }
-
     out->prev.push_back(a);
     out->prev.push_back(b);
 
@@ -341,7 +312,6 @@ inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const st
             }
         }
     }
-
     out->prev.push_back(a);
     out->prev.push_back(b);
 
@@ -386,7 +356,6 @@ inline std::shared_ptr<Tensor> pow(const std::shared_ptr<Tensor>& a, const int n
     for(int i = 0; i<a->size(); i++) {
         out->data[i] = std::pow(a->data[i], n);
     }
-
     out->prev.push_back(a);
 
     std::weak_ptr<Tensor> weak_out = out;
@@ -409,7 +378,6 @@ inline std::shared_ptr<Tensor> sqrt(const std::shared_ptr<Tensor>& a) {
     for(int i = 0; i<a->size(); i++) {
         out->data[i] = std::sqrt(a->data[i]);
     }
-
     out->prev.push_back(a);
 
     std::weak_ptr<Tensor> weak_out = out;
@@ -479,7 +447,6 @@ inline std::shared_ptr<Tensor> sum(const std::shared_ptr<Tensor>& a) {
         total += val;
     }
     out->data[0] = total;
-
     out->prev.push_back(a);
 
     std::weak_ptr<Tensor> weak_out = out;
@@ -503,7 +470,6 @@ inline std::shared_ptr<Tensor> mean(const std::shared_ptr<Tensor>& a) {
         sum += a->data[i];
     }
     out->data[0] = sum/(a->size());
-
     out->prev.push_back(a);
 
     std::weak_ptr<Tensor> weak_out = out;
@@ -634,7 +600,6 @@ inline std::shared_ptr<Tensor> CrossEntropyLoss(const std::shared_ptr<Tensor>& p
     float n = static_cast<float>(pred->size());
 
     out->data[0] = sum_loss / n; 
-
     out->prev.push_back(pred);
 
     std::weak_ptr<Tensor> weak_out = out;
@@ -714,7 +679,6 @@ inline std::shared_ptr<Tensor> broadcast(const std::shared_ptr<Tensor>& a, int a
             }
         }
     }
-
     out->prev.push_back(a);
 
     std::weak_ptr<Tensor> weak_out = out;
@@ -768,7 +732,6 @@ inline std::shared_ptr<Tensor> collapse(const std::shared_ptr<Tensor>& a, int ax
             out->data[i] = total;
         }
     }
-
     out->prev.push_back(a);
 
     std::weak_ptr<Tensor> weak_out = out;
