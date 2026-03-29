@@ -8,14 +8,15 @@ Supports n-dimensional tensors, automatic differentiation, and a full suite of o
 
 ## Features
 
-- N-dimensional tensors with automatic stride computation
+- n-dimensional tensors with automatic stride computation
 - Full autograd engine with topological sort backward pass
 - Batched n-dimensional matmul with correct gradient computation
 - Broadcasting and collapsing along axes. Both are kindoff primitive for now. its not n dimensional and works with only row or column vectors . 
 - Adam and SGD optimizers
 - Common ops: add, sub, mul, div, pow, sqrt, log, exp, sum, mean, transpose, matmul
-- Activations: relu, tanh, softmax(softmax is also not n dimensional for now. only 2d tensors are supported)
-- Loss: CrossEntropyLoss
+- Activations: relu, tanh
+- n-dimensional softmax for normalisation
+- Loss: CrossEntropyLoss(doesn't include softmax, you should write it explicitly.)
 - Python bindings via pybind11 — use it like a Python library
 
 ---
