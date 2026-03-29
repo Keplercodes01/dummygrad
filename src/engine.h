@@ -165,7 +165,26 @@ inline std::shared_ptr<Tensor> one_hot(const std::shared_ptr<Tensor>& indices, i
         if(idx < 0 || idx >= num_classes) throw std::runtime_error("one_hot: index out of range. cmon man.");
         out->data_at(i * num_classes + idx) = 1.0f;
     }
+    return out;
+}
 
+//ones
+inline std::shared_ptr<Tensor> ones(std::vector<int> shape) {
+    auto out = std::make_shared<Tensor>(shape);
+
+    for(int i = 0; i<out->size(); i++) {
+        out->data_at(i) = 1.0f;
+    }
+    return out;
+}
+
+//zeros
+inline std::shared_ptr<Tensor> zeros(std::vector<int> shape) {
+    auto out = std::make_shared<Tensor>(shape);
+
+    for(int i = 0; i<out->size(); i++) {
+        out->data_at(i) = 0.0f;
+    }
     return out;
 }
 
