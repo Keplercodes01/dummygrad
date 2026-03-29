@@ -9,6 +9,8 @@ PYBIND11_MODULE(dummygrad, m) {
 
     py::class_<Tensor, std::shared_ptr<Tensor>>(m, "Tensor")
         .def(py::init<std::vector<int>>())
+
+        //show the tensor
         .def("__repr__", [](Tensor& t) {
             std::function<std::string(std::vector<float>&, std::vector<int>&, int, int)> fmt;
             fmt = [&](std::vector<float>& data, std::vector<int>& shape, int offset, int indent) -> std::string {
@@ -41,6 +43,8 @@ PYBIND11_MODULE(dummygrad, m) {
             }
             return result + "])";
         })
+
+        //show the gradients
         .def("show_grad", [](Tensor& t) {
             std::function<std::string(std::vector<float>&, std::vector<int>&, int, int)> fmt;
             fmt = [&](std::vector<float>& data, std::vector<int>& shape, int offset, int indent) -> std::string {
@@ -74,6 +78,42 @@ PYBIND11_MODULE(dummygrad, m) {
             result += "])";
             py::print(result);
         })
+
+        //slicing
+        .def("__getitem__", [](const std::shared_ptr<Tensor>& a, py::slice slice) {
+            size_t start, stop, step, length;
+            slice.compute(a->shape[0], &start, &stop, &step, &length);
+
+            int row_size = a->size() / a->shape[0];
+            std::vector<int> new_shape = {(int)length};
+            for(int i = 1; i < (int)a->shape.size(); i++) new_shape.push_back(a->shape[i]);
+
+            auto out = std::make_shared<Tensor>(new_shape);
+
+            for(int i = 0; i < (int)length; i++) {
+                int row = start + i * step;
+                for(int j = 0; j < row_size; j++) {
+                    out->data_at(i * row_size + j) = a->data_at(row * row_size + j);
+                }
+            }
+
+            out->prev.push_back(a);
+            std::weak_ptr<Tensor> weak_out = out;
+
+            out->backward_fn = [a, weak_out, start, step, length, row_size]() {
+                if(auto self = weak_out.lock()) {
+                    for(int i = 0; i < (int)length; i++) {
+                        int row = start + i * step;
+                        for(int j = 0; j < row_size; j++) {
+                            a->grad_at(row * row_size + j) += self->grad_at(i * row_size + j);
+                        }
+                    }
+                }
+            };
+
+            return out;
+        })
+
         .def("__matmul__", [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return matmul(a, b); })
         .def("backward", &Tensor::backward)
         .def("zero_grad", &Tensor::zero_grad)
