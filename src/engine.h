@@ -180,12 +180,7 @@ inline std::shared_ptr<Tensor> ones(std::vector<int> shape) {
 
 //zeros
 inline std::shared_ptr<Tensor> zeros(std::vector<int> shape) {
-    auto out = std::make_shared<Tensor>(shape);
-
-    for(int i = 0; i<out->size(); i++) {
-        out->data_at(i) = 0.0f;
-    }
-    return out;
+    return std::make_shared<Tensor>(shape);
 }
 
 //Operations
