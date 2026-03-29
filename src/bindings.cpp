@@ -120,7 +120,7 @@ PYBIND11_MODULE(dummygrad, m) {
     m.def("collapse", [](const std::shared_ptr<Tensor>& a, int axis) { return collapse(a, axis); });
     m.def("CrossEntropyLoss", [](const std::shared_ptr<Tensor>& pred, const std::shared_ptr<Tensor>& target) { return CrossEntropyLoss(pred, target); });
     m.def("SGD",     [](const std::shared_ptr<Tensor>& param, float lr) { SGD(param, lr); });
-    m.def("one_hot", [](const std::shared_ptr<Tensor>& indices, int num_classes) { return one_hot(index, num_classes); });
+    m.def("one_hot", [](const std::shared_ptr<Tensor>& indices, int num_classes) { return one_hot(indices, num_classes); });
 
     py::class_<Adam>(m, "Adam")
         .def(py::init<float, float, float, float>(),
