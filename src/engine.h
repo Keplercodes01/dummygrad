@@ -10,17 +10,27 @@
 #include<functional>
 #include<algorithm>
 
+struct Storage {
+    std::vector<float> data;
+    std::vector<float> grad;
+    //float* cuda_data = nullptr;
+    //float* cuda_grad = nullptr;
+    //bool on_gpu = false;
+
+    Storage(int size) : data(size, 0.0f), grad(size, 0.0f) {}
+};
+
 //Tensor 
 class Tensor {
     public:
-        std::vector<float> data;
-        std::vector<float> grad;
+        std::shared_ptr<Storage> storage;
         std::vector<int> shape;
         std::vector<int> strides;
         std::function<void()> backward_fn;
+        int offset = 0;
         std::vector<std::shared_ptr<Tensor>> prev;
 
-        Tensor(std::vector<int> s) : shape(s) {  
+        Tensor(std::vector<int> s) : shape(s), offset(0) {  
 
             //get total elements of tensor 
             int total = 1;  
@@ -29,10 +39,9 @@ class Tensor {
             }
 
             //allocate and initialise
-            data.resize(total, 0.0f);
-            grad.resize(total, 0.0f);
+            storage = std::make_shared<Storage>(total);
 
-            //compute strides
+            //strides
             strides.resize(shape.size());
             strides.back() = 1;
             for(int i = shape.size() - 2; i>=0; i--) {
@@ -40,21 +49,24 @@ class Tensor {
             }
         }
 
-        int size() { return data.size(); } 
+        float& data_at(int i) { return storage->data[offset + i]; }
+        float& grad_at(int i) { return storage->grad[offset + i]; }
+
+        int size() { return storage->data.size(); } 
 
         //zero_grad
         void zero_grad() {
-            for(int i=0; i<grad.size(); i++) {
-                grad[i] = 0.0f; 
+            for(int i=0; i<size(); i++) {
+                grad_at(i) = 0.0f; 
             }
         }    
 
         //fill the tensor manually   
         void fill(std::vector<float> values) {
-            if (values.size() != data.size()) {
+            if (values.size() != size()) {
                 throw std::runtime_error("size mismatch..."); 
             }
-            data = values;
+            storage->data = values;
         }
 
         //autograd 
@@ -64,7 +76,7 @@ class Tensor {
                 throw std::runtime_error("Grad can only be initialized to 1.0 for scalars (size 1). Sum or mean your tensor first, man!");
             }
 
-            this->grad[0] = 1.0f;
+            this->grad_at(0) = 1.0f;
 
             std::vector<Tensor*> topo;
             std::unordered_set<Tensor*> visited;
@@ -88,26 +100,50 @@ class Tensor {
         }
 };
 
-//randn        
 inline std::mt19937 g_gen(std::random_device{}());
 
 inline void manual_seed(unsigned int seed) {
     g_gen.seed(seed);
 }
 
+//random init
 inline std::shared_ptr<Tensor> randn(std::vector<int> shape) {
-
     auto t = std::make_shared<Tensor>(shape);
-    float k = std::sqrt(1.0f/(float)shape[0]);
-
-    std::uniform_real_distribution<float> dis(-k, k);
-
+    std::normal_distribution<float> dis(0.0f, 1.0f);
     for(int i=0; i<t->size(); i++) {
-        t->data[i] = dis(g_gen);
+        t->data_at(i) = dis(g_gen);
     }
-
     return t;
 }
+
+//xavier init
+inline std::shared_ptr<Tensor> xavier(std::vector<int> shape) {
+    if(shape.size() != 2) throw std::runtime_error("xavier: only 2D tensors supported. cmon man.");
+
+    auto t = std::make_shared<Tensor>(shape);
+    float std = std::sqrt(1.0f / (float)shape[0]);
+    std::normal_distribution<float> dis(0.0f, std);
+    for(int i = 0; i < t->size(); i++) {
+        t->data_at(i) = dis(g_gen);
+    }
+    return t;
+}
+
+//kaiming init
+inline std::shared_ptr<Tensor> kaiming(std::vector<int> shape) {
+    if(shape.size() != 2) throw std::runtime_error("kaiming: only 2D tensors supported. cmon man.");
+
+    auto t = std::make_shared<Tensor>(shape);
+    float std = std::sqrt(2.0f / (float)shape[0]);
+    std::normal_distribution<float> dis(0.0f, std);
+    for(int i = 0; i < t->size(); i++) {
+        t->data_at(i) = dis(g_gen);
+    }
+    return t;
+}
+
+//view
+
 
 //Operations
 
@@ -121,7 +157,7 @@ inline std::shared_ptr<Tensor> add(const std::shared_ptr<Tensor>& a, const std::
     auto out = std::make_shared<Tensor>(a->shape);
 
     for(int i=0; i<out->size(); i++) {
-        out->data[i] = a->data[i] + b->data[i];
+        out->data_at(i) = a->data_at(i) + b->data_at(i);
     }
     out->prev.push_back(a);
     out->prev.push_back(b);
@@ -131,8 +167,8 @@ inline std::shared_ptr<Tensor> add(const std::shared_ptr<Tensor>& a, const std::
     out->backward_fn = [a, b, weak_out]() {
         if(auto self = weak_out.lock()) {
             for(int i=0; i<a->size(); i++) {
-                a->grad[i] += self->grad[i];
-                b->grad[i] += self->grad[i];
+                a->grad_at(i) += self->grad_at(i);
+                b->grad_at(i) += self->grad_at(i);
             }
         }    
     };
@@ -150,7 +186,7 @@ inline std::shared_ptr<Tensor> sub(const std::shared_ptr<Tensor>& a, const std::
     auto out = std::make_shared<Tensor>(a->shape);
 
     for(int i=0; i<out->size(); i++) {
-        out->data[i] = a->data[i] - b->data[i];
+        out->data_at(i) = a->data_at(i) - b->data_at(i);
     }
     out->prev.push_back(a);
     out->prev.push_back(b);
@@ -160,8 +196,8 @@ inline std::shared_ptr<Tensor> sub(const std::shared_ptr<Tensor>& a, const std::
     out->backward_fn = [a, b, weak_out]() {
         if(auto self = weak_out.lock()) {
             for(int i=0; i<a->size(); i++) {
-                a->grad[i] += self->grad[i];
-                b->grad[i] -= self->grad[i];
+                a->grad_at(i) += self->grad_at(i);
+                b->grad_at(i) -= self->grad_at(i);
             }
         }
     };
@@ -179,7 +215,7 @@ inline std::shared_ptr<Tensor> mul(const std::shared_ptr<Tensor>& a, const std::
     auto out = std::make_shared<Tensor>(a->shape);
 
     for(int i=0; i<out->size(); i++) {
-        out->data[i] = a->data[i] * b->data[i];
+        out->data_at(i) = a->data_at(i) * b->data_at(i);
     }
     out->prev.push_back(a);
     out->prev.push_back(b);
@@ -189,8 +225,8 @@ inline std::shared_ptr<Tensor> mul(const std::shared_ptr<Tensor>& a, const std::
     out->backward_fn = [a, b, weak_out]() {
         if(auto self = weak_out.lock()) {
             for(int i=0; i<a->size(); i++) {
-                a->grad[i] += b->data[i] * self->grad[i];
-                b->grad[i] += a->data[i] * self->grad[i];
+                a->grad_at(i) += b->data_at(i) * self->grad_at(i);
+                b->grad_at(i) += a->data_at(i) * self->grad_at(i);
             }
         }
     };
@@ -208,7 +244,7 @@ inline std::shared_ptr<Tensor> div(const std::shared_ptr<Tensor>& a, const std::
     auto out = std::make_shared<Tensor>(a->shape);
 
     for(int i=0; i<out->size(); i++) {
-        out->data[i] = a->data[i] / b->data[i];
+        out->data_at(i) = a->data_at(i) / b->data_at(i);
     }
     out->prev.push_back(a);
     out->prev.push_back(b);
@@ -218,8 +254,8 @@ inline std::shared_ptr<Tensor> div(const std::shared_ptr<Tensor>& a, const std::
     out->backward_fn = [a, b, weak_out]() {
         if(auto self = weak_out.lock()) {
             for(int i=0; i<a->size(); i++) {
-                a->grad[i] += self->grad[i] / b->data[i];
-                b->grad[i] -= a->data[i] * self->grad[i] / (b->data[i] * b->data[i]);
+                a->grad_at(i) += self->grad_at(i) / b->data_at(i);
+                b->grad_at(i) -= a->data_at(i) * self->grad_at(i) / (b->data_at(i) * b->data_at(i));
             }
         }
     };
@@ -232,7 +268,7 @@ inline std::shared_ptr<Tensor> transpose(const std::shared_ptr<Tensor>& a) {
     int n = a->shape.size();
 
     auto out = std::make_shared<Tensor>(a->shape);
-    out->data = a->data;
+    out->storage = a->storage;
     out->strides = a->strides;
 
     //swap the last two dims and strides
@@ -253,8 +289,8 @@ inline std::shared_ptr<Tensor> transpose(const std::shared_ptr<Tensor>& a) {
             for(int batch = 0; batch<batch_size; batch++) {
                 for(int i=0; i<r; i++) {
                     for(int j=0; j<c; j++) {
-                        a->grad[a->strides[n-2]*i + a->strides[n-1]*j + batch*r*c] 
-                            += self->grad[self->strides[n-2]*j + self->strides[n-1]*i + batch*r*c];
+                        a->grad_at(a->strides[n-2]*i + a->strides[n-1]*j + batch*r*c) 
+                            += self->grad_at(self->strides[n-2]*j + self->strides[n-1]*i + batch*r*c);
                     }
                 }
             }
@@ -305,10 +341,10 @@ inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const st
             for(int j = 0; j<c2; j++) {
                 float sum = 0.0f;
                 for(int k = 0; k<c1; k++) {
-                    sum += a->data[a->strides[n1-2]*i + a->strides[n1-1]*k + batch*r1*c1] 
-                         * b->data[b->strides[n2-2]*k + b->strides[n2-1]*j + batch*r2*c2];                       
+                    sum += a->data_at(a->strides[n1-2]*i + a->strides[n1-1]*k + batch*r1*c1) 
+                         * b->data_at(b->strides[n2-2]*k + b->strides[n2-1]*j + batch*r2*c2);                       
                 }
-                out->data[out->strides[nout-2]*i + out->strides[nout-1]*j + batch*r1*c2] = sum;
+                out->data_at(out->strides[nout-2]*i + out->strides[nout-1]*j + batch*r1*c2) = sum;
             }
         }
     }
@@ -325,10 +361,10 @@ inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const st
                     for(int j=0; j<c1; j++) {
                         float sum = 0.0f;
                         for(int k=0; k<c2; k++) {
-                            sum += self->grad[self->strides[nout-2]*i + self->strides[nout-1]*k + batch*r1*c2] 
-                                 * b->data[b->strides[n2-2]*j + b->strides[n2-1]*k + batch*r2*c2];
+                            sum += self->grad_at(self->strides[nout-2]*i + self->strides[nout-1]*k + batch*r1*c2) 
+                                 * b->data_at(b->strides[n2-2]*j + b->strides[n2-1]*k + batch*r2*c2);
                         }
-                        a->grad[a->strides[n1-2]*i + a->strides[n1-1]*j + batch*r1*c1] += sum;
+                        a->grad_at(a->strides[n1-2]*i + a->strides[n1-1]*j + batch*r1*c1) += sum;
                     }
                 }
                 //b.grad
@@ -336,10 +372,10 @@ inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const st
                     for(int j=0; j<c2; j++) {
                         float sum = 0.0f;
                         for(int k=0; k<r1; k++) {
-                            sum += a->data[a->strides[n1-2]*k + a->strides[n1-1]*i + batch*r1*c1] 
-                                 * self->grad[self->strides[nout-2]*k + self->strides[nout-1]*j + batch*r1*c2];
+                            sum += a->data_at(a->strides[n1-2]*k + a->strides[n1-1]*i + batch*r1*c1) 
+                                 * self->grad_at(self->strides[nout-2]*k + self->strides[nout-1]*j + batch*r1*c2);
                         }
-                        b->grad[b->strides[n2-2]*i + b->strides[n2-1]*j + batch*r2*c2] += sum;
+                        b->grad_at(b->strides[n2-2]*i + b->strides[n2-1]*j + batch*r2*c2) += sum;
                     }    
                 }
             }
@@ -354,7 +390,7 @@ inline std::shared_ptr<Tensor> pow(const std::shared_ptr<Tensor>& a, const int n
     auto out = std::make_shared<Tensor>(a->shape);
 
     for(int i = 0; i<a->size(); i++) {
-        out->data[i] = std::pow(a->data[i], n);
+        out->data_at(i) = std::pow(a->data_at(i), n);
     }
     out->prev.push_back(a);
 
@@ -363,7 +399,7 @@ inline std::shared_ptr<Tensor> pow(const std::shared_ptr<Tensor>& a, const int n
     out->backward_fn = [a, weak_out, n]() {
         if(auto self = weak_out.lock()) {
             for(int i = 0; i<a->size(); i++) {
-                a->grad[i] += n * std::pow(a->data[i], n-1) * self->grad[i];
+                a->grad_at(i) += n * std::pow(a->data_at(i), n-1) * self->grad_at(i);
             }
         }
     };
@@ -376,7 +412,7 @@ inline std::shared_ptr<Tensor> sqrt(const std::shared_ptr<Tensor>& a) {
     auto out = std::make_shared<Tensor>(a->shape);
 
     for(int i = 0; i<a->size(); i++) {
-        out->data[i] = std::sqrt(a->data[i]);
+        out->data_at(i) = std::sqrt(a->data_at(i));
     }
     out->prev.push_back(a);
 
@@ -385,7 +421,7 @@ inline std::shared_ptr<Tensor> sqrt(const std::shared_ptr<Tensor>& a) {
     out->backward_fn = [a, weak_out]() {
         if(auto self = weak_out.lock()) {
             for(int i = 0; i<a->size(); i++) {
-                a->grad[i] += (0.5f / std::sqrt(a->data[i])) * self->grad[i];
+                a->grad_at(i) += (0.5f / std::sqrt(a->data_at(i))) * self->grad_at(i);
             }
         }
     };
@@ -400,7 +436,7 @@ inline std::shared_ptr<Tensor> log(const std::shared_ptr<Tensor>& a) {
 
     float epsilon = 1e-8f;
     for(int i=0; i<out->size(); i++) {
-        out->data[i] = std::log(a->data[i] + epsilon);
+        out->data_at(i) = std::log(a->data_at(i) + epsilon);
     }
     out->prev.push_back(a);
 
@@ -409,10 +445,11 @@ inline std::shared_ptr<Tensor> log(const std::shared_ptr<Tensor>& a) {
     out->backward_fn = [a, weak_out, epsilon]() {
         if(auto self = weak_out.lock()) {
             for(int i=0; i<a->size(); i++) {
-                a->grad[i] += self->grad[i] * (1.0f / (a->data[i] + epsilon));
+                a->grad_at(i) += self->grad_at(i) * (1.0f / (a->data_at(i) + epsilon));
             }
         }
     };
+
     return out;
 }
 
@@ -422,7 +459,7 @@ inline std::shared_ptr<Tensor> exp(const std::shared_ptr<Tensor>& a) {
     auto out = std::make_shared<Tensor>(a->shape);
 
     for(int i=0; i<out->size(); i++) {
-        out->data[i] = std::exp(a->data[i]);
+        out->data_at(i) = std::exp(a->data_at(i));
     }
     out->prev.push_back(a);
 
@@ -431,10 +468,11 @@ inline std::shared_ptr<Tensor> exp(const std::shared_ptr<Tensor>& a) {
     out->backward_fn = [a, weak_out]() {
         if(auto self = weak_out.lock()) {
             for(int i=0; i<a->size(); i++) {
-                a->grad[i] += self->grad[i] * self->data[i];
+                a->grad_at(i) += self->grad_at(i) * self->data_at(i);
             }
         }
     };
+
     return out; 
 }
 
@@ -443,21 +481,22 @@ inline std::shared_ptr<Tensor> sum(const std::shared_ptr<Tensor>& a) {
     auto out = std::make_shared<Tensor>(std::vector<int>{1, 1}); 
 
     float total = 0.0f;
-    for(float val : a->data) {
-        total += val;
+    for(int i = 0; i<a->size(); i++) {
+        total += a->data_at(i);
     }
-    out->data[0] = total;
+    out->data_at(0) = total;
     out->prev.push_back(a);
 
     std::weak_ptr<Tensor> weak_out = out;
 
     out->backward_fn = [a, weak_out]() {
         if(auto self = weak_out.lock()) {
-            for(float &g : a->grad) {
-                g += self->grad[0];
+            for(int i = 0; i<a->size(); i++) {
+                a->grad_at(i) += self->grad_at(0);
             }
         }
     };
+
     return out;
 }
 
@@ -467,18 +506,18 @@ inline std::shared_ptr<Tensor> mean(const std::shared_ptr<Tensor>& a) {
 
     float sum = 0.0f;
     for(int i=0; i<a->size(); i++) {
-        sum += a->data[i];
+        sum += a->data_at(i);
     }
-    out->data[0] = sum/(a->size());
+    out->data_at(0) = sum/(a->size());
     out->prev.push_back(a);
 
     std::weak_ptr<Tensor> weak_out = out;
 
     out->backward_fn = [a, weak_out]() {
         if(auto self = weak_out.lock()) {
-            float gradient = self->grad[0] / a->size();
-            for(float &g : a->grad) {
-                g += gradient; 
+            float gradient = self->grad_at(0) / a->size();
+            for(int i = 0; i<a->size(); i++) {
+                a->grad_at(i) += gradient;
             }
         }
     };
@@ -494,16 +533,16 @@ inline std::shared_ptr<Tensor> softmax(const std::shared_ptr<Tensor>& a) {
     auto out = std::make_shared<Tensor>(a->shape);
 
     for(int i = 0; i<r; i++) {
-        float max_val = a->data[i*c];
+        float max_val = a->data_at(i*c);
         for(int m = 1; m<c; m++) {
-            max_val = std::max(max_val, a->data[i*c + m]);
+            max_val = std::max(max_val, a->data_at(i*c + m));
         }
         float sum = 0.0f;
         for(int j = 0; j<c; j++) {
-            sum += std::exp(a->data[i*c + j] - max_val);
+            sum += std::exp(a->data_at(i*c + j) - max_val);
         }
         for(int k = 0; k<c; k++) {
-            out->data[i*c + k] = std::exp(a->data[i*c + k] - max_val) / sum;
+            out->data_at(i*c + k) = std::exp(a->data_at(i*c + k) - max_val) / sum;
         }
     }
     out->prev.push_back(a);
@@ -513,17 +552,17 @@ inline std::shared_ptr<Tensor> softmax(const std::shared_ptr<Tensor>& a) {
     out->backward_fn = [a, weak_out, r, c]() {
         if(auto self = weak_out.lock()) {
             for(int i = 0; i<r; i++) {
-                float max_val = a->data[i*c];
+                float max_val = a->data_at(i*c);
                 for(int m = 1; m<c; m++) {
-                    max_val = std::max(max_val, a->data[i*c + m]);
+                    max_val = std::max(max_val, a->data_at(i*c + m));
                 }
                 float sum = 0.0f;
                 for(int j = 0; j<c; j++) {
-                    sum += std::exp(a->data[i*c + j] - max_val);
+                    sum += std::exp(a->data_at(i*c + j) - max_val);
                 }
                 for(int k = 0; k<c; k++) {
-                    float y_k = std::exp(a->data[i*c + k] - max_val);
-                    a->grad[i*c + k] += (y_k * (sum - y_k) / (sum*sum)) * self->grad[i*c + k];
+                    float y_k = std::exp(a->data_at(i*c + k) - max_val);
+                    a->grad_at(i*c + k) += (y_k * (sum - y_k) / (sum*sum)) * self->grad_at(i*c + k);
                 }
             }
         }
@@ -540,7 +579,7 @@ inline std::shared_ptr<Tensor> relu(const std::shared_ptr<Tensor>& a) {
     auto out = std::make_shared<Tensor>(a->shape);
 
     for(int i = 0; i<a->size(); i++) {
-        out->data[i] = std::max(0.0f, a->data[i]); 
+        out->data_at(i) = std::max(0.0f, a->data_at(i)); 
     }
     out->prev.push_back(a);
 
@@ -549,8 +588,8 @@ inline std::shared_ptr<Tensor> relu(const std::shared_ptr<Tensor>& a) {
     out->backward_fn = [a, weak_out]() {
         if(auto self = weak_out.lock()) {
             for(int i=0; i<a->size(); i++) {
-                if(a->data[i]>0.0f) {
-                    a->grad[i] += self->grad[i];
+                if(a->data_at(i)>0.0f) {
+                    a->grad_at(i) += self->grad_at(i);
                 }
             }
         }
@@ -565,7 +604,7 @@ inline std::shared_ptr<Tensor> tanh(const std::shared_ptr<Tensor>& a) {
     auto out = std::make_shared<Tensor>(a->shape);
 
     for(int i = 0; i<a->size(); i++) {
-        out->data[i] = std::tanh(a->data[i]);
+        out->data_at(i) = std::tanh(a->data_at(i));
     }
     out->prev.push_back(a);
 
@@ -574,7 +613,7 @@ inline std::shared_ptr<Tensor> tanh(const std::shared_ptr<Tensor>& a) {
     out->backward_fn = [a, weak_out]() {
         if(auto self = weak_out.lock()) {
             for(int i=0; i<a->size(); i++) {
-                a->grad[i] += (1.0 - (self->data[i] * self->data[i])) * self->grad[i];
+                a->grad_at(i) += (1.0 - (self->data_at(i) * self->data_at(i))) * self->grad_at(i);
             }
         }
     };
@@ -592,14 +631,14 @@ inline std::shared_ptr<Tensor> CrossEntropyLoss(const std::shared_ptr<Tensor>& p
 
     float sum_loss = 0.0f;
     for(int i=0; i<pred->size(); i++) {
-        sum_loss -= target->data[i] * std::log(pred->data[i]);
+        sum_loss -= target->data_at(i) * std::log(pred->data_at(i));
     }
 
     auto out = std::make_shared<Tensor>(std::vector<int>{1, 1});
 
     float n = static_cast<float>(pred->size());
 
-    out->data[0] = sum_loss / n; 
+    out->data_at(0) = sum_loss / n; 
     out->prev.push_back(pred);
 
     std::weak_ptr<Tensor> weak_out = out;
@@ -607,7 +646,7 @@ inline std::shared_ptr<Tensor> CrossEntropyLoss(const std::shared_ptr<Tensor>& p
     out->backward_fn = [pred, target, weak_out, n]() {
         if(auto self = weak_out.lock()) {
             for(int i=0; i<pred->size(); i++) {
-                pred->grad[i] += -(target->data[i] / (pred->data[i] * n)) * self->grad[0]; 
+                pred->grad_at(i) += -(target->data_at(i) / (pred->data_at(i) * n)) * self->grad_at(0); 
             }
         }
     };
@@ -620,7 +659,7 @@ inline std::shared_ptr<Tensor> CrossEntropyLoss(const std::shared_ptr<Tensor>& p
 //SGD
 inline void SGD(const std::shared_ptr<Tensor>& param, const float& lr) {
     for(int i = 0; i<param->size(); i++) {
-        param->data[i] -= lr * param->grad[i];
+        param->data_at(i) -= lr * param->grad_at(i);
     }
 }
 
@@ -641,14 +680,14 @@ class Adam {
             }
             t++;
             for(int i = 0; i<param->size(); i++) {
-                m[i] = b1*m[i] + (1-b1)*param->grad[i];
-                v[i] = b2*v[i] + (1-b2)*param->grad[i]*param->grad[i];
+                m[i] = b1*m[i] + (1-b1)*param->grad_at(i);
+                v[i] = b2*v[i] + (1-b2)*param->grad_at(i)*param->grad_at(i);
 
                 float m_hat = m[i] / (1 - std::pow(b1, t)); 
                 float v_hat = v[i] / (1 - std::pow(b2, t)); 
 
                 //update
-                param->data[i] -= lr * m_hat / (std::sqrt(v_hat) + E);
+                param->data_at(i) -= lr * m_hat / (std::sqrt(v_hat) + E);
             }
         }
 };
@@ -668,14 +707,14 @@ inline std::shared_ptr<Tensor> broadcast(const std::shared_ptr<Tensor>& a, int a
     if(axis == 0) {
         for(int i = 0; i<n; i++) {
             for(int j = 0; j<c; j++) {
-                out->data[i*c + j] = a->data[j];
+                out->data_at(i*c + j) = a->data_at(j);
             }
         }
     }
     else {
         for(int i = 0; i<r; i++) {
             for(int j = 0; j<n; j++) {
-                out->data[i*n + j] = a->data[i];
+                out->data_at(i*n + j) = a->data_at(i);
             }
         }
     }
@@ -688,14 +727,14 @@ inline std::shared_ptr<Tensor> broadcast(const std::shared_ptr<Tensor>& a, int a
             if(axis == 0) {
                 for(int i = 0; i<n; i++) {
                     for(int j = 0; j<c; j++) {
-                        a->grad[j] += self->grad[i*c + j];
+                        a->grad_at(j) += self->grad_at(i*c + j);
                     }
                 }
             }
             else {
                 for(int i = 0; i<r; i++) {
                     for(int j = 0; j<n; j++) {
-                        a->grad[i] += self->grad[i*n + j];
+                        a->grad_at(i) += self->grad_at(i*n + j);
                     }
                 }
             }
@@ -718,18 +757,18 @@ inline std::shared_ptr<Tensor> collapse(const std::shared_ptr<Tensor>& a, int ax
         for(int i = 0; i<c; i++) {
             float total = 0.0f; 
             for(int j = 0; j<r; j++) {
-                total += a->data[j*c + i];
+                total += a->data_at(j*c + i);
             }
-            out->data[i] = total;
+            out->data_at(i) = total;
         }
     }
     else {
         for(int i = 0; i<r; i++) {
             float total = 0.0f;
             for(int j = 0; j<c; j++) {
-                total += a->data[i*c + j];
+                total += a->data_at(i*c + j);
             }
-            out->data[i] = total;
+            out->data_at(i) = total;
         }
     }
     out->prev.push_back(a);
@@ -741,14 +780,14 @@ inline std::shared_ptr<Tensor> collapse(const std::shared_ptr<Tensor>& a, int ax
             if(axis == 0) {
                 for(int i = 0; i<c; i++) {
                     for(int j = 0; j<r; j++) {
-                        a->grad[j*c + i] += self->grad[i];
+                        a->grad_at(j*c + i) += self->grad_at(i);
                     }
                 }
             }
             else {
                 for(int i = 0; i<r; i++) {
                     for(int j = 0; j<c; j++) {
-                        a->grad[i*c + j] += self->grad[i];
+                        a->grad_at(i*c + j) += self->grad_at(i);
                     }
                 }
             }
