@@ -69,6 +69,19 @@ class Tensor {
             storage->data = values;
         }
 
+        //view the tensor in a different shape
+        std::shared_ptr<Tensor> view(std::vector<int> new_shape) {
+            int total = 1;
+            for(int d : new_shape) total *= d;
+            if(total != size()) throw std::runtime_error("view: total elements must match. cmon man.");
+
+            auto out = std::make_shared<Tensor>(new_shape);
+            out->storage = storage;
+            out->offset = offset;
+
+            return out;
+        }
+
         //autograd 
         void backward() {
 
@@ -142,8 +155,19 @@ inline std::shared_ptr<Tensor> kaiming(std::vector<int> shape) {
     return t;
 }
 
-//view
+//one_hot
+inline std::shared_ptr<Tensor> one_hot(const std::shared_ptr<Tensor>& indices, int num_classes) {
+    int n = indices->size();
+    auto out = std::make_shared<Tensor>(std::vector<int>{n, num_classes});
 
+    for(int i = 0; i < n; i++) {
+        int idx = (int)indices->data_at(i);
+        if(idx < 0 || idx >= num_classes) throw std::runtime_error("one_hot: index out of range. cmon man.");
+        out->data_at(i * num_classes + idx) = 1.0f;
+    }
+
+    return out;
+}
 
 //Operations
 
