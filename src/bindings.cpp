@@ -122,6 +122,16 @@ PYBIND11_MODULE(dummygrad, m) {
     m.def("SGD",     [](const std::shared_ptr<Tensor>& param, float lr) { SGD(param, lr); });
     m.def("one_hot", [](const std::shared_ptr<Tensor>& indices, int num_classes) { return one_hot(indices, num_classes); });
 
+    //dummy.tensor()
+    m.def("tensor", [](std::vector<float> values, std::vector<int> shape) {
+        int total = 1;
+        for(int d : shape) total *= d;
+        if((int)values.size() != total) throw std::runtime_error("tensor: values and shape mismatch. cmon man.");
+        auto out = std::make_shared<Tensor>(shape);
+        for(int i = 0; i < total; i++) out->data_at(i) = values[i];
+        return out;
+    });
+
     py::class_<Adam>(m, "Adam")
         .def(py::init<float, float, float, float>(),
              py::arg("lr") = 0.001f,
