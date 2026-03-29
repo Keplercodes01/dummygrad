@@ -141,6 +141,9 @@ PYBIND11_MODULE(dummygrad, m) {
     m.def("randn",   [](std::vector<int> shape) { return randn(shape); });
     m.def("xavier",  [](std::vector<int> shape) { return xavier(shape); });
     m.def("kaiming", [](std::vector<int> shape) { return kaiming(shape); });
+    m.def("ones",    [](std::vector<int> shape) { return ones(shape); });
+    m.def("zeros",   [](std::vector<int> shape) { return zeros(shape); });
+    m.def("one_hot", [](const std::shared_ptr<Tensor>& indices, int num_classes) { return one_hot(indices, num_classes); });
     m.def("add",     [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return add(a, b); });
     m.def("sub",     [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return sub(a, b); });
     m.def("mul",     [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return mul(a, b); });
@@ -160,7 +163,6 @@ PYBIND11_MODULE(dummygrad, m) {
     m.def("collapse", [](const std::shared_ptr<Tensor>& a, int axis) { return collapse(a, axis); });
     m.def("CrossEntropyLoss", [](const std::shared_ptr<Tensor>& pred, const std::shared_ptr<Tensor>& target) { return CrossEntropyLoss(pred, target); });
     m.def("SGD",     [](const std::shared_ptr<Tensor>& param, float lr) { SGD(param, lr); });
-    m.def("one_hot", [](const std::shared_ptr<Tensor>& indices, int num_classes) { return one_hot(indices, num_classes); });
 
     //dummy.tensor()
     m.def("tensor", [](std::vector<float> values, std::vector<int> shape) {
