@@ -125,7 +125,7 @@ PYBIND11_MODULE(dummygrad, m) {
         .def("__radd__",     [](const std::shared_ptr<Tensor>& a, float s) { return add_scalar(a, s); })
         .def("__sub__",      [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return sub(a, b); })
         .def("__sub__",      [](const std::shared_ptr<Tensor>& a, float s) { return sub_scalar(a, s); })
-        .def("__rsub__",     [](const std::shared_ptr<Tensor>& a, float s) { return rsub_scalar(f, a); })
+        .def("__rsub__",     [](const std::shared_ptr<Tensor>& a, float s) { return rsub_scalar(s, a); })
         .def("__mul__",      [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return mul(a, b); })
         .def("__mul__",      [](const std::shared_ptr<Tensor>& a, float s) { return mul_scalar(a, s); })
         .def("__rmul__",     [](const std::shared_ptr<Tensor>& a, float s) { return mul_scalar(a, s); })
