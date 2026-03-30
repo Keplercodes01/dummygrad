@@ -8,6 +8,7 @@
 #include "optimizers.h"
 #include "scalar_ops.h"
 #include "broadcasting.h"
+#include "batch_norm.h"
 
 namespace py = pybind11;
 
@@ -220,6 +221,11 @@ PYBIND11_MODULE(dummygrad, m) {
     m.def("collapse", [](const std::shared_ptr<Tensor>& a, int axis) { return collapse(a, axis); });
     m.def("CrossEntropyLoss", [](const std::shared_ptr<Tensor>& pred, const std::shared_ptr<Tensor>& target) { return CrossEntropyLoss(pred, target); });
     m.def("SGD",     [](const std::shared_ptr<Tensor>& param, float lr) { SGD(param, lr); });
+    m.def("batch_norm", [](const std::shared_ptr<Tensor>& x,
+                            const std::shared_ptr<Tensor>& gamma,
+                            const std::shared_ptr<Tensor>& beta,
+                            float eps) { return batch_norm(x, gamma, beta, eps); },
+          py::arg("x"), py::arg("gamma"), py::arg("beta"), py::arg("eps") = 1e-5f);
 
     //dummy.tensor()
     m.def("tensor", [](std::vector<float> values, std::vector<int> shape) {
