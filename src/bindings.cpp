@@ -1,6 +1,13 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include "engine.h"
+#include "ops.h"
+#include "activations.h"
+#include "loss.h"
+#include "init.h"
+#include "optimizers.h"
+#include "scalar_ops.h"
+#include "broadcasting.h"
 
 namespace py = pybind11;
 
@@ -113,12 +120,20 @@ PYBIND11_MODULE(dummygrad, m) {
 
             return out;
         })
-
-        .def("__add__", [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return add(a, b); })
-        .def("__sub__", [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return sub(a, b); })
-        .def("__mul__", [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return mul(a, b); })
-        .def("__truediv__", [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return div(a, b); })
-        .def("__matmul__", [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return matmul(a, b); })
+        .def("__add__",      [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return add(a, b); })
+        .def("__add__",      [](const std::shared_ptr<Tensor>& a, float s) { return add_scalar(a, s); })
+        .def("__radd__",     [](const std::shared_ptr<Tensor>& a, float s) { return add_scalar(a, s); })
+        .def("__sub__",      [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return sub(a, b); })
+        .def("__sub__",      [](const std::shared_ptr<Tensor>& a, float s) { return sub_scalar(a, s); })
+        .def("__rsub__",     [](const std::shared_ptr<Tensor>& a, float s) { return rsub_scalar(f, a); })
+        .def("__mul__",      [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return mul(a, b); })
+        .def("__mul__",      [](const std::shared_ptr<Tensor>& a, float s) { return mul_scalar(a, s); })
+        .def("__rmul__",     [](const std::shared_ptr<Tensor>& a, float s) { return mul_scalar(a, s); })
+        .def("__truediv__",  [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return div(a, b); })
+        .def("__truediv__",  [](const std::shared_ptr<Tensor>& a, float s) { return div_scalar(a, s); })
+        .def("__rtruediv__", [](const std::shared_ptr<Tensor>& a, float s) { return rdiv_scalar(s, a); })
+        .def("__neg__",      [](const std::shared_ptr<Tensor>& a) { return neg(a); })
+        .def("__matmul__",   [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return matmul(a, b); })
         .def("backward", &Tensor::backward)
         .def("zero_grad", &Tensor::zero_grad)
         .def("fill", &Tensor::fill)
