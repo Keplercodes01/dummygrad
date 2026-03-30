@@ -54,8 +54,9 @@ pip install .
 ```
 
 ### Windows
+```bash
 Stop using Windows.
-
+```
 ---
 
 ## Usage
