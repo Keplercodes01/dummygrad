@@ -120,6 +120,44 @@ PYBIND11_MODULE(dummygrad, m) {
 
             return out;
         })
+        // integer index — single row
+        .def("__getitem__", [](const std::shared_ptr<Tensor>& a, int row) {
+            if(row < 0 || row >= a->shape[0]) throw std::out_of_range("index out of range. cmon man.");
+            int row_size = a->size() / a->shape[0];
+            std::vector<int> new_shape(a->shape.begin()+1, a->shape.end());
+            auto out = std::make_shared<Tensor>(new_shape);
+            out->storage = a->storage;
+            out->offset = a->offset + row * row_size;
+            return out;
+        })
+
+        // list of indices — for minibatch sampling and embedding lookup
+        .def("__getitem__", [](const std::shared_ptr<Tensor>& a, std::vector<int> indices) {
+            int row_size = a->size() / a->shape[0];
+            std::vector<int> new_shape = {(int)indices.size()};
+            for(int i = 1; i < (int)a->shape.size(); i++) new_shape.push_back(a->shape[i]);
+            auto out = std::make_shared<Tensor>(new_shape);
+            for(int i = 0; i < (int)indices.size(); i++) {
+                int row = indices[i];
+                if(row < 0 || row >= a->shape[0]) throw std::out_of_range("index out of range. cmon man.");
+                for(int j = 0; j < row_size; j++) {
+                    out->data_at(i * row_size + j) = a->data_at(row * row_size + j);
+                }
+            }
+            out->prev.push_back(a);
+            std::weak_ptr<Tensor> weak_out = out;
+            out->backward_fn = [a, weak_out, indices, row_size]() {
+                if(auto self = weak_out.lock()) {
+                    for(int i = 0; i < (int)indices.size(); i++) {
+                        int row = indices[i];
+                        for(int j = 0; j < row_size; j++) {
+                            a->grad_at(row * row_size + j) += self->grad_at(i * row_size + j);
+                        }
+                    }
+                }
+            };
+            return out;
+        })
         .def("__add__",      [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return add(a, b); })
         .def("__add__",      [](const std::shared_ptr<Tensor>& a, float s) { return add_scalar(a, s); })
         .def("__radd__",     [](const std::shared_ptr<Tensor>& a, float s) { return add_scalar(a, s); })
