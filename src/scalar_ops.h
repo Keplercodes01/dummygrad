@@ -1,3 +1,4 @@
+#pragma once
 #include"engine.h"
 
 inline std::shared_ptr<Tensor> add_scalar(const std::shared_ptr<Tensor>& a, float s) {
