@@ -177,7 +177,6 @@ PYBIND11_MODULE(dummygrad, m) {
         .def("zero_grad", &Tensor::zero_grad)
         .def("fill", &Tensor::fill)
         .def("size", &Tensor::size)
-        .def("view", [](const std::shared_ptr<Tensor>& a, std::vector<int> shape) { return a->view(shape); })
         .def_property("data",
             [](Tensor& t) {
                 return std::vector<float>(t.storage->data.begin() + t.offset,
@@ -214,6 +213,7 @@ PYBIND11_MODULE(dummygrad, m) {
     m.def("exp",     [](const std::shared_ptr<Tensor>& a) { return exp(a); });
     m.def("sum",     [](const std::shared_ptr<Tensor>& a) { return sum(a); });
     m.def("mean",    [](const std::shared_ptr<Tensor>& a) { return mean(a); });
+    m.def("view", [](const std::shared_ptr<Tensor>& a, std::vector<int> shape) { return view(a, shape); });
     m.def("softmax", [](const std::shared_ptr<Tensor>& a) { return softmax(a); });
     m.def("relu",    [](const std::shared_ptr<Tensor>& a) { return relu(a); });
     m.def("tanh",    [](const std::shared_ptr<Tensor>& a) { return tanh(a); });

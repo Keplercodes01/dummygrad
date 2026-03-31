@@ -74,19 +74,6 @@ class Tensor {
             storage->data = values;
         }
 
-        //view the tensor in a different shape
-        std::shared_ptr<Tensor> view(std::vector<int> new_shape) {
-            int total = 1;
-            for(int d : new_shape) total *= d;
-            if(total != size()) throw std::runtime_error("view: total elements must match. cmon man.");
-
-            auto out = std::make_shared<Tensor>(new_shape);
-            out->storage = storage;
-            out->offset = offset;
-
-            return out;
-        }
-
         //autograd 
         void backward(bool retain_graph = false) {
 
