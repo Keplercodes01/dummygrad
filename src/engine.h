@@ -53,7 +53,11 @@ class Tensor {
         float& data_at(int i) { return storage->data[offset + i]; }
         float& grad_at(int i) { return storage->grad[offset + i]; }
 
-        int size() { return storage->data.size(); } 
+        int size() {
+            int total = 1;
+            for(int d : shape) total *= d;
+            return total;
+        }
 
         //zero_grad
         void zero_grad() {
