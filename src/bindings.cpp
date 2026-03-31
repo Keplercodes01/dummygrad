@@ -173,7 +173,7 @@ PYBIND11_MODULE(dummygrad, m) {
         .def("__rtruediv__", [](const std::shared_ptr<Tensor>& a, float s) { return rdiv_scalar(s, a); })
         .def("__neg__",      [](const std::shared_ptr<Tensor>& a) { return neg(a); })
         .def("__matmul__",   [](const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) { return matmul(a, b); })
-        .def("backward", &Tensor::backward)
+        .def("backward", &Tensor::backward, py::arg("retain_graph") = false)
         .def("zero_grad", &Tensor::zero_grad)
         .def("fill", &Tensor::fill)
         .def("size", &Tensor::size)

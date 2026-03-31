@@ -84,7 +84,7 @@ class Tensor {
         }
 
         //autograd 
-        void backward() {
+        void backward(bool retain_graph = false) {
 
             if(this->size() > 1) {
                 throw std::runtime_error("Grad can only be initialized to 1.0 for scalars (size 1). Sum or mean your tensor first, man!");
@@ -109,6 +109,12 @@ class Tensor {
             for(int i=topo.size()-1; i>=0; i--) {
                 if(topo[i]->backward_fn) {
                     topo[i]->backward_fn();
+                }
+            }
+            if(!retain_graph) {
+                for(auto t : topo) {
+                    t->prev.clear();
+                    t->backward_fn = nullptr;
                 }
             }
         }
