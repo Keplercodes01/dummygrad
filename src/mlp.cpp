@@ -32,7 +32,7 @@ int main() {
     int batch_size = 32;
     
     std::cout << "dummygrad MLP" << std::endl;
-    auto words = load_words("names.txt");
+    auto words = load_words("/content/dummygrad/src/names.txt");
     std::cout<< "loaded" << words.size() << "words" << std::endl;
     
     return 0;
