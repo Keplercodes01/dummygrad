@@ -31,7 +31,6 @@ int main() {
     int block_size = 3;
     int n_embd = 10;
     int n_hidden = 200;
-    int vocab_size = 27;
     int batch_size = 32;
     
     std::cout << "dummygrad MLP" << std::endl;
@@ -55,7 +54,7 @@ int main() {
     itos[0] = '.';
     int vocab_size = stoi.size();
 
-    std::cout<"vocab size: " << vocab_size <<std::endl;
+    std::cout<<"vocab size: " << vocab_size <<std::endl;
     
     return 0;
 }
