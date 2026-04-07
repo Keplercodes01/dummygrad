@@ -33,3 +33,18 @@ inline std::shared_ptr<Tensor> batch_norm(
 
     return add(mul(gamma_b, norm), beta_b);
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

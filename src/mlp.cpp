@@ -25,22 +25,13 @@ std::vector<std::string> load_words(const std::string& filename) {
     }
     return words;
 }
+
 int main() {
-    
-    // hyperparameters
-    int block_size = 3;
-    int n_embd = 10;
-    int n_hidden = 200;
-    int batch_size = 32;
-    
-    std::cout << "dummygrad MLP" << std::endl;
     auto words = load_words("/content/dummygrad/src/names.txt");
-    std::cout<< "loaded" << words.size() << "words" << std::endl;
 
     //build vocab
     std::map<char, int> stoi;
     std::map<int, char> itos;
-
     std::set<char> chars;
     for(auto& w : words) for(char c : w) chars.insert(c);
 
@@ -54,7 +45,29 @@ int main() {
     itos[0] = '.';
     int vocab_size = stoi.size();
 
-    std::cout<<"vocab size: " << vocab_size <<std::endl;
+    // hyperparameters
+    int block_size = 3;
+    int n_embd = 10;
+    int n_hidden = 200;
+    int batch_size = 32;
+
+    //build the dataset
+    std::shared_ptr<Tensor> build_dataset(std::shared_ptr<Tensor>& words) {
+        auto X = std::make_shared<Tensor>(std::vector<int>{
+    }
     
     return 0;
 }
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    

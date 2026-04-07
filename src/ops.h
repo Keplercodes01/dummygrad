@@ -3,11 +3,9 @@
 
 //add
 inline std::shared_ptr<Tensor> add(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
-
     if(a->shape != b->shape) {
         throw std::runtime_error("Shape mismatch in addition. Cmon man..");
     }
-
     auto out = std::make_shared<Tensor>(a->shape);
 
     for(int i=0; i<out->size(); i++) {
@@ -32,11 +30,9 @@ inline std::shared_ptr<Tensor> add(const std::shared_ptr<Tensor>& a, const std::
                          
 //sub
 inline std::shared_ptr<Tensor> sub(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
-
     if(a->shape != b->shape) {
         throw std::runtime_error("Shape mismatch in subtraction. Cmon man..");
     }
-
     auto out = std::make_shared<Tensor>(a->shape);
 
     for(int i=0; i<out->size(); i++) {
@@ -61,11 +57,9 @@ inline std::shared_ptr<Tensor> sub(const std::shared_ptr<Tensor>& a, const std::
 
 //mul
 inline std::shared_ptr<Tensor> mul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
-
     if(a->shape != b->shape) {
         throw std::runtime_error("Shape mismatch in multiplication. Cmon man..");
     }
-
     auto out = std::make_shared<Tensor>(a->shape);
 
     for(int i=0; i<out->size(); i++) {
@@ -90,11 +84,9 @@ inline std::shared_ptr<Tensor> mul(const std::shared_ptr<Tensor>& a, const std::
 
 //divide
 inline std::shared_ptr<Tensor> div(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
-
     if(a->shape != b->shape) {
         throw std::runtime_error("Shape mismatch in division. Cmon man..");
     }
-
     auto out = std::make_shared<Tensor>(a->shape);
 
     for(int i=0; i<out->size(); i++) {
@@ -155,7 +147,6 @@ inline std::shared_ptr<Tensor> transpose(const std::shared_ptr<Tensor>& a) {
 
 //the mighty matmul
 inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
-
     int n1 = a->shape.size();
     int n2 = b->shape.size();
 
@@ -241,7 +232,6 @@ inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const st
 //pow
 inline std::shared_ptr<Tensor> pow(const std::shared_ptr<Tensor>& a, const int n) {
     auto out = std::make_shared<Tensor>(a->shape);
-
     for(int i = 0; i<a->size(); i++) {
         out->data_at(i) = std::pow(a->data_at(i), n);
     }
@@ -263,7 +253,6 @@ inline std::shared_ptr<Tensor> pow(const std::shared_ptr<Tensor>& a, const int n
 //sqrt
 inline std::shared_ptr<Tensor> sqrt(const std::shared_ptr<Tensor>& a) {
     auto out = std::make_shared<Tensor>(a->shape);
-
     for(int i = 0; i<a->size(); i++) {
         out->data_at(i) = std::sqrt(a->data_at(i));
     }
@@ -284,7 +273,6 @@ inline std::shared_ptr<Tensor> sqrt(const std::shared_ptr<Tensor>& a) {
 
 //log
 inline std::shared_ptr<Tensor> log(const std::shared_ptr<Tensor>& a) {
-
     auto out = std::make_shared<Tensor>(a->shape); 
 
     float epsilon = 1e-8f;
@@ -308,7 +296,6 @@ inline std::shared_ptr<Tensor> log(const std::shared_ptr<Tensor>& a) {
 
 //exp
 inline std::shared_ptr<Tensor> exp(const std::shared_ptr<Tensor>& a) {
-
     auto out = std::make_shared<Tensor>(a->shape);
 
     for(int i=0; i<out->size(); i++) {

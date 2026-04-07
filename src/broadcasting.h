@@ -25,7 +25,6 @@ inline std::shared_ptr<Tensor> broadcast(const std::shared_ptr<Tensor>& a, int a
         }
     }
     out->prev.push_back(a);
-
     std::weak_ptr<Tensor> weak_out = out;
 
     out->backward_fn = [a, weak_out, r, c, n, axis]() {
@@ -78,7 +77,6 @@ inline std::shared_ptr<Tensor> collapse(const std::shared_ptr<Tensor>& a, int ax
         }
     }
     out->prev.push_back(a);
-
     std::weak_ptr<Tensor> weak_out = out;
 
     out->backward_fn = [a, weak_out, r, c, axis]() {

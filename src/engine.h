@@ -76,6 +76,74 @@ class Tensor {
             storage->data = values;
         }
 
+        //show tensor
+        void show_recursive_data(int dim,  int offset) {
+            if(dim == shape.size()-1) {
+                //its the last dimension so print the actual values 
+                std::cout<<"[";
+                for(int i = 0; i<shape[dim]; i++) {
+                    std::cout<< data_at(offset + i);
+                    if(i < shape[dim]-1) std::cout<< ",";
+                }
+                std::cout<< "]"; 
+            }else {
+                std::cout<< "[";
+                for(int i = 0; i<shape[dim]; i++) {
+                    show_recursive_data(dim+1, offset + i*strides[dim]);  
+                    if(i<shape[dim]-1) {
+                        std::cout<< ",\n";
+                        for(int d = 0; d<=dim; d++) {
+                            std::cout<< " ";
+                        }
+                    }
+                }
+                std::cout<< "]"; 
+            }
+        }
+        void show() {
+            show_recursive_data(0, 0);
+            std::cout<< ", shape=(";
+            for(int i = 0; i<shape.size(); i++) {
+                std::cout<< shape[i];
+                if(i<shape.size()-1) std::cout<< ",";
+            }
+            std::cout<< ")" <<std::endl;
+        }
+
+        //show gradients
+        void show_recursive_grad(int dim,  int offset) {
+            if(dim == shape.size()-1) {
+                //its the last dimension so print the actual values 
+                std::cout<<"[";
+                for(int i = 0; i<shape[dim]; i++) {
+                    std::cout<< grad_at(offset + i);
+                    if(i < shape[dim]-1) std::cout<< ",";
+                }
+                std::cout<< "]"; 
+            }else {
+                std::cout<< "[";
+                for(int i = 0; i<shape[dim]; i++) {
+                    show_recursive_grad(dim+1, offset + i*strides[dim]);  
+                    if(i<shape[dim]-1) {
+                        std::cout<< ",\n";
+                        for(int d = 0; d<=dim; d++) {
+                            std::cout<< " ";
+                        }
+                    }
+                }
+                std::cout<< "]"; 
+            }
+        }
+        void show_grad() {
+            show_recursive_grad(0, 0);
+            std::cout<< ", shape=(";
+            for(int i = 0; i<shape.size(); i++) {
+                std::cout<< shape[i];
+                if(i<shape.size()-1) std::cout<< ",";
+            }
+            std::cout<< ")" <<std::endl;
+        }
+
         //autograd 
         void backward(bool retain_graph = false) {
 

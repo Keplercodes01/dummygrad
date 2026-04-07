@@ -1,6 +1,7 @@
 #pragma once
 #include"engine.h"
 
+//add_scalar
 inline std::shared_ptr<Tensor> add_scalar(const std::shared_ptr<Tensor>& a, float s) {
     auto out = std::make_shared<Tensor>(a->shape);
     for(int i = 0; i < a->size(); i++) out->data_at(i) = a->data_at(i) + s;
@@ -14,6 +15,7 @@ inline std::shared_ptr<Tensor> add_scalar(const std::shared_ptr<Tensor>& a, floa
     return out;
 }
 
+//sub_scalar
 inline std::shared_ptr<Tensor> sub_scalar(const std::shared_ptr<Tensor>& a, float s) {
     auto out = std::make_shared<Tensor>(a->shape);
     for(int i = 0; i < a->size(); i++) out->data_at(i) = a->data_at(i) - s;
@@ -27,6 +29,7 @@ inline std::shared_ptr<Tensor> sub_scalar(const std::shared_ptr<Tensor>& a, floa
     return out;
 }
 
+//mul_scalar
 inline std::shared_ptr<Tensor> mul_scalar(const std::shared_ptr<Tensor>& a, float s) {
     auto out = std::make_shared<Tensor>(a->shape);
     for(int i = 0; i < a->size(); i++) out->data_at(i) = a->data_at(i) * s;
@@ -40,6 +43,7 @@ inline std::shared_ptr<Tensor> mul_scalar(const std::shared_ptr<Tensor>& a, floa
     return out;
 }
 
+//div_scalar
 inline std::shared_ptr<Tensor> div_scalar(const std::shared_ptr<Tensor>& a, float s) {
     auto out = std::make_shared<Tensor>(a->shape);
     for(int i = 0; i < a->size(); i++) out->data_at(i) = a->data_at(i) / s;
@@ -53,10 +57,12 @@ inline std::shared_ptr<Tensor> div_scalar(const std::shared_ptr<Tensor>& a, floa
     return out;
 }
 
+//neg
 inline std::shared_ptr<Tensor> neg(const std::shared_ptr<Tensor>& a) {
     return mul_scalar(a, -1.0f);
 }
 
+//rsub_scalar
 inline std::shared_ptr<Tensor> rsub_scalar(float s, const std::shared_ptr<Tensor>& a) {
     auto out = std::make_shared<Tensor>(a->shape);
     for(int i = 0; i < a->size(); i++) out->data_at(i) = s - a->data_at(i);
@@ -70,6 +76,7 @@ inline std::shared_ptr<Tensor> rsub_scalar(float s, const std::shared_ptr<Tensor
     return out;
 }
 
+//rdiv_scalar
 inline std::shared_ptr<Tensor> rdiv_scalar(float s, const std::shared_ptr<Tensor>& a) {
     auto out = std::make_shared<Tensor>(a->shape);
     for(int i = 0; i < a->size(); i++) out->data_at(i) = s / a->data_at(i);
