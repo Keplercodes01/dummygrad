@@ -3,43 +3,62 @@
 
 //broadcast
 inline std::shared_ptr<Tensor> broadcast(const std::shared_ptr<Tensor>& a, int axis, int n) {
-    int r = a->shape[0];
-    int c = a->shape[1];
+    int ndim = a->shape.size();
+    int r = a->shape[ndim-2];
+    int c = a->shape[ndim-1];
 
-    auto out = std::make_shared<Tensor>(
-            axis == 0 ? std::vector<int>{n, c} : std::vector<int>{r, n}
-    );
+    if(axis == 0 && r != 1) { throw std::runtime_error("The dimension to be broadcasted should be 1...cmon man"); }
+    if(axis == 1 && c != 1) { throw std::runtime_error("The dimension to be broadcasted should be 1...cmon man"); }
 
+    int batch_size = 1;
+    for(int i = 0; i<ndim-2; i++) { batch_size *= a->shape[i]; } 
+
+    //calculate out_shape
+    std::vector<int> out_shape = a->shape;
+    axis == 0 ? out_shape[ndim-2] = n : out_shape[ndim-1] = n;
+
+    auto out = std::make_shared<Tensor>(out_shape);
+
+    //forward
     if(axis == 0) {
-        for(int i = 0; i<n; i++) {
-            for(int j = 0; j<c; j++) {
-                out->data_at(i*c + j) = a->data_at(j);
+        for(int batch = 0; batch<batch_size; batch++) {
+            for(int i = 0; i<n; i++) {
+                for(int j = 0; j<c; j++) {
+                    out->data_at(i*c + j + batch*n*c) = a->data_at(j + batch*c);
+                }
             }
         }
     }
     else {
-        for(int i = 0; i<r; i++) {
-            for(int j = 0; j<n; j++) {
-                out->data_at(i*n + j) = a->data_at(i);
+        for(int batch = 0; batch<batch_size; batch++) {
+            for(int i = 0; i<r; i++) {
+                for(int j = 0; j<n; j++) {
+                    out->data_at(i*n + j + batch*r*n) = a->data_at(i + batch*r);
+                }
             }
         }
     }
     out->prev.push_back(a);
     std::weak_ptr<Tensor> weak_out = out;
 
-    out->backward_fn = [a, weak_out, r, c, n, axis]() {
+    //backward
+    out->backward_fn = [a, weak_out, r, c, n, batch_size, axis, ndim]() {
         if(auto self = weak_out.lock()) {
             if(axis == 0) {
-                for(int i = 0; i<n; i++) {
-                    for(int j = 0; j<c; j++) {
-                        a->grad_at(j) += self->grad_at(i*c + j);
+                for(int batch = 0; batch < batch_size; batch++) {
+                    for(int i = 0; i < n; i++) {
+                        for(int j = 0; j < c; j++) {
+                            a->grad_at(j + batch*c) += self->grad_at(i*c + j + batch*n*c);
+                        }
                     }
                 }
             }
             else {
-                for(int i = 0; i<r; i++) {
-                    for(int j = 0; j<n; j++) {
-                        a->grad_at(i) += self->grad_at(i*n + j);
+                for(int batch = 0; batch < batch_size; batch++) {
+                    for(int i = 0; i < r; i++) {
+                        for(int j = 0; j < n; j++) {
+                            a->grad_at(i + batch*r) += self->grad_at(i*n + j + batch*r*n);
+                        }
                     }
                 }
             }
@@ -51,47 +70,63 @@ inline std::shared_ptr<Tensor> broadcast(const std::shared_ptr<Tensor>& a, int a
 
 //collapse
 inline std::shared_ptr<Tensor> collapse(const std::shared_ptr<Tensor>& a, int axis) {
-    int r = a->shape[0];
-    int c = a->shape[1];
+    int ndim = a->shape.size();
+    int r = a->shape[ndim-2];
+    int c = a->shape[ndim-1];
 
-    auto out = std::make_shared<Tensor>(
-            axis == 0 ? std::vector<int>{1, c} : std::vector<int>{r, 1}
-    );
+    int batch_size = 1;
+    for(int i = 0; i<ndim-2; i++) { batch_size *= a->shape[i]; } 
 
+    //calculate out_shape
+    std::vector<int> out_shape = a->shape;
+    axis == 0 ? out_shape[ndim-2] = 1 : out_shape[ndim-1] = 1;
+
+    auto out = std::make_shared<Tensor>(out_shape);
+
+    //forward
     if(axis == 0) {
-        for(int i = 0; i<c; i++) {
-            float total = 0.0f; 
-            for(int j = 0; j<r; j++) {
-                total += a->data_at(j*c + i);
+        for(int batch = 0; batch<batch_size; batch++) {
+            for(int i = 0; i<c; i++) {
+                float total = 0.0f; 
+                for(int j = 0; j<r; j++) {
+                    total += a->data_at(j*c + i + batch*r*c);
+                }
+                out->data_at(i + batch*c) = total;
             }
-            out->data_at(i) = total;
         }
     }
     else {
-        for(int i = 0; i<r; i++) {
-            float total = 0.0f;
-            for(int j = 0; j<c; j++) {
-                total += a->data_at(i*c + j);
+        for(int batch = 0; batch<batch_size; batch++) {
+            for(int i = 0; i<r; i++) {
+                float total = 0.0f;
+                for(int j = 0; j<c; j++) {
+                    total += a->data_at(i*c + j + batch*r*c);
+                }
+                out->data_at(i + batch*r) = total;
             }
-            out->data_at(i) = total;
         }
     }
     out->prev.push_back(a);
     std::weak_ptr<Tensor> weak_out = out;
 
-    out->backward_fn = [a, weak_out, r, c, axis]() {
+    //backward
+    out->backward_fn = [a, weak_out, r, c, axis, ndim, batch_size]() {
         if(auto self = weak_out.lock()) {
             if(axis == 0) {
-                for(int i = 0; i<c; i++) {
-                    for(int j = 0; j<r; j++) {
-                        a->grad_at(j*c + i) += self->grad_at(i);
+                for(int batch = 0; batch<batch_size; batch++) {
+                    for(int i = 0; i<c; i++) {
+                        for(int j = 0; j<r; j++) {
+                            a->grad_at(j*c + i + batch*r*c) += self->grad_at(i + batch*c);
+                        }
                     }
                 }
             }
             else {
-                for(int i = 0; i<r; i++) {
-                    for(int j = 0; j<c; j++) {
-                        a->grad_at(i*c + j) += self->grad_at(i);
+                for(int batch = 0; batch<batch_size; batch++) {
+                    for(int i = 0; i<r; i++) {
+                        for(int j = 0; j<c; j++) {
+                            a->grad_at(i*c + j + batch*r*c) += self->grad_at(i + batch*r);
+                        }
                     }
                 }
             }

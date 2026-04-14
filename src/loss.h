@@ -40,7 +40,7 @@ inline std::shared_ptr<Tensor> mse(const std::shared_ptr<Tensor>& pred, const st
     float sq_sum = 0.0f; 
     int n = static_cast<int>(pred->size());
     for(int i = 0; i<n; i++) {
-        sq_sum += (target->data_at(i) - pred->data_at(i))**2; 
+        sq_sum += std::pow(target->data_at(i) - pred->data_at(i), 2);
     }
     out->data_at(0) = sq_sum/n;
     out->prev.push_back(pred);

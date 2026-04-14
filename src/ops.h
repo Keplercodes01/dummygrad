@@ -379,3 +379,32 @@ inline std::shared_ptr<Tensor> view(const std::shared_ptr<Tensor>& a, std::vecto
 
     return out;
 }
+
+//standard deviation
+inline std::shared_ptr<Tensor> std(const std::shared_ptr<Tensor>& a, int dim) {
+    int n = a->shape.size();
+    int r = a->shape[n-2];
+    int c = a->shape[n-1];
+    std::vector<int> out_shape = a->shape.pop_back().push_back(1);
+
+    int batch_size = 1;
+    for(int i = 0; i<n-2; i++) { batch_size *= a->shape[i]; }
+
+    auto out = std::make_shared<Tensor>(out_shape);
+    for(int batch = 0; batch<batch_size; batch++) {
+        for(int i = 0; i<r; i++) {
+            float sum = 0.0f;
+            for(int j = 0; j<c; j++) {
+                sum += a->data_at(i*r + j + batch*r*c);
+            }
+            out->data_at(i + batch*r) = std::sqrt(sum/c);
+        }
+    }
+    out->prev.push_back(a);
+
+    std::weak_ptr<Tensor> weak_out = out; 
+
+    out->backward_fn = [a, weak_out, n, r, c, batch_size]() {
+    }
+
+}
