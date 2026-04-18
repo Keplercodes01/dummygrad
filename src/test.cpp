@@ -18,7 +18,7 @@ int main() {
     int n_head = 3;
     int head_size = n_embd / n_head;
     int n_hidden = 100;
-    //more coming up..
+    //will write the full transformer..
 
     return 0;
 }
