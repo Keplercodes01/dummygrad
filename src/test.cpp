@@ -18,11 +18,7 @@ int main() {
     int n_head = 3;
     int head_size = n_embd / n_head;
     int n_hidden = 100;
-
-    auto emb = kaiming({});
-    auto L1 = Linear(4, 8, 1.0f);
-    auto L2 = Linear(8, 
-    auto out = L1.forward(a, 3);
+    //more coming up..
 
     return 0;
 }
