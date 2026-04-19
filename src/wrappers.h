@@ -9,6 +9,7 @@
 #include "optimizers.h"
 #include "init.h"
 
+//linear layer
 class Linear {
     public:    
         std::shared_ptr<Tensor> W;
@@ -33,3 +34,14 @@ class Linear {
         }
 };
 
+//layernorm
+class Layer_norm {
+    public:
+        float epsilon = 1e-8f;
+        std::shared_ptr<Tensor> gamma;
+        std::shared_ptr<Tensor> beta;
+
+        Layer_norm(int features, float epsilon = 1e-5f) : epsilon(epsilon) {
+            gamma = std::make_shared<Tensor>(
+        }
+}
