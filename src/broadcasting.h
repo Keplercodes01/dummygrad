@@ -135,3 +135,168 @@ inline std::shared_ptr<Tensor> collapse(const std::shared_ptr<Tensor>& a, int ax
 
     return out;
 }
+
+//broadcast and add
+inline std::shared_ptr<Tensor> cast_add(const std::shared_ptr<Tensor>& x,
+                                         const std::shared_ptr<Tensor>& y) {
+    int ndim = x->shape.size();
+    int r = x->shape[ndim-2];
+    int c = x->shape[ndim-1];
+    int batch_size = 1;
+    for(int i = 0; i < ndim-2; i++) { batch_size *= x->shape[i]; }
+
+    auto out = std::make_shared<Tensor>(x->shape);
+
+    for(int batch = 0; batch < batch_size; batch++) {
+        for(int i = 0; i < r; i++) {
+            for(int j = 0; j < c; j++) {
+                int x_idx = batch*r*c + i*c + j;
+                int y_idx = i*c + j;
+                out->data_at(x_idx) = x->data_at(x_idx) + y->data_at(y_idx);
+            }
+        }
+    }
+
+    out->prev = {x, y};
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [x, y, weak_out, r, c, batch_size]() {
+        if(auto self = weak_out.lock()) {
+            for(int batch = 0; batch < batch_size; batch++) {
+                for(int i = 0; i < r; i++) {
+                    for(int j = 0; j < c; j++) {
+                        int x_idx = batch*r*c + i*c + j;
+                        int y_idx = i*c + j;
+                        x->grad_at(x_idx) += self->grad_at(x_idx);
+                        y->grad_at(y_idx) += self->grad_at(x_idx); 
+                    }
+                }
+            }
+        }
+    };
+    return out;
+}
+
+//broadcast and subtract
+inline std::shared_ptr<Tensor> cast_sub(const std::shared_ptr<Tensor>& x,
+                                         const std::shared_ptr<Tensor>& y) {
+    int ndim = x->shape.size();
+    int r = x->shape[ndim-2];
+    int c = x->shape[ndim-1];
+    int batch_size = 1;
+    for(int i = 0; i < ndim-2; i++) { batch_size *= x->shape[i]; }
+
+    auto out = std::make_shared<Tensor>(x->shape);
+
+    for(int batch = 0; batch < batch_size; batch++) {
+        for(int i = 0; i < r; i++) {
+            for(int j = 0; j < c; j++) {
+                int x_idx = batch*r*c + i*c + j;
+                int y_idx = i*c + j;
+                out->data_at(x_idx) = x->data_at(x_idx) - y->data_at(y_idx);
+            }
+        }
+    }
+
+    out->prev = {x, y};
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [x, y, weak_out, r, c, batch_size]() {
+        if(auto self = weak_out.lock()) {
+            for(int batch = 0; batch < batch_size; batch++) {
+                for(int i = 0; i < r; i++) {
+                    for(int j = 0; j < c; j++) {
+                        int x_idx = batch*r*c + i*c + j;
+                        int y_idx = i*c + j;
+                        x->grad_at(x_idx) += self->grad_at(x_idx);
+                        y->grad_at(y_idx) -= self->grad_at(x_idx); 
+                    }
+                }
+            }
+        }
+    };
+    return out;
+}
+
+//broadcast and multiply
+inline std::shared_ptr<Tensor> cast_mul(const std::shared_ptr<Tensor>& x,
+                                         const std::shared_ptr<Tensor>& y) {
+    int ndim = x->shape.size();
+    int r = x->shape[ndim-2];
+    int c = x->shape[ndim-1];
+    int batch_size = 1;
+    for(int i = 0; i < ndim-2; i++) { batch_size *= x->shape[i]; }
+
+    auto out = std::make_shared<Tensor>(x->shape);
+
+    for(int batch = 0; batch < batch_size; batch++) {
+        for(int i = 0; i < r; i++) {
+            for(int j = 0; j < c; j++) {
+                int x_idx = batch*r*c + i*c + j;
+                int y_idx = i*c + j;
+                out->data_at(x_idx) = x->data_at(x_idx) * y->data_at(y_idx);
+            }
+        }
+    }
+
+    out->prev = {x, y};
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [x, y, weak_out, r, c, batch_size]() {
+        if(auto self = weak_out.lock()) {
+            for(int batch = 0; batch < batch_size; batch++) {
+                for(int i = 0; i < r; i++) {
+                    for(int j = 0; j < c; j++) {
+                        int x_idx = batch*r*c + i*c + j;
+                        int y_idx = i*c + j;
+                        x->grad_at(x_idx) += y->data_at(y_idx) * self->grad_at(x_idx);
+                        y->grad_at(y_idx) += x->data_at(x_idx) * self->grad_at(x_idx);
+                    }
+                }
+            }
+        }
+    };
+    return out;
+}
+
+//broadcast and divide
+inline std::shared_ptr<Tensor> cast_div(const std::shared_ptr<Tensor>& x,
+                                         const std::shared_ptr<Tensor>& y) {
+    int ndim = x->shape.size();
+    int r = x->shape[ndim-2];
+    int c = x->shape[ndim-1];
+    int batch_size = 1;
+    for(int i = 0; i < ndim-2; i++) { batch_size *= x->shape[i]; }
+
+    auto out = std::make_shared<Tensor>(x->shape);
+
+    for(int batch = 0; batch < batch_size; batch++) {
+        for(int i = 0; i < r; i++) {
+            for(int j = 0; j < c; j++) {
+                int x_idx = batch*r*c + i*c + j;
+                int y_idx = i*c + j;
+                out->data_at(x_idx) = x->data_at(x_idx) / y->data_at(y_idx);
+            }
+        }
+    }
+
+    out->prev = {x, y};
+    std::weak_ptr<Tensor> weak_out = out;
+
+    out->backward_fn = [x, y, weak_out, r, c, batch_size]() {
+        if(auto self = weak_out.lock()) {
+            for(int batch = 0; batch < batch_size; batch++) {
+                for(int i = 0; i < r; i++) {
+                    for(int j = 0; j < c; j++) {
+                        int x_idx = batch*r*c + i*c + j;
+                        int y_idx = i*c + j;
+                        x->grad_at(x_idx) += self->grad_at(x_idx) / y->data_at(y_idx);
+                        y->grad_at(y_idx) -= (x->data_at(x_idx) * self->grad_at(x_idx))
+                                           / (y->data_at(y_idx) * y->data_at(y_idx)); 
+                    }
+                }
+            }
+        }
+    };
+    return out;
+}
