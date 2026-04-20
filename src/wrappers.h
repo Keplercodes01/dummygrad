@@ -8,9 +8,10 @@
 #include "cool_ops.h"
 #include "optimizers.h"
 #include "init.h"
+#include "masking.h"
 
 //linear layer
-class linear {
+class Linear {
     public:    
         std::shared_ptr<Tensor> W;
         std::shared_ptr<Tensor> b;
@@ -35,7 +36,7 @@ class linear {
 };
 
 //layernorm
-class layernorm {
+class LayerNorm {
 public:
     std::shared_ptr<Tensor> gamma;
     std::shared_ptr<Tensor> beta;

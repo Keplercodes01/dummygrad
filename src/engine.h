@@ -10,6 +10,7 @@
 #include<vector>
 #include<functional>
 #include<algorithm>
+#include<limits>
 
 struct Storage {
     std::vector<float> data;

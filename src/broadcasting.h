@@ -68,76 +68,8 @@ inline std::shared_ptr<Tensor> broadcast(const std::shared_ptr<Tensor>& a, int a
     return out;
 }
 
-//collapse
-inline std::shared_ptr<Tensor> collapse(const std::shared_ptr<Tensor>& a, int axis) {
-    int ndim = a->shape.size();
-    int r = a->shape[ndim-2];
-    int c = a->shape[ndim-1];
-
-    int batch_size = 1;
-    for(int i = 0; i<ndim-2; i++) { batch_size *= a->shape[i]; } 
-
-    //calculate out_shape
-    std::vector<int> out_shape = a->shape;
-    axis == 0 ? out_shape[ndim-2] = 1 : out_shape[ndim-1] = 1;
-
-    auto out = std::make_shared<Tensor>(out_shape);
-
-    //forward
-    if(axis == 0) {
-        for(int batch = 0; batch<batch_size; batch++) {
-            for(int i = 0; i<c; i++) {
-                float total = 0.0f; 
-                for(int j = 0; j<r; j++) {
-                    total += a->data_at(j*c + i + batch*r*c);
-                }
-                out->data_at(i + batch*c) = total;
-            }
-        }
-    }
-    else {
-        for(int batch = 0; batch<batch_size; batch++) {
-            for(int i = 0; i<r; i++) {
-                float total = 0.0f;
-                for(int j = 0; j<c; j++) {
-                    total += a->data_at(i*c + j + batch*r*c);
-                }
-                out->data_at(i + batch*r) = total;
-            }
-        }
-    }
-    out->prev.push_back(a);
-    std::weak_ptr<Tensor> weak_out = out;
-
-    //backward
-    out->backward_fn = [a, weak_out, r, c, axis, ndim, batch_size]() {
-        if(auto self = weak_out.lock()) {
-            if(axis == 0) {
-                for(int batch = 0; batch<batch_size; batch++) {
-                    for(int i = 0; i<c; i++) {
-                        for(int j = 0; j<r; j++) {
-                            a->grad_at(j*c + i + batch*r*c) += self->grad_at(i + batch*c);
-                        }
-                    }
-                }
-            }
-            else {
-                for(int batch = 0; batch<batch_size; batch++) {
-                    for(int i = 0; i<r; i++) {
-                        for(int j = 0; j<c; j++) {
-                            a->grad_at(i*c + j + batch*r*c) += self->grad_at(i + batch*r);
-                        }
-                    }
-                }
-            }
-        }
-    };
-
-    return out;
-}
-
 //broadcast and add
-inline std::shared_ptr<Tensor> cast_add(const std::shared_ptr<Tensor>& x,
+inline std::shared_ptr<Tensor> cast_n_add(const std::shared_ptr<Tensor>& x,
                                          const std::shared_ptr<Tensor>& y) {
     int ndim = x->shape.size();
     int r = x->shape[ndim-2];
@@ -178,7 +110,7 @@ inline std::shared_ptr<Tensor> cast_add(const std::shared_ptr<Tensor>& x,
 }
 
 //broadcast and subtract
-inline std::shared_ptr<Tensor> cast_sub(const std::shared_ptr<Tensor>& x,
+inline std::shared_ptr<Tensor> cast_n_sub(const std::shared_ptr<Tensor>& x,
                                          const std::shared_ptr<Tensor>& y) {
     int ndim = x->shape.size();
     int r = x->shape[ndim-2];
@@ -219,7 +151,7 @@ inline std::shared_ptr<Tensor> cast_sub(const std::shared_ptr<Tensor>& x,
 }
 
 //broadcast and multiply
-inline std::shared_ptr<Tensor> cast_mul(const std::shared_ptr<Tensor>& x,
+inline std::shared_ptr<Tensor> cast_n_mul(const std::shared_ptr<Tensor>& x,
                                          const std::shared_ptr<Tensor>& y) {
     int ndim = x->shape.size();
     int r = x->shape[ndim-2];
@@ -260,7 +192,7 @@ inline std::shared_ptr<Tensor> cast_mul(const std::shared_ptr<Tensor>& x,
 }
 
 //broadcast and divide
-inline std::shared_ptr<Tensor> cast_div(const std::shared_ptr<Tensor>& x,
+inline std::shared_ptr<Tensor> cast_n_div(const std::shared_ptr<Tensor>& x,
                                          const std::shared_ptr<Tensor>& y) {
     int ndim = x->shape.size();
     int r = x->shape[ndim-2];
