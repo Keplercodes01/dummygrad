@@ -27,7 +27,7 @@ class Linear {
         }
 
         std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x, int batch_size) {
-            return cast_add(matmul(x, W), b);
+            return cast_n_add(matmul(x, W), b);
         }
 
         std::vector<std::shared_ptr<Tensor>> parameters() {
@@ -53,13 +53,13 @@ public:
 
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x) {
         auto mu       = mean(x, 1);
-        auto xmu      = cast_sub(x, mu);
+        auto xmu      = cast_n_sub(x, mu);
 
         auto variance = var(x, 1);
-        auto var_eps  = scalar_add(variance, eps);
+        auto var_eps  = add_scalar(variance, eps);
         auto std_dev  = sqrt(var_eps);
 
-        auto x_norm   = cast_div(xmu, std_dev);
+        auto x_norm   = cast_n_div(xmu, std_dev);
         return scale_n_shift(x_norm, gamma, beta);
     }
 

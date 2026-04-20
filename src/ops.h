@@ -598,7 +598,7 @@ inline std::shared_ptr<Tensor> mean(const std::shared_ptr<Tensor>& a, int axis) 
 }
 
 //standard deviation
-inline std::shared_ptr<Tensor> std(const std::shared_ptr<Tensor>& a, int axis) {
+inline std::shared_ptr<Tensor> std_dev(const std::shared_ptr<Tensor>& a, int axis) {
     int ndim = a->shape.size();
     int r = a->shape[ndim-2];
     int c = a->shape[ndim-1];
@@ -663,6 +663,7 @@ inline std::shared_ptr<Tensor> std(const std::shared_ptr<Tensor>& a, int axis) {
                         for(int j = 0; j<r; j++) {
                             x += std::pow(a->data_at(j*c + i + batch*r*c) - mean, 2);
                         }
+
                         float _std = std::sqrt(x/r);
                         for(int j = 0; j<r; j++) {
                             a->grad_at(j*c + i + batch*r*c) += ((a->data_at(j*c + i + batch*r*c) - mean) / (r*_std)) * self->grad_at(i + batch*c);
@@ -682,6 +683,7 @@ inline std::shared_ptr<Tensor> std(const std::shared_ptr<Tensor>& a, int axis) {
                         for(int j = 0; j<c; j++) {
                             x += std::pow(a->data_at(i*c + j + batch*r*c) - mean, 2);
                         }
+
                         float _std = std::sqrt(x/c);
                         for(int j = 0; j<c; j++) {
                             a->grad_at(i*c + j + batch*r*c) += ((a->data_at(i*c + j + batch*r*c) - mean) / (c*_std)) * self->grad_at(i + batch*r);  
