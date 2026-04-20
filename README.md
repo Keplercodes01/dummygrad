@@ -3,7 +3,7 @@
 An AI engine written from scratch in C++.
 i honestly made it for my selfish reasons.
 i train my neural nets in c++ with my engine.
-im fixing it as i learnt more. 
+im fixing it as i learn more. 
 i think you should read the source code actually. 
 its fun. 
 ok bye.
