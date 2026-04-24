@@ -118,7 +118,11 @@ public:
         : W_q(d_model, d_model), W_k(d_model, d_model), W_v(d_model, d_model), d_k(d_model/h), casual(casual) {}
 
     std::shared_ptr<Tensor> forward(std::shared_ptr<Tensor>& x) {
-        auto Q = W_q.forward(x)  
+        auto Q = W_q.forward(x);  
+        auto K = W_k.forward(x);
+        auto V = W_v.forward(x);
+
+
     }
 }
 
