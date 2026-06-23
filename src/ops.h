@@ -4,7 +4,7 @@
 //add
 inline std::shared_ptr<Tensor> add(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
     if(a->shape != b->shape) {
-        throw std::runtime_error("Shape mismatch in addition. Cmon man..");
+        throw std::runtime_error("add: shape mismatch in addition. cmon man..");
     }
     auto out = std::make_shared<Tensor>(a->shape);
 
@@ -31,7 +31,7 @@ inline std::shared_ptr<Tensor> add(const std::shared_ptr<Tensor>& a, const std::
 //sub
 inline std::shared_ptr<Tensor> sub(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
     if(a->shape != b->shape) {
-        throw std::runtime_error("Shape mismatch in subtraction. Cmon man..");
+        throw std::runtime_error("sub: shape mismatch in subtraction. cmon man..");
     }
     auto out = std::make_shared<Tensor>(a->shape);
 
@@ -58,7 +58,7 @@ inline std::shared_ptr<Tensor> sub(const std::shared_ptr<Tensor>& a, const std::
 //mul
 inline std::shared_ptr<Tensor> mul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
     if(a->shape != b->shape) {
-        throw std::runtime_error("Shape mismatch in multiplication. Cmon man..");
+        throw std::runtime_error("mul: shape mismatch in multiplication. cmon man..");
     }
     auto out = std::make_shared<Tensor>(a->shape);
 
@@ -85,7 +85,7 @@ inline std::shared_ptr<Tensor> mul(const std::shared_ptr<Tensor>& a, const std::
 //divide
 inline std::shared_ptr<Tensor> div(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
     if(a->shape != b->shape) {
-        throw std::runtime_error("Shape mismatch in division. Cmon man..");
+        throw std::runtime_error("div: shape mismatch in division. cmon man..");
     }
     auto out = std::make_shared<Tensor>(a->shape);
 
@@ -112,6 +112,7 @@ inline std::shared_ptr<Tensor> div(const std::shared_ptr<Tensor>& a, const std::
 //pow
 inline std::shared_ptr<Tensor> pow(const std::shared_ptr<Tensor>& a, const int n) {
     auto out = std::make_shared<Tensor>(a->shape);
+
     for(int i = 0; i<a->size(); i++) {
         out->data_at(i) = std::pow(a->data_at(i), n);
     }
@@ -133,6 +134,7 @@ inline std::shared_ptr<Tensor> pow(const std::shared_ptr<Tensor>& a, const int n
 //sqrt
 inline std::shared_ptr<Tensor> sqrt(const std::shared_ptr<Tensor>& a) {
     auto out = std::make_shared<Tensor>(a->shape);
+
     for(int i = 0; i<a->size(); i++) {
         out->data_at(i) = std::sqrt(a->data_at(i));
     }
@@ -216,21 +218,6 @@ inline std::shared_ptr<Tensor> simple_sum(const std::shared_ptr<Tensor>& a) {
             }
         }
     };
-
-    return out;
-}
-
-//view
-inline std::shared_ptr<Tensor> view(const std::shared_ptr<Tensor>& a, std::vector<int> new_shape) {
-    int total = 1;
-    for(int d : new_shape) total *= d;
-    if(total != a->size()) throw std::runtime_error("view: total elements must match. cmon man.");
-
-    auto out = std::make_shared<Tensor>(new_shape);
-    out->storage = a->storage;
-    out->offset = a->offset;
-
-    out->prev.push_back(a);  
 
     return out;
 }
