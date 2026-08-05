@@ -1,38 +1,60 @@
 #pragma once 
-#include"engine.h"
+#include "engine.h"
 
-//SGD
+// SGD
 inline void SGD(const std::shared_ptr<Tensor>& param, const float& lr) {
-    for(int i = 0; i<param->size(); i++) {
-        param->data_at(i) -= lr * param->grad_at(i);
+    if (!param || !param->grad) return;
+    float* data = param->data_ptr();
+    const float* grad = param->grad_ptr();
+    int size = param->size();
+
+    for (int i = 0; i < size; i++) {
+        data[i] -= lr * grad[i];
     }
 }
 
-//Adam the great 
+// Per-parameter state for Adam
+struct ParamState {
+    std::vector<float> m;
+    std::vector<float> v;
+    int t = 0;
+};
+
+// Adam optimizer (supports arbitrary number of parameters with distinct shapes)
 class Adam {
 public:
-    std::vector<float> m, v;
-    int t = 0; 
+    std::unordered_map<Tensor*, ParamState> state;
     float lr, b1, b2, E;
 
     Adam(float lr = 0.001f, float b1 = 0.9f, float b2 = 0.999f, float E = 1e-8f)
         : lr(lr), b1(b1), b2(b2), E(E) {}
 
     void step(const std::shared_ptr<Tensor>& param) {
-        if(m.empty()) {
-            m.resize(param->size(), 0.0f);
-            v.resize(param->size(), 0.0f);
+        if (!param || !param->grad) return;
+        int size = param->size();
+
+        auto& pstate = state[param.get()];
+        if (pstate.m.empty()) {
+            pstate.m.resize(size, 0.0f);
+            pstate.v.resize(size, 0.0f);
         }
-        t++;
-        for(int i = 0; i<param->size(); i++) {
-            m[i] = b1*m[i] + (1-b1)*param->grad_at(i);
-            v[i] = b2*v[i] + (1-b2)*param->grad_at(i)*param->grad_at(i);
+        pstate.t++;
 
-            float m_hat = m[i] / (1 - std::pow(b1, t)); 
-            float v_hat = v[i] / (1 - std::pow(b2, t)); 
+        float* data = param->data_ptr();
+        const float* grad = param->grad_ptr();
 
-            //update
-            param->data_at(i) -= lr * m_hat / (std::sqrt(v_hat) + E);
+        float b1_corr = 1.0f - std::pow(b1, pstate.t);
+        float b2_corr = 1.0f - std::pow(b2, pstate.t);
+
+        for (int i = 0; i < size; i++) {
+            float g = grad[i];
+            pstate.m[i] = b1 * pstate.m[i] + (1.0f - b1) * g;
+            pstate.v[i] = b2 * pstate.v[i] + (1.0f - b2) * g * g;
+
+            float m_hat = pstate.m[i] / b1_corr; 
+            float v_hat = pstate.v[i] / b2_corr; 
+
+            data[i] -= lr * m_hat / (std::sqrt(v_hat) + E);
         }
     }
 };

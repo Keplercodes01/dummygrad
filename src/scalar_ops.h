@@ -1,92 +1,216 @@
 #pragma once
-#include"engine.h"
+#include "engine.h"
 
-//add_scalar
+// --- ADD SCALAR BACKWARD NODE ---
+struct AddScalarBackward : public Node {
+    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        return {grads[0]};
+    }
+};
+
 inline std::shared_ptr<Tensor> add_scalar(const std::shared_ptr<Tensor>& a, float s) {
-    auto out = std::make_shared<Tensor>(a->shape);
-    for(int i = 0; i < a->size(); i++) out->data_at(i) = a->data_at(i) + s;
-    out->prev.push_back(a);
-    std::weak_ptr<Tensor> weak_out = out;
-    out->backward_fn = [a, weak_out]() {
-        if(auto self = weak_out.lock()) {
-            for(int i = 0; i < a->size(); i++) a->grad_at(i) += self->grad_at(i);
-        }
-    };
+    bool req_grad = a->requires_grad;
+    auto out = std::make_shared<Tensor>(a->shape, req_grad);
+    const float* a_ptr = a->data_ptr();
+    float* out_ptr = out->data_ptr();
+    int size = a->size();
+
+    for (int i = 0; i < size; i++) {
+        out_ptr[i] = a_ptr[i] + s;
+    }
+
+    if (req_grad) {
+        auto grad_fn = std::make_shared<AddScalarBackward>();
+        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        out->grad_fn = grad_fn;
+    }
+
     return out;
 }
 
-//sub_scalar
+// --- SUB SCALAR BACKWARD NODE ---
+struct SubScalarBackward : public Node {
+    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        return {grads[0]};
+    }
+};
+
 inline std::shared_ptr<Tensor> sub_scalar(const std::shared_ptr<Tensor>& a, float s) {
-    auto out = std::make_shared<Tensor>(a->shape);
-    for(int i = 0; i < a->size(); i++) out->data_at(i) = a->data_at(i) - s;
-    out->prev.push_back(a);
-    std::weak_ptr<Tensor> weak_out = out;
-    out->backward_fn = [a, weak_out]() {
-        if(auto self = weak_out.lock()) {
-            for(int i = 0; i < a->size(); i++) a->grad_at(i) += self->grad_at(i);
-        }
-    };
+    bool req_grad = a->requires_grad;
+    auto out = std::make_shared<Tensor>(a->shape, req_grad);
+    const float* a_ptr = a->data_ptr();
+    float* out_ptr = out->data_ptr();
+    int size = a->size();
+
+    for (int i = 0; i < size; i++) {
+        out_ptr[i] = a_ptr[i] - s;
+    }
+
+    if (req_grad) {
+        auto grad_fn = std::make_shared<SubScalarBackward>();
+        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        out->grad_fn = grad_fn;
+    }
+
     return out;
 }
 
-//mul_scalar
+// --- MUL SCALAR BACKWARD NODE ---
+struct MulScalarBackward : public Node {
+    float scalar;
+    explicit MulScalarBackward(float s) : scalar(s) {}
+
+    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        std::shared_ptr<Tensor> grad = grads[0];
+        auto da = std::make_shared<Tensor>(grad->shape, false);
+        const float* g_ptr = grad->data_ptr();
+        float* da_ptr = da->data_ptr();
+        int size = grad->size();
+
+        for (int i = 0; i < size; i++) {
+            da_ptr[i] = g_ptr[i] * scalar;
+        }
+        return {da};
+    }
+};
+
 inline std::shared_ptr<Tensor> mul_scalar(const std::shared_ptr<Tensor>& a, float s) {
-    auto out = std::make_shared<Tensor>(a->shape);
-    for(int i = 0; i < a->size(); i++) out->data_at(i) = a->data_at(i) * s;
-    out->prev.push_back(a);
-    std::weak_ptr<Tensor> weak_out = out;
-    out->backward_fn = [a, weak_out, s]() {
-        if(auto self = weak_out.lock()) {
-            for(int i = 0; i < a->size(); i++) a->grad_at(i) += s * self->grad_at(i);
-        }
-    };
+    bool req_grad = a->requires_grad;
+    auto out = std::make_shared<Tensor>(a->shape, req_grad);
+    const float* a_ptr = a->data_ptr();
+    float* out_ptr = out->data_ptr();
+    int size = a->size();
+
+    for (int i = 0; i < size; i++) {
+        out_ptr[i] = a_ptr[i] * s;
+    }
+
+    if (req_grad) {
+        auto grad_fn = std::make_shared<MulScalarBackward>(s);
+        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        out->grad_fn = grad_fn;
+    }
+
     return out;
 }
 
-//div_scalar
+// --- DIV SCALAR BACKWARD NODE ---
+struct DivScalarBackward : public Node {
+    float scalar;
+    explicit DivScalarBackward(float s) : scalar(s) {}
+
+    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        std::shared_ptr<Tensor> grad = grads[0];
+        auto da = std::make_shared<Tensor>(grad->shape, false);
+        const float* g_ptr = grad->data_ptr();
+        float* da_ptr = da->data_ptr();
+        int size = grad->size();
+
+        for (int i = 0; i < size; i++) {
+            da_ptr[i] = g_ptr[i] / scalar;
+        }
+        return {da};
+    }
+};
+
 inline std::shared_ptr<Tensor> div_scalar(const std::shared_ptr<Tensor>& a, float s) {
-    auto out = std::make_shared<Tensor>(a->shape);
-    for(int i = 0; i < a->size(); i++) out->data_at(i) = a->data_at(i) / s;
-    out->prev.push_back(a);
-    std::weak_ptr<Tensor> weak_out = out;
-    out->backward_fn = [a, weak_out, s]() {
-        if(auto self = weak_out.lock()) {
-            for(int i = 0; i < a->size(); i++) a->grad_at(i) += self->grad_at(i) / s;
-        }
-    };
+    bool req_grad = a->requires_grad;
+    auto out = std::make_shared<Tensor>(a->shape, req_grad);
+    const float* a_ptr = a->data_ptr();
+    float* out_ptr = out->data_ptr();
+    int size = a->size();
+
+    for (int i = 0; i < size; i++) {
+        out_ptr[i] = a_ptr[i] / s;
+    }
+
+    if (req_grad) {
+        auto grad_fn = std::make_shared<DivScalarBackward>(s);
+        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        out->grad_fn = grad_fn;
+    }
+
     return out;
 }
 
-//neg
 inline std::shared_ptr<Tensor> neg(const std::shared_ptr<Tensor>& a) {
     return mul_scalar(a, -1.0f);
 }
 
-//rsub_scalar
-inline std::shared_ptr<Tensor> rsub_scalar(float s, const std::shared_ptr<Tensor>& a) {
-    auto out = std::make_shared<Tensor>(a->shape);
-    for(int i = 0; i < a->size(); i++) out->data_at(i) = s - a->data_at(i);
-    out->prev.push_back(a);
-    std::weak_ptr<Tensor> weak_out = out;
-    out->backward_fn = [a, weak_out]() {
-        if(auto self = weak_out.lock()) {
-            for(int i = 0; i < a->size(); i++) a->grad_at(i) -= self->grad_at(i);
+// --- RSUB SCALAR BACKWARD NODE ---
+struct RsubScalarBackward : public Node {
+    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        std::shared_ptr<Tensor> grad = grads[0];
+        auto da = std::make_shared<Tensor>(grad->shape, false);
+        const float* g_ptr = grad->data_ptr();
+        float* da_ptr = da->data_ptr();
+        int size = grad->size();
+
+        for (int i = 0; i < size; i++) {
+            da_ptr[i] = -g_ptr[i];
         }
-    };
+        return {da};
+    }
+};
+
+inline std::shared_ptr<Tensor> rsub_scalar(float s, const std::shared_ptr<Tensor>& a) {
+    bool req_grad = a->requires_grad;
+    auto out = std::make_shared<Tensor>(a->shape, req_grad);
+    const float* a_ptr = a->data_ptr();
+    float* out_ptr = out->data_ptr();
+    int size = a->size();
+
+    for (int i = 0; i < size; i++) {
+        out_ptr[i] = s - a_ptr[i];
+    }
+
+    if (req_grad) {
+        auto grad_fn = std::make_shared<RsubScalarBackward>();
+        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        out->grad_fn = grad_fn;
+    }
+
     return out;
 }
 
-//rdiv_scalar
-inline std::shared_ptr<Tensor> rdiv_scalar(float s, const std::shared_ptr<Tensor>& a) {
-    auto out = std::make_shared<Tensor>(a->shape);
-    for(int i = 0; i < a->size(); i++) out->data_at(i) = s / a->data_at(i);
-    out->prev.push_back(a);
-    std::weak_ptr<Tensor> weak_out = out;
-    out->backward_fn = [a, weak_out, s]() {
-        if(auto self = weak_out.lock()) {
-            for(int i = 0; i < a->size(); i++) 
-                a->grad_at(i) -= s * self->grad_at(i) / (a->data_at(i) * a->data_at(i));
+// --- RDIV SCALAR BACKWARD NODE ---
+struct RdivScalarBackward : public Node {
+    std::shared_ptr<Tensor> a;
+    float scalar;
+    RdivScalarBackward(std::shared_ptr<Tensor> a, float s) : a(a), scalar(s) {}
+
+    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        std::shared_ptr<Tensor> grad = grads[0];
+        auto da = std::make_shared<Tensor>(a->shape, false);
+        const float* g_ptr = grad->data_ptr();
+        const float* a_ptr = a->data_ptr();
+        float* da_ptr = da->data_ptr();
+        int size = a->size();
+
+        for (int i = 0; i < size; i++) {
+            float val = a_ptr[i];
+            da_ptr[i] = -scalar * g_ptr[i] / (val * val);
         }
-    };
+        return {da};
+    }
+};
+
+inline std::shared_ptr<Tensor> rdiv_scalar(float s, const std::shared_ptr<Tensor>& a) {
+    bool req_grad = a->requires_grad;
+    auto out = std::make_shared<Tensor>(a->shape, req_grad);
+    const float* a_ptr = a->data_ptr();
+    float* out_ptr = out->data_ptr();
+    int size = a->size();
+
+    for (int i = 0; i < size; i++) {
+        out_ptr[i] = s / a_ptr[i];
+    }
+
+    if (req_grad) {
+        auto grad_fn = std::make_shared<RdivScalarBackward>(a, s);
+        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        out->grad_fn = grad_fn;
+    }
+
     return out;
 }
