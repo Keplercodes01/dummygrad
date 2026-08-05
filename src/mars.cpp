@@ -159,9 +159,6 @@ int main() {
     int num_floats = size / sizeof(float);
     int total_frames = num_floats / 156;
     
-    // Limit to 100 frames as requested for fast testing
-    total_frames = std::min(total_frames, 100);
-    
     std::vector<float> data(num_floats);
     if (!file.read(reinterpret_cast<char*>(data.data()), size)) {
         std::cerr << "Failed to read data!" << std::endl;
@@ -185,10 +182,10 @@ int main() {
 
     // 2. Hyperparameters
     int action_dim = 156;
-    int max_seq = 2; // Reduced for debugging
-    int batch_size = 1;
-    int d_model = 128; // Smaller for speed
-    int num_heads = 4;
+    int max_seq = 128;
+    int batch_size = 32;
+    int d_model = 256;
+    int num_heads = 8;
     int num_layers = 1;
 
     // 3. Instantiate Model and Optimizer
