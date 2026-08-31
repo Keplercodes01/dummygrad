@@ -1,7 +1,7 @@
 #pragma once
-#include "engine.h"
+#include "tensor.h"
+#include "functional.h"
 #include "init.h"
-#include "matmul.h"
 
 // Token / Positional Embedding Layer
 class Embedding {

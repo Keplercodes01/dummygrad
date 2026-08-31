@@ -6,3 +6,5 @@
 SSM_synced/
 test
 .DS_Store
+build/
+compile_commands.json

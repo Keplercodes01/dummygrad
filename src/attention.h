@@ -1,12 +1,7 @@
 #pragma once
-#include "engine.h"
+#include "tensor.h"
+#include "functional.h"
 #include "linear.h"
-#include "matmul.h"
-#include "transpose.h"
-#include "view.h"
-#include "scalar_ops.h"
-#include "softmax.h"
-#include "masking.h"
 
 // Single-Head Self-Attention
 class SelfAttention {

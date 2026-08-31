@@ -1,5 +1,6 @@
 #pragma once
-#include "engine.h"
+#include "tensor.h"
+#include "functional.h"
 
 inline std::mt19937 g_gen(std::random_device{}());
 
@@ -8,10 +9,10 @@ inline void manual_seed(unsigned int seed) {
 }
 
 // random init
-inline std::shared_ptr<Tensor> randn(std::vector<int> shape) {
+inline std::shared_ptr<Tensor> randn(std::vector<int64_t> shape) {
     auto t = std::make_shared<Tensor>(shape);
     std::normal_distribution<float> dis(0.0f, 1.0f);
-    float* ptr = t->data_ptr();
+    float* ptr = t->data_ptr<float>();
     int size = t->size();
     for (int i = 0; i < size; i++) {
         ptr[i] = dis(g_gen);
@@ -20,13 +21,13 @@ inline std::shared_ptr<Tensor> randn(std::vector<int> shape) {
 }
 
 // xavier init
-inline std::shared_ptr<Tensor> xavier(std::vector<int> shape) {
+inline std::shared_ptr<Tensor> xavier(std::vector<int64_t> shape) {
     if (shape.size() != 2) throw std::runtime_error("xavier: only 2D tensors supported. cmon man.");
 
     auto t = std::make_shared<Tensor>(shape);
     float std_val = std::sqrt(1.0f / (float)shape[0]);
     std::normal_distribution<float> dis(0.0f, std_val);
-    float* ptr = t->data_ptr();
+    float* ptr = t->data_ptr<float>();
     int size = t->size();
     for (int i = 0; i < size; i++) {
         ptr[i] = dis(g_gen);
@@ -35,13 +36,13 @@ inline std::shared_ptr<Tensor> xavier(std::vector<int> shape) {
 }
 
 // kaiming init
-inline std::shared_ptr<Tensor> kaiming(std::vector<int> shape) {
+inline std::shared_ptr<Tensor> kaiming(std::vector<int64_t> shape) {
     if (shape.size() != 2) throw std::runtime_error("kaiming: only 2D tensors supported. cmon man.");
 
     auto t = std::make_shared<Tensor>(shape);
     float std_val = std::sqrt(2.0f / (float)shape[0]);
     std::normal_distribution<float> dis(0.0f, std_val);
-    float* ptr = t->data_ptr();
+    float* ptr = t->data_ptr<float>();
     int size = t->size();
     for (int i = 0; i < size; i++) {
         ptr[i] = dis(g_gen);
@@ -52,9 +53,10 @@ inline std::shared_ptr<Tensor> kaiming(std::vector<int> shape) {
 // one_hot
 inline std::shared_ptr<Tensor> one_hot(const std::shared_ptr<Tensor>& indices, int num_classes) {
     int n = indices->size();
-    auto out = std::make_shared<Tensor>(std::vector<int>{n, num_classes}, false);
-    const float* idx_ptr = indices->data_ptr();
-    float* out_ptr = out->data_ptr();
+    auto out = std::make_shared<Tensor>(std::vector<int64_t>{n, num_classes}, false);
+        out->fill_(0.0f);
+    const float* idx_ptr = indices->data_ptr<float>();
+    float* out_ptr = out->data_ptr<float>();
 
     for (int i = 0; i < n; i++) {
         int idx = (int)idx_ptr[i];
@@ -65,9 +67,10 @@ inline std::shared_ptr<Tensor> one_hot(const std::shared_ptr<Tensor>& indices, i
 }
 
 // ones
-inline std::shared_ptr<Tensor> ones(std::vector<int> shape) {
+inline std::shared_ptr<Tensor> ones(std::vector<int64_t> shape) {
     auto out = std::make_shared<Tensor>(shape, false);
-    float* ptr = out->data_ptr();
+        out->fill_(0.0f);
+    float* ptr = out->data_ptr<float>();
     int size = out->size();
     for (int i = 0; i < size; i++) {
         ptr[i] = 1.0f;
@@ -76,6 +79,6 @@ inline std::shared_ptr<Tensor> ones(std::vector<int> shape) {
 }
 
 // zeros
-inline std::shared_ptr<Tensor> zeros(std::vector<int> shape) {
+inline std::shared_ptr<Tensor> zeros(std::vector<int64_t> shape) {
     return std::make_shared<Tensor>(shape, false);
 }

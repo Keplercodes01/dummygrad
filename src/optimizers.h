@@ -1,11 +1,12 @@
 #pragma once 
-#include "engine.h"
+#include "tensor.h"
+#include "functional.h"
 
 // SGD
 inline void SGD(const std::shared_ptr<Tensor>& param, const float& lr) {
     if (!param || !param->grad) return;
-    float* data = param->data_ptr();
-    const float* grad = param->grad_ptr();
+    float* data = param->data_ptr<float>();
+    const float* grad = param->grad->data_ptr<float>();
     int size = param->size();
 
     for (int i = 0; i < size; i++) {
@@ -40,8 +41,8 @@ public:
         }
         pstate.t++;
 
-        float* data = param->data_ptr();
-        const float* grad = param->grad_ptr();
+        float* data = param->data_ptr<float>();
+        const float* grad = param->grad->data_ptr<float>();
 
         float b1_corr = 1.0f - std::pow(b1, pstate.t);
         float b2_corr = 1.0f - std::pow(b2, pstate.t);

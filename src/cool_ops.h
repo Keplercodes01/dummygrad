@@ -1,5 +1,6 @@
 #pragma once
-#include "engine.h"
+#include "tensor.h"
+#include "functional.h"
 
 // --- SCALE AND SHIFT BACKWARD NODE ---
 struct ScaleAndShiftBackward : public Node {
@@ -13,8 +14,11 @@ struct ScaleAndShiftBackward : public Node {
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
         std::shared_ptr<Tensor> self_grad = grads[0];
         auto gx = std::make_shared<Tensor>(x->shape, false);
+        gx->fill_(0.0f);
         auto gg = std::make_shared<Tensor>(g->shape, false);
+        gg->fill_(0.0f);
         auto gbe = std::make_shared<Tensor>(be->shape, false);
+        gbe->fill_(0.0f);
 
         const float* sg_ptr = self_grad->data_ptr();
         const float* x_ptr = x->data_ptr();

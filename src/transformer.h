@@ -1,9 +1,9 @@
 #pragma once
-#include "engine.h"
+#include "tensor.h"
+#include "functional.h"
 #include "linear.h"
 #include "layernorm.h"
 #include "attention.h"
-#include "activations.h"
 #include "ops.h"
 #include "embedding.h"
 
@@ -95,13 +95,13 @@ public:
             auto attn_proj = blocks.back()->attn.W_o.W;
             int size_a = attn_proj->size();
             for (int j = 0; j < size_a; j++) {
-                attn_proj->data_ptr()[j] *= scale;
+                attn_proj->data_ptr<float>()[j] *= scale;
             }
 
             auto ffn_proj = blocks.back()->ffn.fc2.W;
             int size_f = ffn_proj->size();
             for (int j = 0; j < size_f; j++) {
-                ffn_proj->data_ptr()[j] *= scale;
+                ffn_proj->data_ptr<float>()[j] *= scale;
             }
         }
     }
