@@ -3,7 +3,7 @@
 #include <cstring>
 #include <stdexcept>
 
-enum class Device { CPU, CUDA, MPS };
+enum class Device { CPU, CUDA, MPS, TPU };
 enum class DType { Float32, Float16, BFloat16, Int8 };
 
 inline size_t dtype_size(DType dtype) {

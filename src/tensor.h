@@ -32,9 +32,10 @@ public:
     template<typename T> T data_at(int64_t i) const { return data_ptr<T>()[i]; }
     template<typename T> T grad_at(int64_t i) const { return grad ? grad->data_ptr<T>()[i] : static_cast<T>(0); }
 
-    std::shared_ptr<Tensor> to(Device target_device);
+    std::shared_ptr<Tensor> to(Device target_device, int device_id = 0);
     std::shared_ptr<Tensor> cuda() { return to(Device::CUDA); }
     std::shared_ptr<Tensor> cpu() { return to(Device::CPU); }
+    std::shared_ptr<Tensor> tpu(int device_id = 0) { return to(Device::TPU, device_id); }
 
     int64_t flat_idx(const std::vector<int64_t>& idx) const;
     bool is_contiguous() const;

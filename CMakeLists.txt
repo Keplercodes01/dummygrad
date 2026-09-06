@@ -16,6 +16,7 @@ set(DUMMYGRAD_SOURCES
     src/allocator.cpp
     src/ops.cpp
     src/cpu_ops.cpp
+    src/tpu/pjrt_client.cpp
 )
 
 # Detect and configure CUDA for GPU execution (e.g. Google Colab / Linux GPU)
@@ -35,6 +36,7 @@ endif()
 # Build engine static library
 add_library(dummygrad_engine STATIC ${DUMMYGRAD_SOURCES})
 target_include_directories(dummygrad_engine PUBLIC src)
+target_link_libraries(dummygrad_engine PRIVATE ${CMAKE_DL_LIBS})
 
 # Optional BLAS (OpenBLAS / oneMKL / MKL / Netlib) for fast CPU linear algebra
 find_package(BLAS QUIET)

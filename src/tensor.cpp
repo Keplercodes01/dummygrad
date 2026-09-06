@@ -2,6 +2,7 @@
 #include "functional.h"
 #include "ops.h"
 #include "autograd.h"
+#include "tpu/pjrt_client.h"
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -157,7 +158,7 @@ void Tensor::backward(bool retain_graph) {
     }
 }
 
-std::shared_ptr<Tensor> Tensor::to(Device target_device) {
+std::shared_ptr<Tensor> Tensor::to(Device target_device, int device_id) {
     if (this->device == target_device) {
         return shared_from_this();
     }
@@ -176,6 +177,21 @@ std::shared_ptr<Tensor> Tensor::to(Device target_device) {
 #else
         throw std::runtime_error("Tensor::to: CUDA requested but dummygrad was built without CUDA support");
 #endif
+    } else if (this->device == Device::CPU && target_device == Device::TPU) {
+        auto& mgr = PJRTTPUManager::get();
+        if (!mgr.is_available()) {
+            throw std::runtime_error("Tensor::to(TPU): " + mgr.error_message());
+        }
+        std::memcpy(out->storage->data, this->data_ptr<void>(), this->storage->total_bytes);
+        out->storage->tpu_handle = mgr.create_buffer_from_host(
+            this->data_ptr<void>(), this->shape, this->dtype, device_id
+        );
+    } else if (this->device == Device::TPU && target_device == Device::CPU) {
+        if (this->storage->tpu_handle) {
+            PJRTTPUManager::get().copy_to_host(*this->storage->tpu_handle, out->data_ptr<void>(), this->storage->total_bytes);
+        } else {
+            std::memcpy(out->data_ptr<void>(), this->data_ptr<void>(), this->storage->total_bytes);
+        }
     } else {
         throw std::runtime_error("Tensor::to: Unsupported device migration");
     }

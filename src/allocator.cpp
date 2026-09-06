@@ -97,7 +97,7 @@ bool is_arena_active() { return g_arena_active; }
 
 // Device dispatcher for memory requests
 void* get_memory(Device device, size_t bytes) {
-    if (device == Device::CPU) {
+    if (device == Device::CPU || device == Device::TPU) {
         return CPUCachingAllocator::get().allocate(bytes);
     }
     if (device == Device::CUDA) {
@@ -110,7 +110,7 @@ void* get_memory(Device device, size_t bytes) {
 }
 
 void free_memory(Device device, void* ptr, size_t bytes) {
-    if (device == Device::CPU) {
+    if (device == Device::CPU || device == Device::TPU) {
         CPUCachingAllocator::get().free(ptr, bytes);
     } else if (device == Device::CUDA) {
         if (CUDAScratchpadArena::get().contains(ptr)) {
