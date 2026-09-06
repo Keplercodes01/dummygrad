@@ -1,4 +1,5 @@
 #include "allocator.h"
+#include "metal/metal_backend.h"
 #include <cstdlib>
 #include <stdexcept>
 #ifdef USE_CUDA
@@ -106,6 +107,11 @@ void* get_memory(Device device, size_t bytes) {
         }
         return CUDACachingAllocator::get().allocate(bytes);
     }
+    if (device == Device::MPS) {
+        void* ptr = MetalBackend::get().allocate_shared_buffer(bytes);
+        if (ptr) return ptr;
+        return CPUCachingAllocator::get().allocate(bytes);
+    }
     throw std::runtime_error("Allocator: Unsupported device");
 }
 
@@ -117,6 +123,8 @@ void free_memory(Device device, void* ptr, size_t bytes) {
             return; // Managed by static scratchpad arena: instant zero-cost reset at step boundary!
         }
         CUDACachingAllocator::get().free(ptr, bytes);
+    } else if (device == Device::MPS) {
+        MetalBackend::get().free_buffer(ptr, bytes);
     }
 }
 

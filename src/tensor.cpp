@@ -192,6 +192,11 @@ std::shared_ptr<Tensor> Tensor::to(Device target_device, int device_id) {
         } else {
             std::memcpy(out->data_ptr<void>(), this->data_ptr<void>(), this->storage->total_bytes);
         }
+    } else if (this->device == Device::CPU && target_device == Device::MPS) {
+        // Direct zero-copy staging on Apple Silicon Unified Memory Architecture
+        std::memcpy(out->data_ptr<void>(), this->data_ptr<void>(), this->storage->total_bytes);
+    } else if (this->device == Device::MPS && target_device == Device::CPU) {
+        std::memcpy(out->data_ptr<void>(), this->data_ptr<void>(), this->storage->total_bytes);
     } else {
         throw std::runtime_error("Tensor::to: Unsupported device migration");
     }

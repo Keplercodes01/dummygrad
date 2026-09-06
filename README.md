@@ -168,6 +168,40 @@ int main() {
 
 ---
 
+## Apple Silicon Acceleration (Metal & MPS)
+
+`dummygrad` natively targets Apple Silicon GPUs and the **Apple Matrix Coprocessor (AMX)** via Metal and MetalPerformanceShaders with zero-copy Unified Memory Architecture (UMA):
+
+- **Zero-Copy Shared Memory**: CPU and GPU share physical address space via `MTLResourceStorageModeShared`. Host-to-device migration overhead is literally $0\text{ ns}$.
+- **Hardware GEMMs via MPS**: Direct invocation of `MPSMatrixMultiplication` engaging Apple's AMX coprocessor and GPU execution cores.
+- **Custom MSL Shaders**: Single-pass fused LayerNorm with SIMD-group reductions, fused AdamW, and Tiled FlashAttention.
+
+### Running on Apple Silicon Metal:
+```cpp
+#include "dummy_core.h"
+
+int main() {
+    auto& metal = MetalBackend::get();
+    if (!metal.is_available()) {
+        std::cerr << "Metal not available on this system.\n";
+        return 1;
+    }
+
+    // Allocate tensors directly in unified zero-copy shared memory
+    auto x = std::make_shared<Tensor>(std::vector<int64_t>{512, 768})->mps();
+    auto w = std::make_shared<Tensor>(std::vector<int64_t>{768, 768})->mps();
+    auto y = std::make_shared<Tensor>(std::vector<int64_t>{512, 768})->mps();
+
+    // Fast AMX matrix multiplication
+    metal.matmul(x->data_ptr<float>(), w->data_ptr<float>(), y->data_ptr<float>(), 512, 768, 768);
+
+    std::cout << "Executed on " << metal.device_name() << " with zero-copy UMA.\n";
+    return 0;
+}
+```
+
+---
+
 ## Built by
 
 [@Keplercodes01](https://github.com/Keplercodes01)

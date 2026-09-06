@@ -53,6 +53,18 @@ if(CMAKE_CUDA_COMPILER)
     target_compile_definitions(dummygrad_engine PUBLIC USE_CUDA=1)
 endif()
 
+# Configure Apple Silicon Metal and MetalPerformanceShaders on macOS
+if(APPLE)
+    enable_language(OBJCXX)
+    target_sources(dummygrad_engine PRIVATE src/metal/metal_backend.mm)
+    find_library(METAL_LIB Metal REQUIRED)
+    find_library(MPS_LIB MetalPerformanceShaders REQUIRED)
+    find_library(FOUNDATION_LIB Foundation REQUIRED)
+    target_link_libraries(dummygrad_engine PRIVATE ${METAL_LIB} ${MPS_LIB} ${FOUNDATION_LIB})
+    target_compile_definitions(dummygrad_engine PUBLIC USE_METAL=1)
+    message(STATUS "Apple Silicon Metal & MPS configured.")
+endif()
+
 # Optional: Add an executable for testing
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
     add_executable(dummygrad_test src/main.cpp)

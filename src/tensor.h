@@ -36,6 +36,7 @@ public:
     std::shared_ptr<Tensor> cuda() { return to(Device::CUDA); }
     std::shared_ptr<Tensor> cpu() { return to(Device::CPU); }
     std::shared_ptr<Tensor> tpu(int device_id = 0) { return to(Device::TPU, device_id); }
+    std::shared_ptr<Tensor> mps() { return to(Device::MPS); }
 
     int64_t flat_idx(const std::vector<int64_t>& idx) const;
     bool is_contiguous() const;

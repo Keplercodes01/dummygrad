@@ -10,3 +10,4 @@
 #include "tpu/pjrt_client.h"
 #include "tpu/hlo_builder.h"
 #include "tpu/tpu_runner.h"
+#include "metal/metal_backend.h"
