@@ -59,9 +59,9 @@ public:
 
     //overloading
     T* get() const noexcept { return _ptr; }
-    T* opearator->() const noexcept { return _ptr; }
-    T& opearator*() const noexcept { return *_ptr; }
-    explicit opearator bool() const noexcept {
+    T* operator->() const noexcept { return _ptr; }
+    T& operator*() const noexcept { return *_ptr; }
+    explicit operator bool() const noexcept {
         return _ptr != nullptr; 
     }
 };

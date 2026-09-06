@@ -29,7 +29,7 @@ struct ScaleAndShiftBackward : public Node {
         float* gbe_ptr = gbe->data_ptr();
 
         for (int batch = 0; batch < batch_size; batch++) {
-            std::vector<int> batch_idx = unravel(batch, std::vector<int>(x->shape.begin(), x->shape.end() - 2));
+            std::vector<int64_t> batch_idx = unravel(batch, std::vector<int64_t>(x->shape.begin(), x->shape.end() - 2));
 
             int batch_off_x = 0;
             int batch_off_out = 0;
@@ -78,7 +78,7 @@ inline std::shared_ptr<Tensor> scale_n_shift(const std::shared_ptr<Tensor>& x,
     float* out_ptr = out->data_ptr();
 
     for (int batch = 0; batch < batch_size; batch++) {
-        std::vector<int> batch_idx = unravel(batch, std::vector<int>(x->shape.begin(), x->shape.end() - 2));
+        std::vector<int64_t> batch_idx = unravel(batch, std::vector<int64_t>(x->shape.begin(), x->shape.end() - 2));
 
         int batch_off_x = 0;
         int batch_off_out = 0;

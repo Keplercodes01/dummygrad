@@ -5,4 +5,5 @@
 #include "cool_ops.h"
 #include "init.h"
 #include "optimizers.h"
-#include "wrappers.h"
+#include "dummy_wrappers.h"
+#include "multi_gpu.h"

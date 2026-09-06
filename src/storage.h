@@ -3,8 +3,7 @@
 #include <cstddef>
 
 struct Storage {
-    void* cpu_data = nullptr;
-    void* cuda_data = nullptr;
+    void* data = nullptr;
     Device device;
     DType dtype;
     size_t total_bytes;

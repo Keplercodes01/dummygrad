@@ -5,17 +5,15 @@
 #include <cmath>
 #include <stdexcept>
 
-#if HAS_VDSP
-    #include <Accelerate/Accelerate.h>
-    #define HAS_BLAS 1
-    #define HAS_VDSP 1
-#elif defined(USE_OPENBLAS) || defined(USE_MKL)
+#ifdef USE_CUDA
+#include "cuda/cuda_ops.cuh"
+#endif
+
+#if defined(USE_BLAS) || defined(USE_OPENBLAS) || defined(USE_MKL)
     #include <cblas.h>
     #define HAS_BLAS 1
-    #define HAS_VDSP 0
 #else
     #define HAS_BLAS 0
-    #define HAS_VDSP 0
 #endif
 
 // ========================================
@@ -28,8 +26,14 @@ struct ReluBackward : public Node {
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
         std::shared_ptr<Tensor> grad = grads[0];
-        auto da = std::make_shared<Tensor>(a->shape, false);
+        auto da = std::make_shared<Tensor>(a->shape, a->device, a->dtype, false);
         da->fill_(0.0f);
+#ifdef USE_CUDA
+        if (a->device == Device::CUDA) {
+            cuda::relu_backward(a->data_ptr<float>(), grad->data_ptr<float>(), da->data_ptr<float>(), a->size());
+            return {da};
+        }
+#endif
         const float* g_ptr = grad->data_ptr<float>();
         const float* a_ptr = a->data_ptr<float>();
         float* da_ptr = da->data_ptr<float>();
@@ -45,7 +49,18 @@ struct ReluBackward : public Node {
 // relu
 inline std::shared_ptr<Tensor> relu(const std::shared_ptr<Tensor>& a) {
     bool req_grad = a->requires_grad;
-    auto out = std::make_shared<Tensor>(a->shape, req_grad);
+    auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
+#ifdef USE_CUDA
+    if (a->device == Device::CUDA) {
+        cuda::relu_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size());
+        if (req_grad) {
+            auto grad_fn = std::make_shared<ReluBackward>(a);
+            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
+#endif
     const float* a_ptr = a->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
     int size = a->size();
@@ -70,7 +85,7 @@ struct TanhBackward : public Node {
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
         std::shared_ptr<Tensor> grad = grads[0];
-        auto da = std::make_shared<Tensor>(out_val->shape, false);
+        auto da = std::make_shared<Tensor>(out_val->shape, out_val->device, out_val->dtype, false);
         da->fill_(0.0f);
         const float* g_ptr = grad->data_ptr<float>();
         const float* out_ptr = out_val->data_ptr<float>();
@@ -88,7 +103,7 @@ struct TanhBackward : public Node {
 // tanh
 inline std::shared_ptr<Tensor> tanh(const std::shared_ptr<Tensor>& a) {
     bool req_grad = a->requires_grad;
-    auto out = std::make_shared<Tensor>(a->shape, req_grad);
+    auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
     const float* a_ptr = a->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
     int size = a->size();
@@ -116,8 +131,14 @@ struct GeluBackward : public Node {
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
         std::shared_ptr<Tensor> grad = grads[0];
-        auto da = std::make_shared<Tensor>(a->shape, false);
+        auto da = std::make_shared<Tensor>(a->shape, a->device, a->dtype, false);
         da->fill_(0.0f);
+#ifdef USE_CUDA
+        if (a->device == Device::CUDA) {
+            cuda::gelu_backward(a->data_ptr<float>(), grad->data_ptr<float>(), da->data_ptr<float>(), a->size());
+            return {da};
+        }
+#endif
         const float* g_ptr = grad->data_ptr<float>();
         const float* a_ptr = a->data_ptr<float>();
         float* da_ptr = da->data_ptr<float>();
@@ -142,7 +163,18 @@ inline std::shared_ptr<Tensor> gelu(const std::shared_ptr<Tensor>& a) {
     const float coeff = 0.044715f;
 
     bool req_grad = a->requires_grad;
-    auto out = std::make_shared<Tensor>(a->shape, req_grad);
+    auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
+#ifdef USE_CUDA
+    if (a->device == Device::CUDA) {
+        cuda::gelu_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size());
+        if (req_grad) {
+            auto grad_fn = std::make_shared<GeluBackward>(a, sqrt_2_over_pi, coeff);
+            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
+#endif
     const float* a_ptr = a->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
     int size = a->size();
@@ -249,6 +281,13 @@ inline std::shared_ptr<Tensor> broadcast(const std::shared_ptr<Tensor>& a, int a
     return out;
 }
 
+// --- ADD BACKWARD NODE ---
+struct AddBackward : public Node {
+    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        return {grads[0], grads[0]};
+    }
+};
+
 // --- CAST ADD BACKWARD NODE ---
 struct CastAddBackward : public Node {
     std::vector<int64_t> x_shape, y_shape;
@@ -259,9 +298,9 @@ struct CastAddBackward : public Node {
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
         std::shared_ptr<Tensor> self_grad = grads[0];
-        auto gx = std::make_shared<Tensor>(x_shape, false);
+        auto gx = std::make_shared<Tensor>(x_shape, self_grad->device, self_grad->dtype, false);
         gx->fill_(0.0f);
-        auto gy = std::make_shared<Tensor>(y_shape, false);
+        auto gy = std::make_shared<Tensor>(y_shape, self_grad->device, self_grad->dtype, false);
         gy->fill_(0.0f);
 
         const float* sg_ptr = self_grad->data_ptr<float>();
@@ -271,13 +310,17 @@ struct CastAddBackward : public Node {
         int yr = y_shape.size() > 1 ? y_shape[y_shape.size() - 2] : 1;
         int yc = y_shape.size() > 0 ? y_shape[y_shape.size() - 1] : 1;
 
+        int y_batch_size = 1;
+        for (int i = 0; i < (int)y_shape.size() - 2; i++) { y_batch_size *= y_shape[i]; }
+
         for (int batch = 0; batch < batch_size; batch++) {
+            int y_b = (y_batch_size == batch_size) ? batch : 0;
             for (int i = 0; i < r; i++) {
                 for (int j = 0; j < c; j++) {
                     int x_idx = batch * r * c + i * c + j;
                     int yi = (yr == 1) ? 0 : i;
                     int yj = (yc == 1) ? 0 : j;
-                    int y_idx = yi * yc + yj;
+                    int y_idx = y_b * yr * yc + yi * yc + yj;
 
                     float val = sg_ptr[x_idx];
                     gx_ptr[x_idx] += val;
@@ -293,7 +336,7 @@ struct CastAddBackward : public Node {
 inline std::shared_ptr<Tensor> cast_n_add(const std::shared_ptr<Tensor>& x,
                                           const std::shared_ptr<Tensor>& y) {
     int ndim = x->shape.size();
-    int r = x->shape[ndim - 2];
+    int r = (ndim >= 2) ? x->shape[ndim - 2] : 1;
     int c = x->shape[ndim - 1];
     int batch_size = 1;
     for (int i = 0; i < ndim - 2; i++) { batch_size *= x->shape[i]; }
@@ -301,19 +344,45 @@ inline std::shared_ptr<Tensor> cast_n_add(const std::shared_ptr<Tensor>& x,
     int yr = y->shape.size() > 1 ? y->shape[y->shape.size() - 2] : 1;
     int yc = y->shape.size() > 0 ? y->shape[y->shape.size() - 1] : 1;
 
+    int y_batch_size = 1;
+    for (int i = 0; i < (int)y->shape.size() - 2; i++) { y_batch_size *= y->shape[i]; }
+
     bool req_grad = x->requires_grad || y->requires_grad;
-    auto out = std::make_shared<Tensor>(x->shape, req_grad);
+    auto out = std::make_shared<Tensor>(x->shape, x->device, x->dtype, req_grad);
+
+#ifdef USE_CUDA
+    if (x->device == Device::CUDA) {
+        auto xc = make_contiguous(x);
+        auto yc_t = make_contiguous(y);
+        cuda::make_contiguous(*out, *xc);
+        if (yc_t->size() == c) {
+            cuda::add_bias(out->data_ptr<float>(), yc_t->data_ptr<float>(), batch_size * r, c);
+        } else {
+            cuda::add_inplace(*out, *yc_t);
+        }
+
+        if (req_grad) {
+            auto grad_fn = std::make_shared<CastAddBackward>(x->shape, y->shape, r, c, batch_size);
+            grad_fn->add_next_edge(get_grad_edge(x).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(y).function, 1);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
+#endif
+
     const float* x_ptr = x->data_ptr<float>();
     const float* y_ptr = y->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
 
     for (int batch = 0; batch < batch_size; batch++) {
+        int y_b = (y_batch_size == batch_size) ? batch : 0;
         for (int i = 0; i < r; i++) {
             for (int j = 0; j < c; j++) {
                 int x_idx = batch * r * c + i * c + j;
                 int yi = (yr == 1) ? 0 : i;
                 int yj = (yc == 1) ? 0 : j;
-                int y_idx = yi * yc + yj;
+                int y_idx = y_b * yr * yc + yi * yc + yj;
                 out_ptr[x_idx] = x_ptr[x_idx] + y_ptr[y_idx];
             }
         }
@@ -327,6 +396,54 @@ inline std::shared_ptr<Tensor> cast_n_add(const std::shared_ptr<Tensor>& x,
     }
 
     return out;
+}
+
+// Intelligent elementwise / broadcast addition
+inline std::shared_ptr<Tensor> add(const std::shared_ptr<Tensor>& x,
+                                   const std::shared_ptr<Tensor>& y) {
+    if (x->shape == y->shape) {
+        bool req_grad = x->requires_grad || y->requires_grad;
+        auto out = std::make_shared<Tensor>(x->shape, x->device, x->dtype, req_grad);
+
+#ifdef USE_CUDA
+        if (x->device == Device::CUDA) {
+            auto xc = make_contiguous(x);
+            auto yc_t = make_contiguous(y);
+            cuda::make_contiguous(*out, *xc);
+            cuda::add_inplace(*out, *yc_t);
+
+            if (req_grad) {
+                auto grad_fn = std::make_shared<AddBackward>();
+                grad_fn->add_next_edge(get_grad_edge(x).function, 0);
+                grad_fn->add_next_edge(get_grad_edge(y).function, 1);
+                out->grad_fn = grad_fn;
+            }
+            return out;
+        }
+#endif
+
+        auto xc = make_contiguous(x);
+        auto yc = make_contiguous(y);
+        const float* xp = xc->data_ptr<float>();
+        const float* yp = yc->data_ptr<float>();
+        float* outp = out->data_ptr<float>();
+        int64_t n = x->size();
+
+        for (int64_t i = 0; i < n; i++) {
+            outp[i] = xp[i] + yp[i];
+        }
+
+        if (req_grad) {
+            auto grad_fn = std::make_shared<AddBackward>();
+            grad_fn->add_next_edge(get_grad_edge(x).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(y).function, 1);
+            out->grad_fn = grad_fn;
+        }
+
+        return out;
+    }
+
+    return cast_n_add(x, y);
 }
 
 // --- CAST SUB BACKWARD NODE ---
@@ -872,8 +989,15 @@ struct CausalMaskBackward : public Node {
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
         std::shared_ptr<Tensor> self_grad = grads[0];
-        auto ga = std::make_shared<Tensor>(self_grad->shape, false);
+        auto ga = std::make_shared<Tensor>(self_grad->shape, self_grad->device, self_grad->dtype, false);
         ga->fill_(0.0f);
+
+#ifdef USE_CUDA
+        if (self_grad->device == Device::CUDA) {
+            cuda::causal_mask_backward(self_grad->data_ptr<float>(), ga->data_ptr<float>(), batch_size, r);
+            return {ga};
+        }
+#endif
 
         const float* sg_ptr = self_grad->data_ptr<float>();
         float* ga_ptr = ga->data_ptr<float>();
@@ -899,7 +1023,20 @@ inline std::shared_ptr<Tensor> causal_mask(const std::shared_ptr<Tensor>& a) {
     for (int i = 0; i < ndim - 2; i++) { batch_size *= a->shape[i]; }
 
     bool req_grad = a->requires_grad;
-    auto out = std::make_shared<Tensor>(a->shape, req_grad);
+    auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
+
+#ifdef USE_CUDA
+    if (a->device == Device::CUDA) {
+        cuda::causal_mask(a->data_ptr<float>(), out->data_ptr<float>(), batch_size, r);
+        if (req_grad) {
+            auto grad_fn = std::make_shared<CausalMaskBackward>(r, c, batch_size);
+            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
+#endif
+
     const float* a_ptr = a->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
 
@@ -1339,6 +1476,13 @@ struct SoftmaxBackward : public Node {
         auto ga = std::make_shared<Tensor>(s->shape, s->device, s->dtype, false);
         ga->fill_(0.0f);
 
+#ifdef USE_CUDA
+        if (s->device == Device::CUDA) {
+            cuda::softmax_backward(s->data_ptr<float>(), self_grad->data_ptr<float>(), ga->data_ptr<float>(), batch_size * r, c);
+            return {ga};
+        }
+#endif
+
         const float* sg_ptr = self_grad->data_ptr<float>();
         const float* s_ptr = s->data_ptr<float>();
         float* ga_ptr = ga->data_ptr<float>();
@@ -1349,12 +1493,7 @@ struct SoftmaxBackward : public Node {
                 int offset = batch * r * c + i * c;
                 float sum_dot = 0.0f;
                 
-                // Vectorized dot product (Accelerate)
-#if HAS_VDSP
-vDSP_dotpr(sg_ptr + offset, 1, s_ptr + offset, 1, &sum_dot, c);
-#else
                 for (int j = 0; j < c; j++) sum_dot += sg_ptr[offset + j] * s_ptr[offset + j];
-#endif
                 for (int j = 0; j < c; j++) {
                     ga_ptr[offset + j] = s_ptr[offset + j] * (sg_ptr[offset + j] - sum_dot);
                 }
@@ -1375,6 +1514,19 @@ inline std::shared_ptr<Tensor> softmax(const std::shared_ptr<Tensor>& a, int axi
 
     bool req_grad = a->requires_grad;
     auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
+
+#ifdef USE_CUDA
+    if (a->device == Device::CUDA) {
+        cuda::softmax_forward(a->data_ptr<float>(), out->data_ptr<float>(), batch_size * r, c);
+        if (req_grad) {
+            auto grad_fn = std::make_shared<SoftmaxBackward>(out, r, c, batch_size, ndim);
+            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
+#endif
+
     const float* a_ptr = a->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
 
@@ -1383,29 +1535,14 @@ inline std::shared_ptr<Tensor> softmax(const std::shared_ptr<Tensor>& a, int axi
             int offset = batch * r * c + i * c;
             
             float max_val = -1e9f;
-#if HAS_VDSP
-vDSP_maxv(a_ptr + offset, 1, &max_val, c);
-            float neg_max = -max_val;
-            vDSP_vsadd(a_ptr + offset, 1, &neg_max, out_ptr + offset, 1, c);
-            
-            int length = c;
-            vvexpf(out_ptr + offset, out_ptr + offset, &length);
-            
-            float sum = 0.0f;
-            vDSP_sve(out_ptr + offset, 1, &sum, c);
-            
-            float inv_sum = 1.0f / sum;
-            vDSP_vsmul(out_ptr + offset, 1, &inv_sum, out_ptr + offset, 1, c);
-#else
             for (int j = 0; j < c; j++) if (a_ptr[offset + j] > max_val) max_val = a_ptr[offset + j];
             float sum = 0.0f;
             for (int j = 0; j < c; j++) {
                 out_ptr[offset + j] = std::exp(a_ptr[offset + j] - max_val);
                 sum += out_ptr[offset + j];
             }
-            float inv_sum = 1.0f / sum;
+            float inv_sum = 1.0f / (sum + 1e-12f);
             for (int j = 0; j < c; j++) out_ptr[offset + j] *= inv_sum;
-#endif
         }
     }
 
@@ -1969,11 +2106,6 @@ inline std::shared_ptr<Tensor> im2col(const std::shared_ptr<Tensor>& x, int kH, 
 // ========================================
 // From matmul.h
 // ========================================
-#if HAS_VDSP
-#include <Accelerate/Accelerate.h>
-#else
-// Define a fallback for non-Apple Intel machines (e.g. Linux)
-#endif
 #include <stdexcept>
 
 // --- MATMUL BACKWARD NODE ---
@@ -2179,6 +2311,11 @@ cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
 }
 
 inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
+#ifdef USE_CUDA
+    if (a->device == Device::CUDA || b->device == Device::CUDA) {
+        return cuda::matmul(a, b);
+    }
+#endif
     return manual_matmul(a, b);
 }
 

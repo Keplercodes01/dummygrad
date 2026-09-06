@@ -1,6 +1,7 @@
 #pragma once
 #include "tensor.h"
 #include "functional.h"
+#include <random>
 
 inline std::mt19937 g_gen(std::random_device{}());
 

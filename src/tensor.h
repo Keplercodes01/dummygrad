@@ -27,10 +27,14 @@ public:
         : Tensor(s, Device::CPU, DType::Float32, req_grad) {}
 
 
-    template<typename T> T* data_ptr() { return static_cast<T*>(storage->cpu_data) + global_offset; }
-    template<typename T> const T* data_ptr() const { return static_cast<const T*>(storage->cpu_data) + global_offset; }
+    template<typename T> T* data_ptr() { return static_cast<T*>(storage->data) + global_offset; }
+    template<typename T> const T* data_ptr() const { return static_cast<const T*>(storage->data) + global_offset; }
     template<typename T> T data_at(int64_t i) const { return data_ptr<T>()[i]; }
     template<typename T> T grad_at(int64_t i) const { return grad ? grad->data_ptr<T>()[i] : static_cast<T>(0); }
+
+    std::shared_ptr<Tensor> to(Device target_device);
+    std::shared_ptr<Tensor> cuda() { return to(Device::CUDA); }
+    std::shared_ptr<Tensor> cpu() { return to(Device::CPU); }
 
     int64_t flat_idx(const std::vector<int64_t>& idx) const;
     bool is_contiguous() const;

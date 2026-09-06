@@ -13,10 +13,9 @@ Storage::Storage(size_t total_elements, Device d, DType type)
             default: throw std::runtime_error("Unknown DType!");
         }
         total_bytes = total_elements * element_size;
-        if(device == Device::CPU) 
-            cpu_data = get_memory(device, total_bytes);
+        data = get_memory(device, total_bytes);
 }
 
 Storage::~Storage() {
-    if(cpu_data) free_memory(device, cpu_data, total_bytes);
+    if(data) free_memory(device, data, total_bytes);
 }

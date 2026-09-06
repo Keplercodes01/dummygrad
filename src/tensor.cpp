@@ -2,6 +2,9 @@
 #include "functional.h"
 #include "ops.h"
 #include "autograd.h"
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
 #include <unordered_map>
 #include <queue>
 #include <functional>
@@ -152,4 +155,30 @@ void Tensor::backward(bool retain_graph) {
         AutogradEngine::get().execute(this->grad_fn, this->shape, this->device, this->dtype, retain_graph);
         if (!retain_graph) this->grad_fn = nullptr;
     }
+}
+
+std::shared_ptr<Tensor> Tensor::to(Device target_device) {
+    if (this->device == target_device) {
+        return shared_from_this();
+    }
+
+    auto out = std::make_shared<Tensor>(this->shape, target_device, this->dtype, this->requires_grad);
+
+    if (this->device == Device::CPU && target_device == Device::CUDA) {
+#ifdef USE_CUDA
+        cudaMemcpy(out->data_ptr<void>(), this->data_ptr<void>(), this->storage->total_bytes, cudaMemcpyHostToDevice);
+#else
+        throw std::runtime_error("Tensor::to: CUDA requested but dummygrad was built without CUDA support");
+#endif
+    } else if (this->device == Device::CUDA && target_device == Device::CPU) {
+#ifdef USE_CUDA
+        cudaMemcpy(out->data_ptr<void>(), this->data_ptr<void>(), this->storage->total_bytes, cudaMemcpyDeviceToHost);
+#else
+        throw std::runtime_error("Tensor::to: CUDA requested but dummygrad was built without CUDA support");
+#endif
+    } else {
+        throw std::runtime_error("Tensor::to: Unsupported device migration");
+    }
+
+    return out;
 }

@@ -18,6 +18,8 @@ inline void SGD(const std::shared_ptr<Tensor>& param, const float& lr) {
 struct ParamState {
     std::vector<float> m;
     std::vector<float> v;
+    float* gpu_m = nullptr;
+    float* gpu_v = nullptr;
     int t = 0;
 };
 
@@ -25,14 +27,31 @@ struct ParamState {
 class Adam {
 public:
     std::unordered_map<Tensor*, ParamState> state;
-    float lr, b1, b2, E;
+    float lr, b1, b2, E, weight_decay;
 
-    Adam(float lr = 0.001f, float b1 = 0.9f, float b2 = 0.999f, float E = 1e-8f)
-        : lr(lr), b1(b1), b2(b2), E(E) {}
+    Adam(float lr = 0.001f, float b1 = 0.9f, float b2 = 0.999f, float E = 1e-8f, float weight_decay = 0.01f)
+        : lr(lr), b1(b1), b2(b2), E(E), weight_decay(weight_decay) {}
 
     void step(const std::shared_ptr<Tensor>& param) {
         if (!param || !param->grad) return;
         int size = param->size();
+
+#ifdef USE_CUDA
+        if (param->device == Device::CUDA) {
+            auto& pstate = state[param.get()];
+            if (!pstate.gpu_m) {
+                pstate.gpu_m = static_cast<float*>(get_memory(Device::CUDA, size * sizeof(float)));
+                pstate.gpu_v = static_cast<float*>(get_memory(Device::CUDA, size * sizeof(float)));
+                cudaMemset(pstate.gpu_m, 0, size * sizeof(float));
+                cudaMemset(pstate.gpu_v, 0, size * sizeof(float));
+            }
+            pstate.t++;
+            cuda::adamw_step(param->data_ptr<float>(), param->grad->data_ptr<float>(),
+                             pstate.gpu_m, pstate.gpu_v,
+                             lr, b1, b2, E, weight_decay, pstate.t, size);
+            return;
+        }
+#endif
 
         auto& pstate = state[param.get()];
         if (pstate.m.empty()) {
