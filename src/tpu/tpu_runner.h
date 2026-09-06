@@ -3,12 +3,14 @@
 #include <memory>
 #include <iostream>
 #include <functional>
+#include <thread>
+#include <stdexcept>
 #include "pjrt_client.h"
 #include "hlo_builder.h"
 #include "../tensor.h"
 
-// High-performance TPU Execution Engine for Google Colab v5e-1 & Kaggle v5e-8
-// Direct PJRT driver integration with zero Python and near-zero host latency
+// High-performance TPU Execution Engine for Single & Multi-TPU Pod Slices
+// Direct OpenXLA PJRT driver integration with zero Python and near-zero host latency
 class TPUEngine {
 private:
     size_t num_devices = 0;
@@ -27,10 +29,11 @@ public:
             num_devices = mgr.device_count();
             available = true;
             std::cout << "[dummygrad TPU] Detected " << num_devices << " TPU device(s) via OpenXLA PJRT.\n";
-            if (num_devices >= 8) {
-                std::cout << "[dummygrad TPU] Kaggle v5e-8 configuration active. Inter-Chip Interconnect (ICI) enabled.\n";
+            if (num_devices > 1) {
+                std::cout << "[dummygrad TPU] Multi-TPU Pod slice active (" << num_devices 
+                          << " chips). Hardware Inter-Chip Interconnect (ICI) enabled.\n";
             } else if (num_devices == 1) {
-                std::cout << "[dummygrad TPU] Google Colab v5e-1 single-chip configuration active.\n";
+                std::cout << "[dummygrad TPU] Single-chip TPU active.\n";
             }
         } else {
             available = false;
@@ -40,7 +43,7 @@ public:
     bool is_available() const { return available; }
     size_t device_count() const { return num_devices; }
 
-    // Synchronize gradients across all TPU chips via direct ICI ring reduction
+    // Synchronize gradients across any arbitrary number of TPU chips via direct ICI ring reduction
     void all_reduce_gradients(
         std::vector<std::shared_ptr<TPUBufferHandle>>& per_device_gradients,
         const std::vector<int64_t>& shape,
@@ -63,7 +66,7 @@ public:
         }
     }
 
-    // High-performance GEMM executed directly on TPU v5e systolic MXU
+    // High-performance GEMM executed directly on TPU systolic MXU (128x128)
     std::shared_ptr<TPUBufferHandle> matmul(
         const std::shared_ptr<TPUBufferHandle>& a,
         const std::shared_ptr<TPUBufferHandle>& b,
@@ -129,6 +132,56 @@ public:
         if (ici_all_reduce_exec) {
             PJRTTPUManager::get().destroy_executable(ici_all_reduce_exec);
             ici_all_reduce_exec = nullptr;
+        }
+    }
+};
+
+// Generic Multi-TPU Distributed Data-Parallel Runner
+// Scales across ANY arbitrary number of TPU chips (2, 4, 8, 16, 32, 64, 128...) over hardware ICI
+template <typename ModelType>
+class MultiTPURunner {
+private:
+    size_t num_chips = 0;
+    std::vector<ModelType> replicas;
+
+public:
+    explicit MultiTPURunner(size_t chips, std::function<ModelType(size_t rank)> factory)
+        : num_chips(chips) {
+        auto& engine = TPUEngine::get();
+        if (!engine.is_available()) {
+            throw std::runtime_error("MultiTPURunner: TPU runtime unavailable");
+        }
+        if (num_chips > engine.device_count()) {
+            throw std::runtime_error("MultiTPURunner requested " + std::to_string(num_chips) +
+                                     " chips but only " + std::to_string(engine.device_count()) + " detected");
+        }
+
+        replicas.reserve(num_chips);
+        for (size_t rank = 0; rank < num_chips; ++rank) {
+            replicas.push_back(factory(rank));
+        }
+    }
+
+    // Default constructor: automatically uses all detected TPU chips on the host/pod
+    explicit MultiTPURunner(std::function<ModelType(size_t rank)> factory)
+        : MultiTPURunner(TPUEngine::get().device_count(), factory) {}
+
+    size_t world_size() const { return num_chips; }
+    ModelType& get_replica(size_t rank) { return replicas[rank]; }
+
+    // Execute parallel data-parallel steps across all TPU chips with zero CPU lock contention
+    void parallel_step(std::function<void(size_t rank, ModelType& model)> step_fn) {
+        std::vector<std::thread> workers;
+        workers.reserve(num_chips);
+
+        for (size_t rank = 0; rank < num_chips; ++rank) {
+            workers.emplace_back([this, rank, &step_fn]() {
+                step_fn(rank, replicas[rank]);
+            });
+        }
+
+        for (auto& w : workers) {
+            if (w.joinable()) w.join();
         }
     }
 };

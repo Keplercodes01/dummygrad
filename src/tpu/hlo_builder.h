@@ -92,10 +92,10 @@ inline std::string build_fused_linear_gelu_hlo(
 }
 
 // Emits an HLO Module for Multi-TPU Inter-Chip Interconnect (ICI) All-Reduce
-// Maps directly to the hardware 2D torus / ring interconnect on Kaggle TPU v5e-8 (8 chips)
+// Dynamically forms the replica group for any arbitrary number of TPU chips (e.g. 2, 4, 8, 16, 32, 64...)
 inline std::string build_ici_all_reduce_hlo(
     const std::vector<int64_t>& shape,
-    size_t num_chips = 8,
+    size_t num_chips,
     DType dt = DType::Float32
 ) {
     std::string s = shape_to_hlo(shape, dt);
