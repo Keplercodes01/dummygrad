@@ -247,6 +247,17 @@ auto ffn_out = ffn.forward(x_norm);
 // 4. Gradient Clipping & LR Scheduler
 loss->backward();
 float total_norm = clip_grad_norm_(model.parameters(), 1.0f);
+
+// 5. Full Turnkey ModernTransformer (LLaMA / Mistral Architecture)
+//    RMSNorm + RoPE + SwiGLU + Tied Output Projection
+ModernTransformer modern_model(
+    /*vocab_size=*/32000,
+    /*max_seq_len=*/4096,
+    /*d_model=*/768,
+    /*n_heads=*/12,
+    /*n_layers=*/12
+);
+auto modern_logits = modern_model.forward(input_ids);
 ```
 
 ---

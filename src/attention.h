@@ -2,6 +2,7 @@
 #include "tensor.h"
 #include "functional.h"
 #include "linear.h"
+#include "modern_layers.h"
 
 #ifdef USE_CUDA
 struct FlashAttentionBackward : public Node {
@@ -134,7 +135,10 @@ public:
           d_model(d_model), n_heads(n_heads), d_k(d_model / n_heads), causal(causal) {}
 
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x_in,
-                                    const std::shared_ptr<Tensor>& mask = nullptr) {
+                                    const std::shared_ptr<Tensor>& mask = nullptr,
+                                    const std::shared_ptr<Tensor>& cos_freqs = nullptr,
+                                    const std::shared_ptr<Tensor>& sin_freqs = nullptr,
+                                    int start_pos = 0) {
         auto x = x_in;
         bool is_2d = (x->ndim() == 2);
         if (is_2d) {
@@ -148,9 +152,19 @@ public:
         auto K = W_k.forward(x);
         auto V = W_v.forward(x);
 
-        // Reshape Q, K, V to [B, S, n_heads, d_k] -> Transpose to [B, n_heads, S, d_k]
-        auto Q_split = transpose(reshape(Q, {B, S, n_heads, d_k}), 1, 2);
-        auto K_split = transpose(reshape(K, {B, S, n_heads, d_k}), 1, 2);
+        // Reshape Q, K, V to [B, S, n_heads, d_k]
+        auto Q_4d = reshape(Q, {B, S, n_heads, d_k});
+        auto K_4d = reshape(K, {B, S, n_heads, d_k});
+
+        // Apply Rotary Position Embeddings (RoPE) if frequency tables provided
+        if (cos_freqs && sin_freqs) {
+            Q_4d = apply_rotary_emb(Q_4d, cos_freqs, sin_freqs, start_pos);
+            K_4d = apply_rotary_emb(K_4d, cos_freqs, sin_freqs, start_pos);
+        }
+
+        // Transpose to [B, n_heads, S, d_k]
+        auto Q_split = transpose(Q_4d, 1, 2);
+        auto K_split = transpose(K_4d, 1, 2);
         auto V_split = transpose(reshape(V, {B, S, n_heads, d_k}), 1, 2);
 
         // Scaled dot product
