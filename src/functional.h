@@ -8,6 +8,8 @@
 #ifdef USE_CUDA
 #include "cuda/cuda_ops.cuh"
 #endif
+#include "metal/metal_backend.h"
+#include "tpu/tpu_runner.h"
 
 #if defined(USE_BLAS) || defined(USE_OPENBLAS) || defined(USE_MKL)
     #include <cblas.h>
@@ -210,6 +212,10 @@ struct SigmoidBackward : public Node {
             return {da};
         }
 #endif
+        if (out_val->device == Device::MPS) {
+            MetalBackend::get().sigmoid_backward(out_val->data_ptr<float>(), grad->data_ptr<float>(), da->data_ptr<float>(), out_val->size());
+            return {da};
+        }
         const float* g_ptr = grad->data_ptr<float>();
         const float* o_ptr = out_val->data_ptr<float>();
         float* da_ptr = da->data_ptr<float>();
@@ -238,6 +244,24 @@ inline std::shared_ptr<Tensor> sigmoid(const std::shared_ptr<Tensor>& a) {
         return out;
     }
 #endif
+    if (a->device == Device::MPS) {
+        MetalBackend::get().sigmoid_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size());
+        if (req_grad) {
+            auto grad_fn = std::make_shared<SigmoidBackward>(out);
+            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
+    if (a->device == Device::TPU && a->storage->tpu_handle) {
+        out->storage->tpu_handle = TPUEngine::get().sigmoid(a->storage->tpu_handle, a->shape, a->dtype);
+        if (req_grad) {
+            auto grad_fn = std::make_shared<SigmoidBackward>(out);
+            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
     const float* a_ptr = a->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
     int size = static_cast<int>(a->size());
@@ -270,6 +294,10 @@ struct SiluBackward : public Node {
             return {da};
         }
 #endif
+        if (a->device == Device::MPS) {
+            MetalBackend::get().silu_backward(a->data_ptr<float>(), grad->data_ptr<float>(), da->data_ptr<float>(), a->size());
+            return {da};
+        }
         const float* g_ptr = grad->data_ptr<float>();
         const float* a_ptr = a->data_ptr<float>();
         float* da_ptr = da->data_ptr<float>();
@@ -299,6 +327,24 @@ inline std::shared_ptr<Tensor> silu(const std::shared_ptr<Tensor>& a) {
         return out;
     }
 #endif
+    if (a->device == Device::MPS) {
+        MetalBackend::get().silu_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size());
+        if (req_grad) {
+            auto grad_fn = std::make_shared<SiluBackward>(a);
+            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
+    if (a->device == Device::TPU && a->storage->tpu_handle) {
+        out->storage->tpu_handle = TPUEngine::get().silu(a->storage->tpu_handle, a->shape, a->dtype);
+        if (req_grad) {
+            auto grad_fn = std::make_shared<SiluBackward>(a);
+            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
     const float* a_ptr = a->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
     int size = static_cast<int>(a->size());
@@ -338,6 +384,10 @@ struct LeakyReluBackward : public Node {
             return {da};
         }
 #endif
+        if (a->device == Device::MPS) {
+            MetalBackend::get().leaky_relu_backward(a->data_ptr<float>(), grad->data_ptr<float>(), da->data_ptr<float>(), a->size(), negative_slope);
+            return {da};
+        }
         const float* g_ptr = grad->data_ptr<float>();
         const float* a_ptr = a->data_ptr<float>();
         float* da_ptr = da->data_ptr<float>();
@@ -365,6 +415,24 @@ inline std::shared_ptr<Tensor> leaky_relu(const std::shared_ptr<Tensor>& a, floa
         return out;
     }
 #endif
+    if (a->device == Device::MPS) {
+        MetalBackend::get().leaky_relu_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size(), negative_slope);
+        if (req_grad) {
+            auto grad_fn = std::make_shared<LeakyReluBackward>(a, negative_slope);
+            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
+    if (a->device == Device::TPU && a->storage->tpu_handle) {
+        out->storage->tpu_handle = TPUEngine::get().leaky_relu(a->storage->tpu_handle, a->shape, negative_slope, a->dtype);
+        if (req_grad) {
+            auto grad_fn = std::make_shared<LeakyReluBackward>(a, negative_slope);
+            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
     const float* a_ptr = a->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
     int size = static_cast<int>(a->size());
@@ -1062,12 +1130,19 @@ struct MseBackward : public Node {
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
         std::shared_ptr<Tensor> self_grad = grads[0];
-        auto grad_pred = std::make_shared<Tensor>(pred->shape, false);
+        auto grad_pred = std::make_shared<Tensor>(pred->shape, pred->device, pred->dtype, false);
         grad_pred->fill_(0.0f);
+        float g_val = self_grad->data_ptr<float>()[0];
+
+        if (pred->device == Device::MPS) {
+            float scale = (2.0f / static_cast<float>(n)) * g_val;
+            MetalBackend::get().mse_backward(pred->data_ptr<float>(), target->data_ptr<float>(), grad_pred->data_ptr<float>(), n, scale);
+            return {grad_pred};
+        }
+
         const float* p_ptr = pred->data_ptr<float>();
         const float* t_ptr = target->data_ptr<float>();
         float* gp_ptr = grad_pred->data_ptr<float>();
-        float g_val = self_grad->data_ptr<float>()[0];
 
         for (int i = 0; i < n; i++) {
             gp_ptr[i] = (2.0f * (p_ptr[i] - t_ptr[i]) / n) * g_val;
@@ -1083,6 +1158,19 @@ inline std::shared_ptr<Tensor> mse(const std::shared_ptr<Tensor>& pred, const st
     }
 
     int n = static_cast<int>(pred->size());
+
+    if (pred->device == Device::TPU && pred->storage->tpu_handle && target->storage->tpu_handle) {
+        bool req_grad = pred->requires_grad;
+        auto out = std::make_shared<Tensor>(std::vector<int64_t>{1, 1}, Device::TPU, pred->dtype, req_grad);
+        out->storage->tpu_handle = TPUEngine::get().mse(pred->storage->tpu_handle, target->storage->tpu_handle, pred->shape, pred->dtype);
+        if (req_grad) {
+            auto grad_fn = std::make_shared<MseBackward>(pred, target, n);
+            grad_fn->add_next_edge(get_grad_edge(pred).function, 0);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
+
     const float* p_ptr = pred->data_ptr<float>();
     const float* t_ptr = target->data_ptr<float>();
 
@@ -1093,7 +1181,7 @@ inline std::shared_ptr<Tensor> mse(const std::shared_ptr<Tensor>& pred, const st
     }
 
     bool req_grad = pred->requires_grad;
-    auto out = std::make_shared<Tensor>(std::vector<int64_t>{1, 1}, req_grad);
+    auto out = std::make_shared<Tensor>(std::vector<int64_t>{1, 1}, pred->device, pred->dtype, req_grad);
     out->data_ptr<float>()[0] = sq_sum / n;
 
     if (req_grad) {
@@ -1114,12 +1202,19 @@ struct L1LossBackward : public Node {
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
         std::shared_ptr<Tensor> self_grad = grads[0];
-        auto grad_pred = std::make_shared<Tensor>(pred->shape, false);
+        auto grad_pred = std::make_shared<Tensor>(pred->shape, pred->device, pred->dtype, false);
         grad_pred->fill_(0.0f);
+        float g_val = self_grad->data_ptr<float>()[0];
+
+        if (pred->device == Device::MPS) {
+            float scale = (1.0f / static_cast<float>(n)) * g_val;
+            MetalBackend::get().l1_loss_backward(pred->data_ptr<float>(), target->data_ptr<float>(), grad_pred->data_ptr<float>(), n, scale);
+            return {grad_pred};
+        }
+
         const float* p_ptr = pred->data_ptr<float>();
         const float* t_ptr = target->data_ptr<float>();
         float* gp_ptr = grad_pred->data_ptr<float>();
-        float g_val = self_grad->data_ptr<float>()[0];
 
         for (int i = 0; i < n; i++) {
             float diff = p_ptr[i] - t_ptr[i];
@@ -1137,6 +1232,19 @@ inline std::shared_ptr<Tensor> l1_loss(const std::shared_ptr<Tensor>& pred, cons
     }
 
     int n = static_cast<int>(pred->size());
+
+    if (pred->device == Device::TPU && pred->storage->tpu_handle && target->storage->tpu_handle) {
+        bool req_grad = pred->requires_grad;
+        auto out = std::make_shared<Tensor>(std::vector<int64_t>{1, 1}, Device::TPU, pred->dtype, req_grad);
+        out->storage->tpu_handle = TPUEngine::get().l1_loss(pred->storage->tpu_handle, target->storage->tpu_handle, pred->shape, pred->dtype);
+        if (req_grad) {
+            auto grad_fn = std::make_shared<L1LossBackward>(pred, target, n);
+            grad_fn->add_next_edge(get_grad_edge(pred).function, 0);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
+
     const float* p_ptr = pred->data_ptr<float>();
     const float* t_ptr = target->data_ptr<float>();
 
@@ -1146,7 +1254,7 @@ inline std::shared_ptr<Tensor> l1_loss(const std::shared_ptr<Tensor>& pred, cons
     }
 
     bool req_grad = pred->requires_grad;
-    auto out = std::make_shared<Tensor>(std::vector<int64_t>{1, 1}, req_grad);
+    auto out = std::make_shared<Tensor>(std::vector<int64_t>{1, 1}, pred->device, pred->dtype, req_grad);
     out->data_ptr<float>()[0] = abs_sum / static_cast<float>(n);
 
     if (req_grad) {

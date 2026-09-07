@@ -21,6 +21,15 @@ private:
     id<MTLComputePipelineState> pipeline_adamw = nil;
     id<MTLComputePipelineState> pipeline_attention = nil;
 
+    id<MTLComputePipelineState> pipeline_sigmoid = nil;
+    id<MTLComputePipelineState> pipeline_sigmoid_bwd = nil;
+    id<MTLComputePipelineState> pipeline_silu = nil;
+    id<MTLComputePipelineState> pipeline_silu_bwd = nil;
+    id<MTLComputePipelineState> pipeline_leaky_relu = nil;
+    id<MTLComputePipelineState> pipeline_leaky_relu_bwd = nil;
+    id<MTLComputePipelineState> pipeline_mse_bwd = nil;
+    id<MTLComputePipelineState> pipeline_l1_loss_bwd = nil;
+
     std::unordered_map<void*, id<MTLBuffer>> buffer_map;
     std::mutex mtx;
     bool ready = false;
@@ -210,6 +219,102 @@ public:
                         out_vec[tid] = acc;
                     }
                 }
+
+                kernel void sigmoid_kernel(
+                    device const float* in       [[buffer(0)]],
+                    device float* out            [[buffer(1)]],
+                    constant uint& total_elems   [[buffer(2)]],
+                    uint id                      [[thread_position_in_grid]]
+                ) {
+                    if (id >= total_elems) return;
+                    out[id] = 1.0f / (1.0f + metal::exp(-in[id]));
+                }
+
+                kernel void sigmoid_backward_kernel(
+                    device const float* out      [[buffer(0)]],
+                    device const float* grad_out [[buffer(1)]],
+                    device float* grad_in        [[buffer(2)]],
+                    constant uint& total_elems   [[buffer(3)]],
+                    uint id                      [[thread_position_in_grid]]
+                ) {
+                    if (id >= total_elems) return;
+                    float s = out[id];
+                    grad_in[id] = s * (1.0f - s) * grad_out[id];
+                }
+
+                kernel void silu_kernel(
+                    device const float* in       [[buffer(0)]],
+                    device float* out            [[buffer(1)]],
+                    constant uint& total_elems   [[buffer(2)]],
+                    uint id                      [[thread_position_in_grid]]
+                ) {
+                    if (id >= total_elems) return;
+                    float x = in[id];
+                    out[id] = x / (1.0f + metal::exp(-x));
+                }
+
+                kernel void silu_backward_kernel(
+                    device const float* in       [[buffer(0)]],
+                    device const float* grad_out [[buffer(1)]],
+                    device float* grad_in        [[buffer(2)]],
+                    constant uint& total_elems   [[buffer(3)]],
+                    uint id                      [[thread_position_in_grid]]
+                ) {
+                    if (id >= total_elems) return;
+                    float x = in[id];
+                    float s = 1.0f / (1.0f + metal::exp(-x));
+                    grad_in[id] = (s * (1.0f + x * (1.0f - s))) * grad_out[id];
+                }
+
+                kernel void leaky_relu_kernel(
+                    device const float* in          [[buffer(0)]],
+                    device float* out               [[buffer(1)]],
+                    constant float& negative_slope  [[buffer(2)]],
+                    constant uint& total_elems      [[buffer(3)]],
+                    uint id                         [[thread_position_in_grid]]
+                ) {
+                    if (id >= total_elems) return;
+                    float x = in[id];
+                    out[id] = x > 0.0f ? x : negative_slope * x;
+                }
+
+                kernel void leaky_relu_backward_kernel(
+                    device const float* in          [[buffer(0)]],
+                    device const float* grad_out    [[buffer(1)]],
+                    device float* grad_in           [[buffer(2)]],
+                    constant float& negative_slope  [[buffer(3)]],
+                    constant uint& total_elems      [[buffer(4)]],
+                    uint id                         [[thread_position_in_grid]]
+                ) {
+                    if (id >= total_elems) return;
+                    grad_in[id] = in[id] > 0.0f ? grad_out[id] : negative_slope * grad_out[id];
+                }
+
+                kernel void mse_backward_kernel(
+                    device const float* pred     [[buffer(0)]],
+                    device const float* target   [[buffer(1)]],
+                    device float* grad_pred      [[buffer(2)]],
+                    constant float& scale        [[buffer(3)]],
+                    constant uint& total_elems   [[buffer(4)]],
+                    uint id                      [[thread_position_in_grid]]
+                ) {
+                    if (id >= total_elems) return;
+                    grad_pred[id] = scale * (pred[id] - target[id]);
+                }
+
+                kernel void l1_loss_backward_kernel(
+                    device const float* pred     [[buffer(0)]],
+                    device const float* target   [[buffer(1)]],
+                    device float* grad_pred      [[buffer(2)]],
+                    constant float& scale        [[buffer(3)]],
+                    constant uint& total_elems   [[buffer(4)]],
+                    uint id                      [[thread_position_in_grid]]
+                ) {
+                    if (id >= total_elems) return;
+                    float diff = pred[id] - target[id];
+                    float sgn = diff > 0.0f ? 1.0f : (diff < 0.0f ? -1.0f : 0.0f);
+                    grad_pred[id] = scale * sgn;
+                }
             )";
 
             NSError* error = nil;
@@ -232,6 +337,15 @@ public:
             pipeline_layernorm = create_pso(@"fused_layernorm_kernel");
             pipeline_adamw     = create_pso(@"fused_adamw_kernel");
             pipeline_attention = create_pso(@"tiled_flash_attention_kernel");
+
+            pipeline_sigmoid        = create_pso(@"sigmoid_kernel");
+            pipeline_sigmoid_bwd    = create_pso(@"sigmoid_backward_kernel");
+            pipeline_silu           = create_pso(@"silu_kernel");
+            pipeline_silu_bwd       = create_pso(@"silu_backward_kernel");
+            pipeline_leaky_relu     = create_pso(@"leaky_relu_kernel");
+            pipeline_leaky_relu_bwd = create_pso(@"leaky_relu_backward_kernel");
+            pipeline_mse_bwd        = create_pso(@"mse_backward_kernel");
+            pipeline_l1_loss_bwd    = create_pso(@"l1_loss_backward_kernel");
 
             ready = true;
         }
@@ -504,6 +618,188 @@ public:
         }
     }
 
+    void sigmoid_forward(const float* in, float* out, size_t size) override {
+        if (!ready || !pipeline_sigmoid) return;
+        @autoreleasepool {
+            id<MTLBuffer> bufIn  = get_or_wrap_buffer(in, size * sizeof(float));
+            id<MTLBuffer> bufOut = get_or_wrap_buffer(out, size * sizeof(float));
+            id<MTLCommandBuffer> cmd = [commandQueue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:pipeline_sigmoid];
+            [enc setBuffer:bufIn offset:0 atIndex:0];
+            [enc setBuffer:bufOut offset:0 atIndex:1];
+            uint tot = static_cast<uint>(size);
+            [enc setBytes:&tot length:sizeof(tot) atIndex:2];
+            MTLSize gridSize = MTLSizeMake(size, 1, 1);
+            NSUInteger w = pipeline_sigmoid.threadExecutionWidth;
+            [enc dispatchThreads:gridSize threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+    }
+
+    void sigmoid_backward(const float* out, const float* grad_out, float* grad_in, size_t size) override {
+        if (!ready || !pipeline_sigmoid_bwd) return;
+        @autoreleasepool {
+            id<MTLBuffer> bufOut  = get_or_wrap_buffer(out, size * sizeof(float));
+            id<MTLBuffer> bufGOut = get_or_wrap_buffer(grad_out, size * sizeof(float));
+            id<MTLBuffer> bufGIn  = get_or_wrap_buffer(grad_in, size * sizeof(float));
+            id<MTLCommandBuffer> cmd = [commandQueue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:pipeline_sigmoid_bwd];
+            [enc setBuffer:bufOut offset:0 atIndex:0];
+            [enc setBuffer:bufGOut offset:0 atIndex:1];
+            [enc setBuffer:bufGIn offset:0 atIndex:2];
+            uint tot = static_cast<uint>(size);
+            [enc setBytes:&tot length:sizeof(tot) atIndex:3];
+            MTLSize gridSize = MTLSizeMake(size, 1, 1);
+            NSUInteger w = pipeline_sigmoid_bwd.threadExecutionWidth;
+            [enc dispatchThreads:gridSize threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+    }
+
+    void silu_forward(const float* in, float* out, size_t size) override {
+        if (!ready || !pipeline_silu) return;
+        @autoreleasepool {
+            id<MTLBuffer> bufIn  = get_or_wrap_buffer(in, size * sizeof(float));
+            id<MTLBuffer> bufOut = get_or_wrap_buffer(out, size * sizeof(float));
+            id<MTLCommandBuffer> cmd = [commandQueue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:pipeline_silu];
+            [enc setBuffer:bufIn offset:0 atIndex:0];
+            [enc setBuffer:bufOut offset:0 atIndex:1];
+            uint tot = static_cast<uint>(size);
+            [enc setBytes:&tot length:sizeof(tot) atIndex:2];
+            MTLSize gridSize = MTLSizeMake(size, 1, 1);
+            NSUInteger w = pipeline_silu.threadExecutionWidth;
+            [enc dispatchThreads:gridSize threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+    }
+
+    void silu_backward(const float* in, const float* grad_out, float* grad_in, size_t size) override {
+        if (!ready || !pipeline_silu_bwd) return;
+        @autoreleasepool {
+            id<MTLBuffer> bufIn   = get_or_wrap_buffer(in, size * sizeof(float));
+            id<MTLBuffer> bufGOut = get_or_wrap_buffer(grad_out, size * sizeof(float));
+            id<MTLBuffer> bufGIn  = get_or_wrap_buffer(grad_in, size * sizeof(float));
+            id<MTLCommandBuffer> cmd = [commandQueue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:pipeline_silu_bwd];
+            [enc setBuffer:bufIn offset:0 atIndex:0];
+            [enc setBuffer:bufGOut offset:0 atIndex:1];
+            [enc setBuffer:bufGIn offset:0 atIndex:2];
+            uint tot = static_cast<uint>(size);
+            [enc setBytes:&tot length:sizeof(tot) atIndex:3];
+            MTLSize gridSize = MTLSizeMake(size, 1, 1);
+            NSUInteger w = pipeline_silu_bwd.threadExecutionWidth;
+            [enc dispatchThreads:gridSize threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+    }
+
+    void leaky_relu_forward(const float* in, float* out, size_t size, float negative_slope) override {
+        if (!ready || !pipeline_leaky_relu) return;
+        @autoreleasepool {
+            id<MTLBuffer> bufIn  = get_or_wrap_buffer(in, size * sizeof(float));
+            id<MTLBuffer> bufOut = get_or_wrap_buffer(out, size * sizeof(float));
+            id<MTLCommandBuffer> cmd = [commandQueue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:pipeline_leaky_relu];
+            [enc setBuffer:bufIn offset:0 atIndex:0];
+            [enc setBuffer:bufOut offset:0 atIndex:1];
+            [enc setBytes:&negative_slope length:sizeof(negative_slope) atIndex:2];
+            uint tot = static_cast<uint>(size);
+            [enc setBytes:&tot length:sizeof(tot) atIndex:3];
+            MTLSize gridSize = MTLSizeMake(size, 1, 1);
+            NSUInteger w = pipeline_leaky_relu.threadExecutionWidth;
+            [enc dispatchThreads:gridSize threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+    }
+
+    void leaky_relu_backward(const float* in, const float* grad_out, float* grad_in, size_t size, float negative_slope) override {
+        if (!ready || !pipeline_leaky_relu_bwd) return;
+        @autoreleasepool {
+            id<MTLBuffer> bufIn   = get_or_wrap_buffer(in, size * sizeof(float));
+            id<MTLBuffer> bufGOut = get_or_wrap_buffer(grad_out, size * sizeof(float));
+            id<MTLBuffer> bufGIn  = get_or_wrap_buffer(grad_in, size * sizeof(float));
+            id<MTLCommandBuffer> cmd = [commandQueue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:pipeline_leaky_relu_bwd];
+            [enc setBuffer:bufIn offset:0 atIndex:0];
+            [enc setBuffer:bufGOut offset:0 atIndex:1];
+            [enc setBuffer:bufGIn offset:0 atIndex:2];
+            [enc setBytes:&negative_slope length:sizeof(negative_slope) atIndex:3];
+            uint tot = static_cast<uint>(size);
+            [enc setBytes:&tot length:sizeof(tot) atIndex:4];
+            MTLSize gridSize = MTLSizeMake(size, 1, 1);
+            NSUInteger w = pipeline_leaky_relu_bwd.threadExecutionWidth;
+            [enc dispatchThreads:gridSize threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+    }
+
+    void mse_backward(const float* pred, const float* target, float* grad_pred, size_t size, float scale) override {
+        if (!ready || !pipeline_mse_bwd) return;
+        @autoreleasepool {
+            id<MTLBuffer> bufP = get_or_wrap_buffer(pred, size * sizeof(float));
+            id<MTLBuffer> bufT = get_or_wrap_buffer(target, size * sizeof(float));
+            id<MTLBuffer> bufG = get_or_wrap_buffer(grad_pred, size * sizeof(float));
+            id<MTLCommandBuffer> cmd = [commandQueue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:pipeline_mse_bwd];
+            [enc setBuffer:bufP offset:0 atIndex:0];
+            [enc setBuffer:bufT offset:0 atIndex:1];
+            [enc setBuffer:bufG offset:0 atIndex:2];
+            [enc setBytes:&scale length:sizeof(scale) atIndex:3];
+            uint tot = static_cast<uint>(size);
+            [enc setBytes:&tot length:sizeof(tot) atIndex:4];
+            MTLSize gridSize = MTLSizeMake(size, 1, 1);
+            NSUInteger w = pipeline_mse_bwd.threadExecutionWidth;
+            [enc dispatchThreads:gridSize threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+    }
+
+    void l1_loss_backward(const float* pred, const float* target, float* grad_pred, size_t size, float scale) override {
+        if (!ready || !pipeline_l1_loss_bwd) return;
+        @autoreleasepool {
+            id<MTLBuffer> bufP = get_or_wrap_buffer(pred, size * sizeof(float));
+            id<MTLBuffer> bufT = get_or_wrap_buffer(target, size * sizeof(float));
+            id<MTLBuffer> bufG = get_or_wrap_buffer(grad_pred, size * sizeof(float));
+            id<MTLCommandBuffer> cmd = [commandQueue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:pipeline_l1_loss_bwd];
+            [enc setBuffer:bufP offset:0 atIndex:0];
+            [enc setBuffer:bufT offset:0 atIndex:1];
+            [enc setBuffer:bufG offset:0 atIndex:2];
+            [enc setBytes:&scale length:sizeof(scale) atIndex:3];
+            uint tot = static_cast<uint>(size);
+            [enc setBytes:&tot length:sizeof(tot) atIndex:4];
+            MTLSize gridSize = MTLSizeMake(size, 1, 1);
+            NSUInteger w = pipeline_l1_loss_bwd.threadExecutionWidth;
+            [enc dispatchThreads:gridSize threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+    }
+
     void synchronize() override {
         // Managed synchronously per dispatch queue command buffer
     }
@@ -528,6 +824,14 @@ public:
     void fused_add_bias_relu(const float*, const float*, float*, size_t, size_t) override {}
     void layernorm(const float*, const float*, const float*, float*, size_t, size_t, float) override {}
     void adamw(float*, const float*, float*, float*, size_t, float, float, float, float, float, int) override {}
+    void sigmoid_forward(const float*, float*, size_t) override {}
+    void sigmoid_backward(const float*, const float*, float*, size_t) override {}
+    void silu_forward(const float*, float*, size_t) override {}
+    void silu_backward(const float*, const float*, float*, size_t) override {}
+    void leaky_relu_forward(const float*, float*, size_t, float) override {}
+    void leaky_relu_backward(const float*, const float*, float*, size_t, float) override {}
+    void mse_backward(const float*, const float*, float*, size_t, float) override {}
+    void l1_loss_backward(const float*, const float*, float*, size_t, float) override {}
     void flash_attention(const float*, const float*, const float*, float*, size_t, size_t, size_t) override {}
     void synchronize() override {}
 };

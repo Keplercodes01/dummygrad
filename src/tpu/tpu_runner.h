@@ -128,6 +128,94 @@ public:
         return out[0];
     }
 
+    // Sigmoid executed directly on TPU VPU vector units
+    std::shared_ptr<TPUBufferHandle> sigmoid(
+        const std::shared_ptr<TPUBufferHandle>& x,
+        const std::vector<int64_t>& shape,
+        DType dtype = DType::Float32,
+        size_t device_id = 0
+    ) {
+        if (!available) throw std::runtime_error("TPUEngine: TPU runtime not available");
+        auto& mgr = PJRTTPUManager::get();
+        std::string hlo_src = hlo::build_sigmoid_hlo(shape, dtype);
+        PJRT_LoadedExecutable* exec = mgr.compile_hlo(hlo_src);
+        auto out = mgr.execute(exec, { x }, { shape }, { dtype }, device_id);
+        mgr.destroy_executable(exec);
+        if (out.empty()) throw std::runtime_error("TPUEngine::sigmoid execution failed");
+        return out[0];
+    }
+
+    // SiLU (Swish) executed directly on TPU VPU vector units
+    std::shared_ptr<TPUBufferHandle> silu(
+        const std::shared_ptr<TPUBufferHandle>& x,
+        const std::vector<int64_t>& shape,
+        DType dtype = DType::Float32,
+        size_t device_id = 0
+    ) {
+        if (!available) throw std::runtime_error("TPUEngine: TPU runtime not available");
+        auto& mgr = PJRTTPUManager::get();
+        std::string hlo_src = hlo::build_silu_hlo(shape, dtype);
+        PJRT_LoadedExecutable* exec = mgr.compile_hlo(hlo_src);
+        auto out = mgr.execute(exec, { x }, { shape }, { dtype }, device_id);
+        mgr.destroy_executable(exec);
+        if (out.empty()) throw std::runtime_error("TPUEngine::silu execution failed");
+        return out[0];
+    }
+
+    // LeakyReLU executed directly on TPU VPU vector units
+    std::shared_ptr<TPUBufferHandle> leaky_relu(
+        const std::shared_ptr<TPUBufferHandle>& x,
+        const std::vector<int64_t>& shape,
+        float negative_slope = 0.01f,
+        DType dtype = DType::Float32,
+        size_t device_id = 0
+    ) {
+        if (!available) throw std::runtime_error("TPUEngine: TPU runtime not available");
+        auto& mgr = PJRTTPUManager::get();
+        std::string hlo_src = hlo::build_leaky_relu_hlo(shape, negative_slope, dtype);
+        PJRT_LoadedExecutable* exec = mgr.compile_hlo(hlo_src);
+        auto out = mgr.execute(exec, { x }, { shape }, { dtype }, device_id);
+        mgr.destroy_executable(exec);
+        if (out.empty()) throw std::runtime_error("TPUEngine::leaky_relu execution failed");
+        return out[0];
+    }
+
+    // MSE Loss reduction executed on TPU VPU vector units
+    std::shared_ptr<TPUBufferHandle> mse(
+        const std::shared_ptr<TPUBufferHandle>& pred,
+        const std::shared_ptr<TPUBufferHandle>& target,
+        const std::vector<int64_t>& shape,
+        DType dtype = DType::Float32,
+        size_t device_id = 0
+    ) {
+        if (!available) throw std::runtime_error("TPUEngine: TPU runtime not available");
+        auto& mgr = PJRTTPUManager::get();
+        std::string hlo_src = hlo::build_mse_hlo(shape, dtype);
+        PJRT_LoadedExecutable* exec = mgr.compile_hlo(hlo_src);
+        auto out = mgr.execute(exec, { pred, target }, { {1} }, { dtype }, device_id);
+        mgr.destroy_executable(exec);
+        if (out.empty()) throw std::runtime_error("TPUEngine::mse execution failed");
+        return out[0];
+    }
+
+    // L1 (MAE) Loss reduction executed on TPU VPU vector units
+    std::shared_ptr<TPUBufferHandle> l1_loss(
+        const std::shared_ptr<TPUBufferHandle>& pred,
+        const std::shared_ptr<TPUBufferHandle>& target,
+        const std::vector<int64_t>& shape,
+        DType dtype = DType::Float32,
+        size_t device_id = 0
+    ) {
+        if (!available) throw std::runtime_error("TPUEngine: TPU runtime not available");
+        auto& mgr = PJRTTPUManager::get();
+        std::string hlo_src = hlo::build_l1_loss_hlo(shape, dtype);
+        PJRT_LoadedExecutable* exec = mgr.compile_hlo(hlo_src);
+        auto out = mgr.execute(exec, { pred, target }, { {1} }, { dtype }, device_id);
+        mgr.destroy_executable(exec);
+        if (out.empty()) throw std::runtime_error("TPUEngine::l1_loss execution failed");
+        return out[0];
+    }
+
     ~TPUEngine() {
         if (ici_all_reduce_exec) {
             PJRTTPUManager::get().destroy_executable(ici_all_reduce_exec);

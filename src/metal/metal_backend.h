@@ -49,6 +49,20 @@ public:
         float eps, float weight_decay, int step
     ) = 0;
 
+    // Activations & Backward Passes
+    virtual void sigmoid_forward(const float* in, float* out, size_t size) = 0;
+    virtual void sigmoid_backward(const float* out, const float* grad_out, float* grad_in, size_t size) = 0;
+
+    virtual void silu_forward(const float* in, float* out, size_t size) = 0;
+    virtual void silu_backward(const float* in, const float* grad_out, float* grad_in, size_t size) = 0;
+
+    virtual void leaky_relu_forward(const float* in, float* out, size_t size, float negative_slope = 0.01f) = 0;
+    virtual void leaky_relu_backward(const float* in, const float* grad_out, float* grad_in, size_t size, float negative_slope = 0.01f) = 0;
+
+    // Loss Backward Passes
+    virtual void mse_backward(const float* pred, const float* target, float* grad_pred, size_t size, float scale) = 0;
+    virtual void l1_loss_backward(const float* pred, const float* target, float* grad_pred, size_t size, float scale) = 0;
+
     // Tiled FlashAttention Forward Pass
     virtual void flash_attention(
         const float* Q, const float* K, const float* V, float* Out,

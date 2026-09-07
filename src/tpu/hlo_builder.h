@@ -174,4 +174,125 @@ inline std::string build_tpu_attention_hlo(
     return ss.str();
 }
 
+// Emits an HLO Module for Sigmoid Activation
+inline std::string build_sigmoid_hlo(const std::vector<int64_t>& shape, DType dt = DType::Float32) {
+    std::string s = shape_to_hlo(shape, dt);
+    std::string t = dtype_to_hlo(dt);
+    std::ostringstream ss;
+    ss << "HloModule tpu_sigmoid\n\n";
+    ss << "ENTRY %main (x: " << s << ") -> " << s << " {\n";
+    ss << "  %x = " << s << " parameter(0)\n";
+    ss << "  %neg = " << s << " negate(%x)\n";
+    ss << "  %exp = " << s << " exponential(%neg)\n";
+    ss << "  %one_c = " << t << "[] constant(1.0)\n";
+    ss << "  %one = " << s << " broadcast(%one_c), dimensions={}\n";
+    ss << "  %denom = " << s << " add(%one, %exp)\n";
+    ss << "  ROOT %out = " << s << " divide(%one, %denom)\n";
+    ss << "}\n";
+    return ss.str();
+}
+
+// Emits an HLO Module for SiLU (Swish) Activation
+inline std::string build_silu_hlo(const std::vector<int64_t>& shape, DType dt = DType::Float32) {
+    std::string s = shape_to_hlo(shape, dt);
+    std::string t = dtype_to_hlo(dt);
+    std::ostringstream ss;
+    ss << "HloModule tpu_silu\n\n";
+    ss << "ENTRY %main (x: " << s << ") -> " << s << " {\n";
+    ss << "  %x = " << s << " parameter(0)\n";
+    ss << "  %neg = " << s << " negate(%x)\n";
+    ss << "  %exp = " << s << " exponential(%neg)\n";
+    ss << "  %one_c = " << t << "[] constant(1.0)\n";
+    ss << "  %one = " << s << " broadcast(%one_c), dimensions={}\n";
+    ss << "  %denom = " << s << " add(%one, %exp)\n";
+    ss << "  %sig = " << s << " divide(%one, %denom)\n";
+    ss << "  ROOT %out = " << s << " multiply(%x, %sig)\n";
+    ss << "}\n";
+    return ss.str();
+}
+
+// Emits an HLO Module for LeakyReLU Activation
+inline std::string build_leaky_relu_hlo(const std::vector<int64_t>& shape, float negative_slope = 0.01f, DType dt = DType::Float32) {
+    std::string s = shape_to_hlo(shape, dt);
+    std::string t = dtype_to_hlo(dt);
+    std::ostringstream ss;
+    ss << "HloModule tpu_leaky_relu\n\n";
+    ss << "ENTRY %main (x: " << s << ") -> " << s << " {\n";
+    ss << "  %x = " << s << " parameter(0)\n";
+    ss << "  %slope_c = " << t << "[] constant(" << negative_slope << ")\n";
+    ss << "  %slope = " << s << " broadcast(%slope_c), dimensions={}\n";
+    ss << "  %scaled = " << s << " multiply(%x, %slope)\n";
+    ss << "  ROOT %out = " << s << " maximum(%x, %scaled)\n";
+    ss << "}\n";
+    return ss.str();
+}
+
+// Emits an HLO Module for MSE Loss
+inline std::string build_mse_hlo(const std::vector<int64_t>& shape, DType dt = DType::Float32) {
+    std::string s = shape_to_hlo(shape, dt);
+    std::string t = dtype_to_hlo(dt);
+    int64_t total = 1;
+    for (auto d : shape) total *= d;
+
+    std::ostringstream ss;
+    ss << "HloModule tpu_mse\n\n";
+    ss << "%add_fn (lhs: " << t << "[], rhs: " << t << "[]) -> " << t << "[] {\n";
+    ss << "  %lhs = " << t << "[] parameter(0)\n";
+    ss << "  %rhs = " << t << "[] parameter(1)\n";
+    ss << "  ROOT %res = " << t << "[] add(%lhs, %rhs)\n";
+    ss << "}\n\n";
+
+    ss << "ENTRY %main (pred: " << s << ", target: " << s << ") -> " << t << "[1] {\n";
+    ss << "  %pred = " << s << " parameter(0)\n";
+    ss << "  %target = " << s << " parameter(1)\n";
+    ss << "  %diff = " << s << " subtract(%pred, %target)\n";
+    ss << "  %sq = " << s << " multiply(%diff, %diff)\n";
+    ss << "  %zero = " << t << "[] constant(0.0)\n";
+    ss << "  %sum = " << t << "[] reduce(%sq, %zero), dimensions={";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        ss << i;
+        if (i + 1 < shape.size()) ss << ",";
+    }
+    ss << "}, to_apply=%add_fn\n";
+    ss << "  %n_c = " << t << "[] constant(" << static_cast<float>(total) << ")\n";
+    ss << "  %mean = " << t << "[] divide(%sum, %n_c)\n";
+    ss << "  ROOT %out = " << t << "[1] reshape(%mean)\n";
+    ss << "}\n";
+    return ss.str();
+}
+
+// Emits an HLO Module for L1 (MAE) Loss
+inline std::string build_l1_loss_hlo(const std::vector<int64_t>& shape, DType dt = DType::Float32) {
+    std::string s = shape_to_hlo(shape, dt);
+    std::string t = dtype_to_hlo(dt);
+    int64_t total = 1;
+    for (auto d : shape) total *= d;
+
+    std::ostringstream ss;
+    ss << "HloModule tpu_l1_loss\n\n";
+    ss << "%add_fn (lhs: " << t << "[], rhs: " << t << "[]) -> " << t << "[] {\n";
+    ss << "  %lhs = " << t << "[] parameter(0)\n";
+    ss << "  %rhs = " << t << "[] parameter(1)\n";
+    ss << "  ROOT %res = " << t << "[] add(%lhs, %rhs)\n";
+    ss << "}\n\n";
+
+    ss << "ENTRY %main (pred: " << s << ", target: " << s << ") -> " << t << "[1] {\n";
+    ss << "  %pred = " << s << " parameter(0)\n";
+    ss << "  %target = " << s << " parameter(1)\n";
+    ss << "  %diff = " << s << " subtract(%pred, %target)\n";
+    ss << "  %abs = " << s << " abs(%diff)\n";
+    ss << "  %zero = " << t << "[] constant(0.0)\n";
+    ss << "  %sum = " << t << "[] reduce(%abs, %zero), dimensions={";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        ss << i;
+        if (i + 1 < shape.size()) ss << ",";
+    }
+    ss << "}, to_apply=%add_fn\n";
+    ss << "  %n_c = " << t << "[] constant(" << static_cast<float>(total) << ")\n";
+    ss << "  %mean = " << t << "[] divide(%sum, %n_c)\n";
+    ss << "  ROOT %out = " << t << "[1] reshape(%mean)\n";
+    ss << "}\n";
+    return ss.str();
+}
+
 } // namespace hlo

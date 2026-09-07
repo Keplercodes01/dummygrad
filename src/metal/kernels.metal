@@ -213,3 +213,111 @@ kernel void tiled_flash_attention_kernel(
         out_vec[tid] = acc;
     }
 }
+
+// -------------------------------------------------------------
+// Sigmoid Forward & Backward
+// -------------------------------------------------------------
+kernel void sigmoid_kernel(
+    device const float* in       [[buffer(0)]],
+    device float* out            [[buffer(1)]],
+    constant uint& total_elems   [[buffer(2)]],
+    uint id                      [[thread_position_in_grid]]
+) {
+    if (id >= total_elems) return;
+    out[id] = 1.0f / (1.0f + metal::exp(-in[id]));
+}
+
+kernel void sigmoid_backward_kernel(
+    device const float* out      [[buffer(0)]],
+    device const float* grad_out [[buffer(1)]],
+    device float* grad_in        [[buffer(2)]],
+    constant uint& total_elems   [[buffer(3)]],
+    uint id                      [[thread_position_in_grid]]
+) {
+    if (id >= total_elems) return;
+    float s = out[id];
+    grad_in[id] = s * (1.0f - s) * grad_out[id];
+}
+
+// -------------------------------------------------------------
+// SiLU (Swish) Forward & Backward
+// -------------------------------------------------------------
+kernel void silu_kernel(
+    device const float* in       [[buffer(0)]],
+    device float* out            [[buffer(1)]],
+    constant uint& total_elems   [[buffer(2)]],
+    uint id                      [[thread_position_in_grid]]
+) {
+    if (id >= total_elems) return;
+    float x = in[id];
+    out[id] = x / (1.0f + metal::exp(-x));
+}
+
+kernel void silu_backward_kernel(
+    device const float* in       [[buffer(0)]],
+    device const float* grad_out [[buffer(1)]],
+    device float* grad_in        [[buffer(2)]],
+    constant uint& total_elems   [[buffer(3)]],
+    uint id                      [[thread_position_in_grid]]
+) {
+    if (id >= total_elems) return;
+    float x = in[id];
+    float s = 1.0f / (1.0f + metal::exp(-x));
+    grad_in[id] = (s * (1.0f + x * (1.0f - s))) * grad_out[id];
+}
+
+// -------------------------------------------------------------
+// LeakyReLU Forward & Backward
+// -------------------------------------------------------------
+kernel void leaky_relu_kernel(
+    device const float* in          [[buffer(0)]],
+    device float* out               [[buffer(1)]],
+    constant float& negative_slope  [[buffer(2)]],
+    constant uint& total_elems      [[buffer(3)]],
+    uint id                         [[thread_position_in_grid]]
+) {
+    if (id >= total_elems) return;
+    float x = in[id];
+    out[id] = x > 0.0f ? x : negative_slope * x;
+}
+
+kernel void leaky_relu_backward_kernel(
+    device const float* in          [[buffer(0)]],
+    device const float* grad_out    [[buffer(1)]],
+    device float* grad_in           [[buffer(2)]],
+    constant float& negative_slope  [[buffer(3)]],
+    constant uint& total_elems      [[buffer(4)]],
+    uint id                         [[thread_position_in_grid]]
+) {
+    if (id >= total_elems) return;
+    grad_in[id] = in[id] > 0.0f ? grad_out[id] : negative_slope * grad_out[id];
+}
+
+// -------------------------------------------------------------
+// MSE & L1 Loss Backward
+// -------------------------------------------------------------
+kernel void mse_backward_kernel(
+    device const float* pred     [[buffer(0)]],
+    device const float* target   [[buffer(1)]],
+    device float* grad_pred      [[buffer(2)]],
+    constant float& scale        [[buffer(3)]],
+    constant uint& total_elems   [[buffer(4)]],
+    uint id                      [[thread_position_in_grid]]
+) {
+    if (id >= total_elems) return;
+    grad_pred[id] = scale * (pred[id] - target[id]);
+}
+
+kernel void l1_loss_backward_kernel(
+    device const float* pred     [[buffer(0)]],
+    device const float* target   [[buffer(1)]],
+    device float* grad_pred      [[buffer(2)]],
+    constant float& scale        [[buffer(3)]],
+    constant uint& total_elems   [[buffer(4)]],
+    uint id                      [[thread_position_in_grid]]
+) {
+    if (id >= total_elems) return;
+    float diff = pred[id] - target[id];
+    float sgn = diff > 0.0f ? 1.0f : (diff < 0.0f ? -1.0f : 0.0f);
+    grad_pred[id] = scale * sgn;
+}
