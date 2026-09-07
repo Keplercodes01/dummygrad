@@ -1355,6 +1355,10 @@ struct CausalMaskBackward : public Node {
             return {ga};
         }
 #endif
+        if (self_grad->device == Device::MPS) {
+            MetalBackend::get().causal_mask_backward(self_grad->data_ptr<float>(), ga->data_ptr<float>(), batch_size, r);
+            return {ga};
+        }
 
         const float* sg_ptr = self_grad->data_ptr<float>();
         float* ga_ptr = ga->data_ptr<float>();
@@ -1393,6 +1397,15 @@ inline std::shared_ptr<Tensor> causal_mask(const std::shared_ptr<Tensor>& a) {
         return out;
     }
 #endif
+    if (a->device == Device::MPS) {
+        MetalBackend::get().causal_mask(a->data_ptr<float>(), out->data_ptr<float>(), batch_size, r);
+        if (req_grad) {
+            auto grad_fn = std::make_shared<CausalMaskBackward>(r, c, batch_size);
+            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
 
     const float* a_ptr = a->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();

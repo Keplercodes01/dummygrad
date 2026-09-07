@@ -251,6 +251,36 @@ float total_norm = clip_grad_norm_(model.parameters(), 1.0f);
 
 ---
 
+## Modern Attention Masking Techniques
+
+`dummygrad` provides a comprehensive suite of hardware-accelerated modern masking primitives:
+
+- **Sliding Window Attention (SWA)**: Used in Mistral 7B and Gemma 2 (`masking::sliding_window_mask`). Bounds memory and attention span to a local window $W$.
+- **Prefix-LM Masking**: Used in T5, PaLM, and Fill-in-the-Middle (`masking::prefix_causal_mask`). Enables bidirectional prefix conditioning with causal generation.
+- **ALiBi (Attention with Linear Biases)**: Eliminates positional embeddings with geometric head slopes $m_h = 2^{-8h/H}$ (`masking::alibi_bias`).
+- **Arbitrary Key-Padding Mask**: Automatically broadcastable additive masks (`masking::create_padding_mask`) for variable-length batched training.
+- **Document-Packing Block-Diagonal Mask**: Prevents attention contamination between multiplexed packed sequences (`masking::document_causal_mask`).
+
+```cpp
+#include "dummy_core.h"
+
+// 1. Sliding Window Attention (e.g. 512 token local window for Mistral)
+auto swa_scores = masking::sliding_window_mask(scores, 512);
+
+// 2. Prefix-Causal Mask (first 256 tokens bidirectional prompt, rest causal)
+auto prefix_scores = masking::prefix_causal_mask(scores, 256);
+
+// 3. ALiBi Positional Bias
+auto alibi = masking::alibi_bias(12, 1024); // [1, 12, 1024, 1024]
+auto logits = model.forward(input_ids, nullptr, alibi);
+
+// 4. Sequence Packing / Sample Multiplexing (LLaMA 3 block-diagonal mask)
+auto doc_mask = masking::document_causal_mask(doc_ids);
+auto out = model.forward(input_ids, nullptr, doc_mask);
+```
+
+---
+
 ## Built by
 
 [@Keplercodes01](https://github.com/Keplercodes01)

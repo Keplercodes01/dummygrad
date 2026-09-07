@@ -47,6 +47,10 @@ namespace cuda {
 
     void causal_mask(const float* in, float* out, int batch, int seq_len);
     void causal_mask_backward(const float* grad_out, float* grad_in, int batch, int seq_len);
+    void sliding_window_mask(const float* in, float* out, int batch, int seq_len, int window_size);
+    void sliding_window_mask_backward(const float* grad_out, float* grad_in, int batch, int seq_len, int window_size);
+    void prefix_causal_mask(const float* in, float* out, int batch, int seq_len, int prefix_len);
+    void prefix_causal_mask_backward(const float* grad_out, float* grad_in, int batch, int seq_len, int prefix_len);
 
     // Frontier Tiled FlashAttention (Online Softmax, O(N) memory)
     void flash_attention_forward(const float* q, const float* k, const float* v,

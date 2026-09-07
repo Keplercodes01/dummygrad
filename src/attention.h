@@ -50,7 +50,8 @@ public:
     SelfAttention(int d_model, bool causal = false)
         : W_q(d_model, d_model), W_k(d_model, d_model), W_v(d_model, d_model), d_k(d_model), causal(causal) {}
 
-    std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x_in) {
+    std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x_in,
+                                    const std::shared_ptr<Tensor>& mask = nullptr) {
         auto x = x_in;
         bool is_2d = (x->ndim() == 2);
         if (is_2d) {
@@ -68,7 +69,7 @@ public:
 
 #ifdef USE_CUDA
         std::shared_ptr<Tensor> out;
-        if (x->device == Device::CUDA) {
+        if (x->device == Device::CUDA && !mask) {
             auto Q_4d = make_contiguous(reshape(Q, {B, 1, S, d_k}));
             auto K_4d = make_contiguous(reshape(K, {B, 1, S, d_k}));
             auto V_4d = make_contiguous(reshape(V, {B, 1, S, d_k}));
@@ -87,13 +88,15 @@ public:
             out = reshape(out_4d, {B, S, d_k});
         } else {
             auto scores = mul_scalar(matmul(Q, transpose(K, -2, -1)), scale);
-            if (causal) scores = causal_mask(scores); 
+            if (mask) scores = add(scores, mask);
+            else if (causal) scores = causal_mask(scores); 
             auto weights = softmax(scores); 
             out = matmul(weights, V);
         }
 #else
         auto scores = mul_scalar(matmul(Q, transpose(K, -2, -1)), scale);
-        if (causal) scores = causal_mask(scores); 
+        if (mask) scores = add(scores, mask);
+        else if (causal) scores = causal_mask(scores); 
         auto weights = softmax(scores); 
         auto out = matmul(weights, V);
 #endif
@@ -130,7 +133,8 @@ public:
         : W_q(d_model, d_model), W_k(d_model, d_model), W_v(d_model, d_model), W_o(d_model, d_model),
           d_model(d_model), n_heads(n_heads), d_k(d_model / n_heads), causal(causal) {}
 
-    std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x_in) {
+    std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x_in,
+                                    const std::shared_ptr<Tensor>& mask = nullptr) {
         auto x = x_in;
         bool is_2d = (x->ndim() == 2);
         if (is_2d) {
@@ -154,7 +158,7 @@ public:
 
 #ifdef USE_CUDA
         std::shared_ptr<Tensor> attn_out;
-        if (x->device == Device::CUDA) {
+        if (x->device == Device::CUDA && !mask) {
             auto Q_c = make_contiguous(Q_split);
             auto K_c = make_contiguous(K_split);
             auto V_c = make_contiguous(V_split);
@@ -172,15 +176,17 @@ public:
             }
         } else {
             auto scores = mul_scalar(matmul(Q_split, transpose(K_split, -2, -1)), scale);
-            if (causal) scores = causal_mask(scores);
+            if (mask) scores = add(scores, mask);
+            else if (causal) scores = causal_mask(scores);
             auto weights = softmax(scores);
             attn_out = matmul(weights, V_split); // [B, n_heads, S, d_k]
         }
 #else
         auto scores = mul_scalar(matmul(Q_split, transpose(K_split, -2, -1)), scale);
-        if (causal) scores = causal_mask(scores);
+        if (mask) scores = add(scores, mask);
+        else if (causal) scores = causal_mask(scores);
         auto weights = softmax(scores);
-        auto attn_out = matmul(weights, V_split); // [B, n_heads, S, d_k]
+        attn_out = matmul(weights, V_split); // [B, n_heads, S, d_k]
 #endif
 
         // Transpose back to [B, S, n_heads, d_k] -> Reshape to [B, S, d_model]

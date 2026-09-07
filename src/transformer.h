@@ -41,10 +41,11 @@ public:
     TransformerBlock(int d_model, int n_heads, bool causal = true)
         : ln1(d_model), attn(d_model, n_heads, causal), ln2(d_model), ffn(d_model) {}
 
-    std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x) {
+    std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x,
+                                    const std::shared_ptr<Tensor>& mask = nullptr) {
         // Pre-LN Residual Connection 1: x = x + Attention(LN1(x))
         auto norm1 = ln1.forward(x);
-        auto attn_out = attn.forward(norm1);
+        auto attn_out = attn.forward(norm1, mask);
         auto x1 = add(x, attn_out);
 
         // Pre-LN Residual Connection 2: x = x + FFN(LN2(x))
@@ -106,15 +107,17 @@ public:
         }
     }
 
-    std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& input_ids, const std::shared_ptr<Tensor>& pos_ids) {
+    std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& input_ids,
+                                    const std::shared_ptr<Tensor>& pos_ids,
+                                    const std::shared_ptr<Tensor>& mask = nullptr) {
         // Token + Positional Embeddings
         auto tok_x = token_emb.forward(input_ids);
-        auto pos_x = pos_emb.forward(pos_ids);
-        auto x = add(tok_x, pos_x);
+        auto pos_x = pos_ids ? pos_emb.forward(pos_ids) : nullptr;
+        auto x = pos_x ? add(tok_x, pos_x) : tok_x;
 
         // Pass through Transformer blocks
         for (auto& block : blocks) {
-            x = block->forward(x);
+            x = block->forward(x, mask);
         }
 
         // Final LayerNorm 

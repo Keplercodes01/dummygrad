@@ -69,5 +69,11 @@ public:
         size_t num_heads, size_t seq_len, size_t head_dim
     ) = 0;
 
+    // Attention & Modern Masking
+    virtual void causal_mask(const float* in, float* out, size_t batch, size_t seq_len) = 0;
+    virtual void causal_mask_backward(const float* grad_out, float* grad_in, size_t batch, size_t seq_len) = 0;
+    virtual void sliding_window_mask(const float* in, float* out, size_t batch, size_t seq_len, size_t window_size) = 0;
+    virtual void sliding_window_mask_backward(const float* grad_out, float* grad_in, size_t batch, size_t seq_len, size_t window_size) = 0;
+
     virtual void synchronize() = 0;
 };

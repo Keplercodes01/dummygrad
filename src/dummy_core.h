@@ -13,3 +13,4 @@
 #include "metal/metal_backend.h"
 #include "serialization.h"
 #include "modern_layers.h"
+#include "masking.h"

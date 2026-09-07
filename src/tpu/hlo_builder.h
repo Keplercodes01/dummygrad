@@ -295,4 +295,86 @@ inline std::string build_l1_loss_hlo(const std::vector<int64_t>& shape, DType dt
     return ss.str();
 }
 
+// Emits an HLO Module for Causal Masking on TPU
+inline std::string build_causal_mask_hlo(
+    const std::vector<int64_t>& shape,
+    DType dt = DType::Float32
+) {
+    std::string s = shape_to_hlo(shape, dt);
+    std::string t = dtype_to_hlo(dt);
+    size_t ndim = shape.size();
+    size_t row_dim = ndim - 2;
+    size_t col_dim = ndim - 1;
+
+    std::string s_s32 = "s32[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        s_s32 += std::to_string(shape[i]);
+        if (i + 1 < shape.size()) s_s32 += ",";
+    }
+    s_s32 += "]";
+    std::string s_pred = "pred[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        s_pred += std::to_string(shape[i]);
+        if (i + 1 < shape.size()) s_pred += ",";
+    }
+    s_pred += "]";
+
+    std::ostringstream ss;
+    ss << "HloModule tpu_causal_mask\n\n";
+    ss << "ENTRY %main (scores: " << s << ") -> " << s << " {\n";
+    ss << "  %scores = " << s << " parameter(0)\n";
+    ss << "  %neg_inf_c = " << t << "[] constant(-1e9)\n";
+    ss << "  %neg_inf = " << s << " broadcast(%neg_inf_c), dimensions={}\n";
+    ss << "  %row_idx = " << s_s32 << " iota(), iota_dimension=" << row_dim << "\n";
+    ss << "  %col_idx = " << s_s32 << " iota(), iota_dimension=" << col_dim << "\n";
+    ss << "  %mask_cond = " << s_pred << " compare(%col_idx, %row_idx), direction=LE\n";
+    ss << "  ROOT %out = " << s << " select(%mask_cond, %scores, %neg_inf)\n";
+    ss << "}\n";
+    return ss.str();
+}
+
+// Emits an HLO Module for Sliding Window Attention Masking on TPU
+inline std::string build_sliding_window_mask_hlo(
+    const std::vector<int64_t>& shape,
+    int64_t window_size,
+    DType dt = DType::Float32
+) {
+    std::string s = shape_to_hlo(shape, dt);
+    std::string t = dtype_to_hlo(dt);
+    size_t ndim = shape.size();
+    size_t row_dim = ndim - 2;
+    size_t col_dim = ndim - 1;
+
+    std::string s_s32 = "s32[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        s_s32 += std::to_string(shape[i]);
+        if (i + 1 < shape.size()) s_s32 += ",";
+    }
+    s_s32 += "]";
+    std::string s_pred = "pred[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        s_pred += std::to_string(shape[i]);
+        if (i + 1 < shape.size()) s_pred += ",";
+    }
+    s_pred += "]";
+
+    std::ostringstream ss;
+    ss << "HloModule tpu_sliding_window_mask\n\n";
+    ss << "ENTRY %main (scores: " << s << ") -> " << s << " {\n";
+    ss << "  %scores = " << s << " parameter(0)\n";
+    ss << "  %neg_inf_c = " << t << "[] constant(-1e9)\n";
+    ss << "  %neg_inf = " << s << " broadcast(%neg_inf_c), dimensions={}\n";
+    ss << "  %win_c = s32[] constant(" << window_size << ")\n";
+    ss << "  %win = " << s_s32 << " broadcast(%win_c), dimensions={}\n";
+    ss << "  %row_idx = " << s_s32 << " iota(), iota_dimension=" << row_dim << "\n";
+    ss << "  %col_idx = " << s_s32 << " iota(), iota_dimension=" << col_dim << "\n";
+    ss << "  %causal_cond = " << s_pred << " compare(%col_idx, %row_idx), direction=LE\n";
+    ss << "  %dist = " << s_s32 << " subtract(%row_idx, %col_idx)\n";
+    ss << "  %win_cond = " << s_pred << " compare(%dist, %win), direction=LE\n";
+    ss << "  %valid = " << s_pred << " and(%causal_cond, %win_cond)\n";
+    ss << "  ROOT %out = " << s << " select(%valid, %scores, %neg_inf)\n";
+    ss << "}\n";
+    return ss.str();
+}
+
 } // namespace hlo

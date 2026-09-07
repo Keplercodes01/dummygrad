@@ -29,6 +29,10 @@ private:
     id<MTLComputePipelineState> pipeline_leaky_relu_bwd = nil;
     id<MTLComputePipelineState> pipeline_mse_bwd = nil;
     id<MTLComputePipelineState> pipeline_l1_loss_bwd = nil;
+    id<MTLComputePipelineState> pipeline_causal_mask = nil;
+    id<MTLComputePipelineState> pipeline_causal_mask_bwd = nil;
+    id<MTLComputePipelineState> pipeline_sliding_window_mask = nil;
+    id<MTLComputePipelineState> pipeline_sliding_window_mask_bwd = nil;
 
     std::unordered_map<void*, id<MTLBuffer>> buffer_map;
     std::mutex mtx;
@@ -315,6 +319,62 @@ public:
                     float sgn = diff > 0.0f ? 1.0f : (diff < 0.0f ? -1.0f : 0.0f);
                     grad_pred[id] = scale * sgn;
                 }
+
+                kernel void causal_mask_kernel(
+                    device const float* in       [[buffer(0)]],
+                    device float* out            [[buffer(1)]],
+                    constant uint& total_elems   [[buffer(2)]],
+                    constant uint& seq_len       [[buffer(3)]],
+                    uint id                      [[thread_position_in_grid]]
+                ) {
+                    if (id >= total_elems) return;
+                    uint j = id % seq_len;
+                    uint i = (id / seq_len) % seq_len;
+                    out[id] = (j > i) ? -1e9f : in[id];
+                }
+
+                kernel void causal_mask_backward_kernel(
+                    device const float* grad_out [[buffer(0)]],
+                    device float* grad_in        [[buffer(1)]],
+                    constant uint& total_elems   [[buffer(2)]],
+                    constant uint& seq_len       [[buffer(3)]],
+                    uint id                      [[thread_position_in_grid]]
+                ) {
+                    if (id >= total_elems) return;
+                    uint j = id % seq_len;
+                    uint i = (id / seq_len) % seq_len;
+                    grad_in[id] = (j > i) ? 0.0f : grad_out[id];
+                }
+
+                kernel void sliding_window_mask_kernel(
+                    device const float* in       [[buffer(0)]],
+                    device float* out            [[buffer(1)]],
+                    constant uint& total_elems   [[buffer(2)]],
+                    constant uint& seq_len       [[buffer(3)]],
+                    constant uint& window_size   [[buffer(4)]],
+                    uint id                      [[thread_position_in_grid]]
+                ) {
+                    if (id >= total_elems) return;
+                    uint j = id % seq_len;
+                    uint i = (id / seq_len) % seq_len;
+                    bool valid = (j <= i) && (i - j <= window_size);
+                    out[id] = valid ? in[id] : -1e9f;
+                }
+
+                kernel void sliding_window_mask_backward_kernel(
+                    device const float* grad_out [[buffer(0)]],
+                    device float* grad_in        [[buffer(1)]],
+                    constant uint& total_elems   [[buffer(2)]],
+                    constant uint& seq_len       [[buffer(3)]],
+                    constant uint& window_size   [[buffer(4)]],
+                    uint id                      [[thread_position_in_grid]]
+                ) {
+                    if (id >= total_elems) return;
+                    uint j = id % seq_len;
+                    uint i = (id / seq_len) % seq_len;
+                    bool valid = (j <= i) && (i - j <= window_size);
+                    grad_in[id] = valid ? grad_out[id] : 0.0f;
+                }
             )";
 
             NSError* error = nil;
@@ -346,6 +406,11 @@ public:
             pipeline_leaky_relu_bwd = create_pso(@"leaky_relu_backward_kernel");
             pipeline_mse_bwd        = create_pso(@"mse_backward_kernel");
             pipeline_l1_loss_bwd    = create_pso(@"l1_loss_backward_kernel");
+
+            pipeline_causal_mask            = create_pso(@"causal_mask_kernel");
+            pipeline_causal_mask_bwd        = create_pso(@"causal_mask_backward_kernel");
+            pipeline_sliding_window_mask     = create_pso(@"sliding_window_mask_kernel");
+            pipeline_sliding_window_mask_bwd = create_pso(@"sliding_window_mask_backward_kernel");
 
             ready = true;
         }
@@ -800,6 +865,106 @@ public:
         }
     }
 
+    void causal_mask(const float* in, float* out, size_t batch, size_t seq_len) override {
+        if (!ready || !pipeline_causal_mask) return;
+        size_t total = batch * seq_len * seq_len;
+        @autoreleasepool {
+            id<MTLBuffer> bufIn  = get_or_wrap_buffer(in, total * sizeof(float));
+            id<MTLBuffer> bufOut = get_or_wrap_buffer(out, total * sizeof(float));
+            id<MTLCommandBuffer> cmd = [commandQueue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:pipeline_causal_mask];
+            [enc setBuffer:bufIn offset:0 atIndex:0];
+            [enc setBuffer:bufOut offset:0 atIndex:1];
+            uint tot = static_cast<uint>(total);
+            uint slen = static_cast<uint>(seq_len);
+            [enc setBytes:&tot length:sizeof(tot) atIndex:2];
+            [enc setBytes:&slen length:sizeof(slen) atIndex:3];
+            MTLSize gridSize = MTLSizeMake(total, 1, 1);
+            NSUInteger w = pipeline_causal_mask.threadExecutionWidth;
+            [enc dispatchThreads:gridSize threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+    }
+
+    void causal_mask_backward(const float* grad_out, float* grad_in, size_t batch, size_t seq_len) override {
+        if (!ready || !pipeline_causal_mask_bwd) return;
+        size_t total = batch * seq_len * seq_len;
+        @autoreleasepool {
+            id<MTLBuffer> bufGOut = get_or_wrap_buffer(grad_out, total * sizeof(float));
+            id<MTLBuffer> bufGIn  = get_or_wrap_buffer(grad_in, total * sizeof(float));
+            id<MTLCommandBuffer> cmd = [commandQueue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:pipeline_causal_mask_bwd];
+            [enc setBuffer:bufGOut offset:0 atIndex:0];
+            [enc setBuffer:bufGIn offset:0 atIndex:1];
+            uint tot = static_cast<uint>(total);
+            uint slen = static_cast<uint>(seq_len);
+            [enc setBytes:&tot length:sizeof(tot) atIndex:2];
+            [enc setBytes:&slen length:sizeof(slen) atIndex:3];
+            MTLSize gridSize = MTLSizeMake(total, 1, 1);
+            NSUInteger w = pipeline_causal_mask_bwd.threadExecutionWidth;
+            [enc dispatchThreads:gridSize threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+    }
+
+    void sliding_window_mask(const float* in, float* out, size_t batch, size_t seq_len, size_t window_size) override {
+        if (!ready || !pipeline_sliding_window_mask) return;
+        size_t total = batch * seq_len * seq_len;
+        @autoreleasepool {
+            id<MTLBuffer> bufIn  = get_or_wrap_buffer(in, total * sizeof(float));
+            id<MTLBuffer> bufOut = get_or_wrap_buffer(out, total * sizeof(float));
+            id<MTLCommandBuffer> cmd = [commandQueue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:pipeline_sliding_window_mask];
+            [enc setBuffer:bufIn offset:0 atIndex:0];
+            [enc setBuffer:bufOut offset:0 atIndex:1];
+            uint tot = static_cast<uint>(total);
+            uint slen = static_cast<uint>(seq_len);
+            uint win = static_cast<uint>(window_size);
+            [enc setBytes:&tot length:sizeof(tot) atIndex:2];
+            [enc setBytes:&slen length:sizeof(slen) atIndex:3];
+            [enc setBytes:&win length:sizeof(win) atIndex:4];
+            MTLSize gridSize = MTLSizeMake(total, 1, 1);
+            NSUInteger w = pipeline_sliding_window_mask.threadExecutionWidth;
+            [enc dispatchThreads:gridSize threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+    }
+
+    void sliding_window_mask_backward(const float* grad_out, float* grad_in, size_t batch, size_t seq_len, size_t window_size) override {
+        if (!ready || !pipeline_sliding_window_mask_bwd) return;
+        size_t total = batch * seq_len * seq_len;
+        @autoreleasepool {
+            id<MTLBuffer> bufGOut = get_or_wrap_buffer(grad_out, total * sizeof(float));
+            id<MTLBuffer> bufGIn  = get_or_wrap_buffer(grad_in, total * sizeof(float));
+            id<MTLCommandBuffer> cmd = [commandQueue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:pipeline_sliding_window_mask_bwd];
+            [enc setBuffer:bufGOut offset:0 atIndex:0];
+            [enc setBuffer:bufGIn offset:0 atIndex:1];
+            uint tot = static_cast<uint>(total);
+            uint slen = static_cast<uint>(seq_len);
+            uint win = static_cast<uint>(window_size);
+            [enc setBytes:&tot length:sizeof(tot) atIndex:2];
+            [enc setBytes:&slen length:sizeof(slen) atIndex:3];
+            [enc setBytes:&win length:sizeof(win) atIndex:4];
+            MTLSize gridSize = MTLSizeMake(total, 1, 1);
+            NSUInteger w = pipeline_sliding_window_mask_bwd.threadExecutionWidth;
+            [enc dispatchThreads:gridSize threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+    }
+
     void synchronize() override {
         // Managed synchronously per dispatch queue command buffer
     }
@@ -833,6 +998,10 @@ public:
     void mse_backward(const float*, const float*, float*, size_t, float) override {}
     void l1_loss_backward(const float*, const float*, float*, size_t, float) override {}
     void flash_attention(const float*, const float*, const float*, float*, size_t, size_t, size_t) override {}
+    void causal_mask(const float*, float*, size_t, size_t) override {}
+    void causal_mask_backward(const float*, float*, size_t, size_t) override {}
+    void sliding_window_mask(const float*, float*, size_t, size_t, size_t) override {}
+    void sliding_window_mask_backward(const float*, float*, size_t, size_t, size_t) override {}
     void synchronize() override {}
 };
 

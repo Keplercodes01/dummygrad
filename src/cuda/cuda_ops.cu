@@ -122,6 +122,50 @@ __global__ void k_causal_mask_backward(const float* grad_out, float* grad_in, in
     }
 }
 
+__global__ void k_sliding_window_mask(const float* in, float* out, int total_rows, int seq_len, int window_size) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total_elements = (int64_t)total_rows * seq_len;
+    if (idx < total_elements) {
+        int col = idx % seq_len;
+        int row = (idx / seq_len) % seq_len;
+        bool valid = (col <= row) && (row - col <= window_size);
+        out[idx] = valid ? in[idx] : -1e9f;
+    }
+}
+
+__global__ void k_sliding_window_mask_backward(const float* grad_out, float* grad_in, int total_rows, int seq_len, int window_size) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total_elements = (int64_t)total_rows * seq_len;
+    if (idx < total_elements) {
+        int col = idx % seq_len;
+        int row = (idx / seq_len) % seq_len;
+        bool valid = (col <= row) && (row - col <= window_size);
+        grad_in[idx] = valid ? grad_out[idx] : 0.0f;
+    }
+}
+
+__global__ void k_prefix_causal_mask(const float* in, float* out, int total_rows, int seq_len, int prefix_len) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total_elements = (int64_t)total_rows * seq_len;
+    if (idx < total_elements) {
+        int col = idx % seq_len;
+        int row = (idx / seq_len) % seq_len;
+        bool valid = (row < prefix_len) ? (col < prefix_len) : (col <= row);
+        out[idx] = valid ? in[idx] : -1e9f;
+    }
+}
+
+__global__ void k_prefix_causal_mask_backward(const float* grad_out, float* grad_in, int total_rows, int seq_len, int prefix_len) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total_elements = (int64_t)total_rows * seq_len;
+    if (idx < total_elements) {
+        int col = idx % seq_len;
+        int row = (idx / seq_len) % seq_len;
+        bool valid = (row < prefix_len) ? (col < prefix_len) : (col <= row);
+        grad_in[idx] = valid ? grad_out[idx] : 0.0f;
+    }
+}
+
 __global__ void k_layernorm_forward(const float* __restrict__ x,
                                     const float* __restrict__ gamma,
                                     const float* __restrict__ beta,
@@ -649,6 +693,38 @@ void causal_mask_backward(const float* grad_out, float* grad_in, int batch, int 
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     k_causal_mask_backward<<<blocks, threads>>>(grad_out, grad_in, batch * seq_len, seq_len);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void sliding_window_mask(const float* in, float* out, int batch, int seq_len, int window_size) {
+    int64_t total = (int64_t)batch * seq_len * seq_len;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    k_sliding_window_mask<<<blocks, threads>>>(in, out, batch * seq_len, seq_len, window_size);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void sliding_window_mask_backward(const float* grad_out, float* grad_in, int batch, int seq_len, int window_size) {
+    int64_t total = (int64_t)batch * seq_len * seq_len;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    k_sliding_window_mask_backward<<<blocks, threads>>>(grad_out, grad_in, batch * seq_len, seq_len, window_size);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void prefix_causal_mask(const float* in, float* out, int batch, int seq_len, int prefix_len) {
+    int64_t total = (int64_t)batch * seq_len * seq_len;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    k_prefix_causal_mask<<<blocks, threads>>>(in, out, batch * seq_len, seq_len, prefix_len);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void prefix_causal_mask_backward(const float* grad_out, float* grad_in, int batch, int seq_len, int prefix_len) {
+    int64_t total = (int64_t)batch * seq_len * seq_len;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    k_prefix_causal_mask_backward<<<blocks, threads>>>(grad_out, grad_in, batch * seq_len, seq_len, prefix_len);
     CUDA_CHECK(cudaGetLastError());
 }
 

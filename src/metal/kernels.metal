@@ -321,3 +321,62 @@ kernel void l1_loss_backward_kernel(
     float sgn = diff > 0.0f ? 1.0f : (diff < 0.0f ? -1.0f : 0.0f);
     grad_pred[id] = scale * sgn;
 }
+
+// -------------------------------------------------------------
+// Causal Mask & Sliding Window Mask Forward & Backward
+// -------------------------------------------------------------
+kernel void causal_mask_kernel(
+    device const float* in       [[buffer(0)]],
+    device float* out            [[buffer(1)]],
+    constant uint& total_elems   [[buffer(2)]],
+    constant uint& seq_len       [[buffer(3)]],
+    uint id                      [[thread_position_in_grid]]
+) {
+    if (id >= total_elems) return;
+    uint j = id % seq_len;
+    uint i = (id / seq_len) % seq_len;
+    out[id] = (j > i) ? -1e9f : in[id];
+}
+
+kernel void causal_mask_backward_kernel(
+    device const float* grad_out [[buffer(0)]],
+    device float* grad_in        [[buffer(1)]],
+    constant uint& total_elems   [[buffer(2)]],
+    constant uint& seq_len       [[buffer(3)]],
+    uint id                      [[thread_position_in_grid]]
+) {
+    if (id >= total_elems) return;
+    uint j = id % seq_len;
+    uint i = (id / seq_len) % seq_len;
+    grad_in[id] = (j > i) ? 0.0f : grad_out[id];
+}
+
+kernel void sliding_window_mask_kernel(
+    device const float* in       [[buffer(0)]],
+    device float* out            [[buffer(1)]],
+    constant uint& total_elems   [[buffer(2)]],
+    constant uint& seq_len       [[buffer(3)]],
+    constant uint& window_size   [[buffer(4)]],
+    uint id                      [[thread_position_in_grid]]
+) {
+    if (id >= total_elems) return;
+    uint j = id % seq_len;
+    uint i = (id / seq_len) % seq_len;
+    bool valid = (j <= i) && (i - j <= window_size);
+    out[id] = valid ? in[id] : -1e9f;
+}
+
+kernel void sliding_window_mask_backward_kernel(
+    device const float* grad_out [[buffer(0)]],
+    device float* grad_in        [[buffer(1)]],
+    constant uint& total_elems   [[buffer(2)]],
+    constant uint& seq_len       [[buffer(3)]],
+    constant uint& window_size   [[buffer(4)]],
+    uint id                      [[thread_position_in_grid]]
+) {
+    if (id >= total_elems) return;
+    uint j = id % seq_len;
+    uint i = (id / seq_len) % seq_len;
+    bool valid = (j <= i) && (i - j <= window_size);
+    grad_in[id] = valid ? grad_out[id] : 0.0f;
+}
