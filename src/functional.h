@@ -917,6 +917,67 @@ inline std::shared_ptr<Tensor> mse(const std::shared_ptr<Tensor>& pred, const st
     return out;
 }
 
+// --- L1 LOSS (MAE) BACKWARD NODE ---
+struct L1LossBackward : public Node {
+    std::shared_ptr<Tensor> pred, target;
+    int n;
+    L1LossBackward(std::shared_ptr<Tensor> pred, std::shared_ptr<Tensor> target, int n)
+        : pred(pred), target(target), n(n) {}
+
+    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        std::shared_ptr<Tensor> self_grad = grads[0];
+        auto grad_pred = std::make_shared<Tensor>(pred->shape, false);
+        grad_pred->fill_(0.0f);
+        const float* p_ptr = pred->data_ptr<float>();
+        const float* t_ptr = target->data_ptr<float>();
+        float* gp_ptr = grad_pred->data_ptr<float>();
+        float g_val = self_grad->data_ptr<float>()[0];
+
+        for (int i = 0; i < n; i++) {
+            float diff = p_ptr[i] - t_ptr[i];
+            float sgn = (diff > 0.0f) ? 1.0f : ((diff < 0.0f) ? -1.0f : 0.0f);
+            gp_ptr[i] = (sgn / static_cast<float>(n)) * g_val;
+        }
+        return {grad_pred};
+    }
+};
+
+// l1_loss (MAE - Mean Absolute Error)
+inline std::shared_ptr<Tensor> l1_loss(const std::shared_ptr<Tensor>& pred, const std::shared_ptr<Tensor>& target) {
+    if (pred->shape != target->shape) {
+        throw std::runtime_error("The shape of your prediction and target doesn't match man..");
+    }
+
+    int n = static_cast<int>(pred->size());
+    const float* p_ptr = pred->data_ptr<float>();
+    const float* t_ptr = target->data_ptr<float>();
+
+    float abs_sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        abs_sum += std::abs(p_ptr[i] - t_ptr[i]);
+    }
+
+    bool req_grad = pred->requires_grad;
+    auto out = std::make_shared<Tensor>(std::vector<int64_t>{1, 1}, req_grad);
+    out->data_ptr<float>()[0] = abs_sum / static_cast<float>(n);
+
+    if (req_grad) {
+        auto grad_fn = std::make_shared<L1LossBackward>(pred, target, n);
+        grad_fn->add_next_edge(get_grad_edge(pred).function, 0);
+        out->grad_fn = grad_fn;
+    }
+
+    return out;
+}
+
+inline std::shared_ptr<Tensor> l1loss(const std::shared_ptr<Tensor>& pred, const std::shared_ptr<Tensor>& target) {
+    return l1_loss(pred, target);
+}
+
+inline std::shared_ptr<Tensor> mae(const std::shared_ptr<Tensor>& pred, const std::shared_ptr<Tensor>& target) {
+    return l1_loss(pred, target);
+}
+
 // ========================================
 // From masking.h
 // ========================================
