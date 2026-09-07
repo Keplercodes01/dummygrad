@@ -11,3 +11,5 @@
 #include "tpu/hlo_builder.h"
 #include "tpu/tpu_runner.h"
 #include "metal/metal_backend.h"
+#include "serialization.h"
+#include "modern_layers.h"

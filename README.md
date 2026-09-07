@@ -193,6 +193,64 @@ int main() {
 
 ---
 
+## Zero-Copy SafeTensors & Model Serialization
+
+`dummygrad` features native, pure C++ **SafeTensors** and binary model checkpointing with **zero Python dependencies** and zero CPU copies via memory-mapped I/O (`mmap`):
+
+- **Hugging Face Interoperability**: Read and write standard `.safetensors` files directly loadable in PyTorch / Hugging Face Transformers.
+- **Zero-Copy Deserialization**: Uses `mmap` to map tensors directly from disk into virtual address space in sub-microsecond latency.
+- **Pure C++ Checkpointing**: Save and restore complete state dicts (`std::unordered_map<std::string, std::shared_ptr<Tensor>>`) with single-line calls.
+
+```cpp
+#include "dummy_core.h"
+
+// 1. Save model weights to Hugging Face SafeTensors format
+std::unordered_map<std::string, std::shared_ptr<Tensor>> weights = {
+    {"transformer.w_gate.weight", w_gate},
+    {"transformer.norm.gamma", rms_gamma}
+};
+io::save_safetensors("model.safetensors", weights);
+
+// 2. Instantaneous zero-copy load from SafeTensors file
+auto loaded = io::load_safetensors("model.safetensors", Device::CPU);
+std::cout << "Loaded " << loaded.size() << " tensors with zero memory copies.\n";
+```
+
+---
+
+## Modern LLM Research Primitives (LLaMA 3, Mistral, DeepSeek Stack)
+
+`dummygrad` comes built-in with the complete modern LLM architectural stack:
+
+- **RMSNorm**: Root Mean Square Layer Normalization without mean subtraction ($\frac{x}{\text{RMS}(x)} \odot \gamma$) with analytical autograd backward pass.
+- **RoPE (Rotary Position Embeddings)**: Continuous coordinate rotation for Query and Key tensors (`precompute_freqs_cis`, `apply_rotary_emb`) with orthogonal $R^T$ backward pass.
+- **SwiGLU**: Gated feed-forward network ($\text{SwiGLU}(x) = (\text{SiLU}(x W_{\text{gate}}) \odot x W_{\text{up}}) W_{\text{down}}$) fully differentiable across all backends.
+- **Gradient Clipping**: In-place global $L_2$ norm clipping (`clip_grad_norm_`) preventing exploding gradients in deep transformer training.
+- **Cosine Annealing with Warmup**: `CosineAnnealingLR` scheduler for optimal convergence.
+
+```cpp
+#include "dummy_core.h"
+
+// 1. RMSNorm
+RMSNorm norm(768);
+auto x_norm = norm.forward(x);
+
+// 2. Rotary Position Embeddings (RoPE)
+auto [cos_t, sin_t] = precompute_freqs_cis(64, 4096);
+auto q_rot = apply_rotary_emb(q, cos_t, sin_t);
+auto k_rot = apply_rotary_emb(k, cos_t, sin_t);
+
+// 3. SwiGLU Gated Feed-Forward Block
+SwiGLU ffn(768);
+auto ffn_out = ffn.forward(x_norm);
+
+// 4. Gradient Clipping & LR Scheduler
+loss->backward();
+float total_norm = clip_grad_norm_(model.parameters(), 1.0f);
+```
+
+---
+
 ## Built by
 
 [@Keplercodes01](https://github.com/Keplercodes01)
