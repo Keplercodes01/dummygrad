@@ -195,6 +195,194 @@ inline std::shared_ptr<Tensor> gelu(const std::shared_ptr<Tensor>& a) {
     return out;
 }
 
+// --- SIGMOID BACKWARD NODE ---
+struct SigmoidBackward : public Node {
+    std::shared_ptr<Tensor> out_val;
+    explicit SigmoidBackward(std::shared_ptr<Tensor> out_val) : out_val(out_val) {}
+
+    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        std::shared_ptr<Tensor> grad = grads[0];
+        auto da = std::make_shared<Tensor>(out_val->shape, out_val->device, out_val->dtype, false);
+        da->fill_(0.0f);
+#ifdef USE_CUDA
+        if (out_val->device == Device::CUDA) {
+            cuda::sigmoid_backward(out_val->data_ptr<float>(), grad->data_ptr<float>(), da->data_ptr<float>(), out_val->size());
+            return {da};
+        }
+#endif
+        const float* g_ptr = grad->data_ptr<float>();
+        const float* o_ptr = out_val->data_ptr<float>();
+        float* da_ptr = da->data_ptr<float>();
+        int size = static_cast<int>(out_val->size());
+
+        for (int i = 0; i < size; i++) {
+            float s = o_ptr[i];
+            da_ptr[i] = s * (1.0f - s) * g_ptr[i];
+        }
+        return {da};
+    }
+};
+
+// sigmoid
+inline std::shared_ptr<Tensor> sigmoid(const std::shared_ptr<Tensor>& a) {
+    bool req_grad = a->requires_grad;
+    auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
+#ifdef USE_CUDA
+    if (a->device == Device::CUDA) {
+        cuda::sigmoid_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size());
+        if (req_grad) {
+            auto grad_fn = std::make_shared<SigmoidBackward>(out);
+            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
+#endif
+    const float* a_ptr = a->data_ptr<float>();
+    float* out_ptr = out->data_ptr<float>();
+    int size = static_cast<int>(a->size());
+
+    for (int i = 0; i < size; i++) {
+        out_ptr[i] = 1.0f / (1.0f + std::exp(-a_ptr[i]));
+    }
+
+    if (req_grad) {
+        auto grad_fn = std::make_shared<SigmoidBackward>(out);
+        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        out->grad_fn = grad_fn;
+    }
+
+    return out;
+}
+
+// --- SILU (SWISH) BACKWARD NODE ---
+struct SiluBackward : public Node {
+    std::shared_ptr<Tensor> a;
+    explicit SiluBackward(std::shared_ptr<Tensor> a) : a(a) {}
+
+    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        std::shared_ptr<Tensor> grad = grads[0];
+        auto da = std::make_shared<Tensor>(a->shape, a->device, a->dtype, false);
+        da->fill_(0.0f);
+#ifdef USE_CUDA
+        if (a->device == Device::CUDA) {
+            cuda::silu_backward(a->data_ptr<float>(), grad->data_ptr<float>(), da->data_ptr<float>(), a->size());
+            return {da};
+        }
+#endif
+        const float* g_ptr = grad->data_ptr<float>();
+        const float* a_ptr = a->data_ptr<float>();
+        float* da_ptr = da->data_ptr<float>();
+        int size = static_cast<int>(a->size());
+
+        for (int i = 0; i < size; i++) {
+            float x = a_ptr[i];
+            float s = 1.0f / (1.0f + std::exp(-x));
+            da_ptr[i] = (s * (1.0f + x * (1.0f - s))) * g_ptr[i];
+        }
+        return {da};
+    }
+};
+
+// silu (Swish)
+inline std::shared_ptr<Tensor> silu(const std::shared_ptr<Tensor>& a) {
+    bool req_grad = a->requires_grad;
+    auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
+#ifdef USE_CUDA
+    if (a->device == Device::CUDA) {
+        cuda::silu_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size());
+        if (req_grad) {
+            auto grad_fn = std::make_shared<SiluBackward>(a);
+            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
+#endif
+    const float* a_ptr = a->data_ptr<float>();
+    float* out_ptr = out->data_ptr<float>();
+    int size = static_cast<int>(a->size());
+
+    for (int i = 0; i < size; i++) {
+        float x = a_ptr[i];
+        out_ptr[i] = x / (1.0f + std::exp(-x));
+    }
+
+    if (req_grad) {
+        auto grad_fn = std::make_shared<SiluBackward>(a);
+        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        out->grad_fn = grad_fn;
+    }
+
+    return out;
+}
+
+inline std::shared_ptr<Tensor> swish(const std::shared_ptr<Tensor>& a) {
+    return silu(a);
+}
+
+// --- LEAKY RELU BACKWARD NODE ---
+struct LeakyReluBackward : public Node {
+    std::shared_ptr<Tensor> a;
+    float negative_slope;
+    LeakyReluBackward(std::shared_ptr<Tensor> a, float negative_slope)
+        : a(a), negative_slope(negative_slope) {}
+
+    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        std::shared_ptr<Tensor> grad = grads[0];
+        auto da = std::make_shared<Tensor>(a->shape, a->device, a->dtype, false);
+        da->fill_(0.0f);
+#ifdef USE_CUDA
+        if (a->device == Device::CUDA) {
+            cuda::leaky_relu_backward(a->data_ptr<float>(), grad->data_ptr<float>(), da->data_ptr<float>(), a->size(), negative_slope);
+            return {da};
+        }
+#endif
+        const float* g_ptr = grad->data_ptr<float>();
+        const float* a_ptr = a->data_ptr<float>();
+        float* da_ptr = da->data_ptr<float>();
+        int size = static_cast<int>(a->size());
+
+        for (int i = 0; i < size; i++) {
+            da_ptr[i] = (a_ptr[i] > 0.0f) ? g_ptr[i] : (negative_slope * g_ptr[i]);
+        }
+        return {da};
+    }
+};
+
+// leaky_relu
+inline std::shared_ptr<Tensor> leaky_relu(const std::shared_ptr<Tensor>& a, float negative_slope = 0.01f) {
+    bool req_grad = a->requires_grad;
+    auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
+#ifdef USE_CUDA
+    if (a->device == Device::CUDA) {
+        cuda::leaky_relu_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size(), negative_slope);
+        if (req_grad) {
+            auto grad_fn = std::make_shared<LeakyReluBackward>(a, negative_slope);
+            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
+#endif
+    const float* a_ptr = a->data_ptr<float>();
+    float* out_ptr = out->data_ptr<float>();
+    int size = static_cast<int>(a->size());
+
+    for (int i = 0; i < size; i++) {
+        float x = a_ptr[i];
+        out_ptr[i] = (x > 0.0f) ? x : (negative_slope * x);
+    }
+
+    if (req_grad) {
+        auto grad_fn = std::make_shared<LeakyReluBackward>(a, negative_slope);
+        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        out->grad_fn = grad_fn;
+    }
+
+    return out;
+}
+
 // ========================================
 // From broadcasting.h
 // ========================================

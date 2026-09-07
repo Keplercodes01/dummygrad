@@ -24,6 +24,15 @@ namespace cuda {
     void gelu_forward(const float* in, float* out, int64_t size);
     void gelu_backward(const float* in, const float* grad_out, float* grad_in, int64_t size);
 
+    void sigmoid_forward(const float* in, float* out, int64_t size);
+    void sigmoid_backward(const float* out, const float* grad_out, float* grad_in, int64_t size);
+
+    void silu_forward(const float* in, float* out, int64_t size);
+    void silu_backward(const float* in, const float* grad_out, float* grad_in, int64_t size);
+
+    void leaky_relu_forward(const float* in, float* out, int64_t size, float negative_slope);
+    void leaky_relu_backward(const float* in, const float* grad_out, float* grad_in, int64_t size, float negative_slope);
+
     // Normalizations & Masking
     void softmax_forward(const float* in, float* out, int rows, int cols);
     void softmax_backward(const float* out, const float* grad_out, float* grad_in, int rows, int cols);

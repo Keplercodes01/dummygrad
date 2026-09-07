@@ -57,6 +57,51 @@ __global__ void k_gelu_backward(const float* in, const float* grad_out, float* g
     }
 }
 
+__global__ void k_sigmoid_forward(const float* in, float* out, int64_t size) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) out[idx] = 1.0f / (1.0f + expf(-in[idx]));
+}
+
+__global__ void k_sigmoid_backward(const float* out, const float* grad_out, float* grad_in, int64_t size) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float s = out[idx];
+        grad_in[idx] = s * (1.0f - s) * grad_out[idx];
+    }
+}
+
+__global__ void k_silu_forward(const float* in, float* out, int64_t size) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = in[idx];
+        out[idx] = x / (1.0f + expf(-x));
+    }
+}
+
+__global__ void k_silu_backward(const float* in, const float* grad_out, float* grad_in, int64_t size) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = in[idx];
+        float s = 1.0f / (1.0f + expf(-x));
+        grad_in[idx] = (s * (1.0f + x * (1.0f - s))) * grad_out[idx];
+    }
+}
+
+__global__ void k_leaky_relu_forward(const float* in, float* out, int64_t size, float negative_slope) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = in[idx];
+        out[idx] = x > 0.0f ? x : negative_slope * x;
+    }
+}
+
+__global__ void k_leaky_relu_backward(const float* in, const float* grad_out, float* grad_in, int64_t size, float negative_slope) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        grad_in[idx] = in[idx] > 0.0f ? grad_out[idx] : negative_slope * grad_out[idx];
+    }
+}
+
 __global__ void k_causal_mask(const float* in, float* out, int total_rows, int seq_len) {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     int64_t total_elements = (int64_t)total_rows * seq_len;
@@ -534,6 +579,48 @@ void gelu_backward(const float* in, const float* grad_out, float* grad_in, int64
     int threads = 256;
     int blocks = (size + threads - 1) / threads;
     k_gelu_backward<<<blocks, threads>>>(in, grad_out, grad_in, size);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void sigmoid_forward(const float* in, float* out, int64_t size) {
+    int threads = 256;
+    int blocks = (size + threads - 1) / threads;
+    k_sigmoid_forward<<<blocks, threads>>>(in, out, size);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void sigmoid_backward(const float* out, const float* grad_out, float* grad_in, int64_t size) {
+    int threads = 256;
+    int blocks = (size + threads - 1) / threads;
+    k_sigmoid_backward<<<blocks, threads>>>(out, grad_out, grad_in, size);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void silu_forward(const float* in, float* out, int64_t size) {
+    int threads = 256;
+    int blocks = (size + threads - 1) / threads;
+    k_silu_forward<<<blocks, threads>>>(in, out, size);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void silu_backward(const float* in, const float* grad_out, float* grad_in, int64_t size) {
+    int threads = 256;
+    int blocks = (size + threads - 1) / threads;
+    k_silu_backward<<<blocks, threads>>>(in, grad_out, grad_in, size);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void leaky_relu_forward(const float* in, float* out, int64_t size, float negative_slope) {
+    int threads = 256;
+    int blocks = (size + threads - 1) / threads;
+    k_leaky_relu_forward<<<blocks, threads>>>(in, out, size, negative_slope);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void leaky_relu_backward(const float* in, const float* grad_out, float* grad_in, int64_t size, float negative_slope) {
+    int threads = 256;
+    int blocks = (size + threads - 1) / threads;
+    k_leaky_relu_backward<<<blocks, threads>>>(in, grad_out, grad_in, size, negative_slope);
     CUDA_CHECK(cudaGetLastError());
 }
 
