@@ -198,7 +198,8 @@ std::shared_ptr<Tensor> Tensor::to(Device target_device, int device_id) {
     } else if (this->device == Device::MPS && target_device == Device::CPU) {
         std::memcpy(out->data_ptr<void>(), this->data_ptr<void>(), this->storage->total_bytes);
     } else {
-        throw std::runtime_error("Tensor::to: Unsupported device migration");
+        // Automatically stage through host CPU memory
+        return this->to(Device::CPU)->to(target_device, device_id);
     }
 
     return out;

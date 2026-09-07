@@ -118,7 +118,37 @@ public:
     }
 };
 
-// Multi-Head Self-Attention
+// Backward Node for GQA head repetition (aggregates gradients from repeated heads to original KV heads)
+struct GQARepeatBackward : public Node {
+    std::shared_ptr<Tensor> orig;
+    int B, n_heads, n_kv_heads, S, d_k;
+
+    GQARepeatBackward(std::shared_ptr<Tensor> orig, int B, int n_heads, int n_kv_heads, int S, int d_k)
+        : orig(orig), B(B), n_heads(n_heads), n_kv_heads(n_kv_heads), S(S), d_k(d_k) {}
+
+    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        auto dout = grads[0];
+        auto din = std::make_shared<Tensor>(orig->shape, orig->device, orig->dtype, false);
+        din->fill_(0.0f);
+        int group_size = n_heads / n_kv_heads;
+        const float* dout_ptr = dout->data_ptr<float>();
+        float* din_ptr = din->data_ptr<float>();
+
+        for (int b = 0; b < B; ++b) {
+            for (int h = 0; h < n_heads; ++h) {
+                int kv_h = h / group_size;
+                int src_offset = (b * n_heads + h) * S * d_k;
+                int dst_offset = (b * n_kv_heads + kv_h) * S * d_k;
+                for (int i = 0; i < S * d_k; ++i) {
+                    din_ptr[dst_offset + i] += dout_ptr[src_offset + i];
+                }
+            }
+        }
+        return {din};
+    }
+};
+
+// Multi-Head Self-Attention (Supports MHA, GQA, and MQA)
 class MultiHeadAttention {
 public:
     Linear W_q;
@@ -127,12 +157,20 @@ public:
     Linear W_o;
     int d_model;
     int n_heads;
+    int n_kv_heads;
     int d_k;
     bool causal;
 
-    MultiHeadAttention(int d_model, int n_heads, bool causal = false)
-        : W_q(d_model, d_model), W_k(d_model, d_model), W_v(d_model, d_model), W_o(d_model, d_model),
-          d_model(d_model), n_heads(n_heads), d_k(d_model / n_heads), causal(causal) {}
+    MultiHeadAttention(int d_model, int n_heads, int n_kv_heads = 0, bool causal = false)
+        : W_q(d_model, d_model),
+          W_k(d_model, (n_kv_heads > 0 ? n_kv_heads : n_heads) * (d_model / n_heads)),
+          W_v(d_model, (n_kv_heads > 0 ? n_kv_heads : n_heads) * (d_model / n_heads)),
+          W_o(d_model, d_model),
+          d_model(d_model),
+          n_heads(n_heads),
+          n_kv_heads(n_kv_heads > 0 ? n_kv_heads : n_heads),
+          d_k(d_model / n_heads),
+          causal(causal) {}
 
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x_in,
                                     const std::shared_ptr<Tensor>& mask = nullptr,
@@ -148,13 +186,13 @@ public:
         int B = x->shape[0];
         int S = x->shape[1];
 
-        auto Q = W_q.forward(x); // [B, S, d_model]
-        auto K = W_k.forward(x);
-        auto V = W_v.forward(x);
+        auto Q = W_q.forward(x); // [B, S, n_heads * d_k]
+        auto K = W_k.forward(x); // [B, S, n_kv_heads * d_k]
+        auto V = W_v.forward(x); // [B, S, n_kv_heads * d_k]
 
-        // Reshape Q, K, V to [B, S, n_heads, d_k]
+        // Reshape Q, K, V to 4D tensors
         auto Q_4d = reshape(Q, {B, S, n_heads, d_k});
-        auto K_4d = reshape(K, {B, S, n_heads, d_k});
+        auto K_4d = reshape(K, {B, S, n_kv_heads, d_k});
 
         // Apply Rotary Position Embeddings (RoPE) if frequency tables provided
         if (cos_freqs && sin_freqs) {
@@ -162,10 +200,51 @@ public:
             K_4d = apply_rotary_emb(K_4d, cos_freqs, sin_freqs, start_pos);
         }
 
-        // Transpose to [B, n_heads, S, d_k]
+        // Transpose to [B, heads, S, d_k]
         auto Q_split = transpose(Q_4d, 1, 2);
         auto K_split = transpose(K_4d, 1, 2);
-        auto V_split = transpose(reshape(V, {B, S, n_heads, d_k}), 1, 2);
+        auto V_split = transpose(reshape(V, {B, S, n_kv_heads, d_k}), 1, 2);
+
+        // Grouped Query Attention (GQA): Repeat KV heads across query head groups
+        if (n_kv_heads < n_heads) {
+            int group_size = n_heads / n_kv_heads;
+            auto K_rep = std::make_shared<Tensor>(
+                std::vector<int64_t>{B, n_heads, S, d_k}, K_split->device, K_split->dtype, K_split->requires_grad
+            );
+            auto V_rep = std::make_shared<Tensor>(
+                std::vector<int64_t>{B, n_heads, S, d_k}, V_split->device, V_split->dtype, V_split->requires_grad
+            );
+
+            const float* k_src = K_split->data_ptr<float>();
+            const float* v_src = V_split->data_ptr<float>();
+            float* k_dst = K_rep->data_ptr<float>();
+            float* v_dst = V_rep->data_ptr<float>();
+
+            int head_elements = S * d_k;
+            for (int b = 0; b < B; ++b) {
+                for (int h = 0; h < n_heads; ++h) {
+                    int kv_h = h / group_size;
+                    int src_offset = (b * n_kv_heads + kv_h) * head_elements;
+                    int dst_offset = (b * n_heads + h) * head_elements;
+                    std::memcpy(k_dst + dst_offset, k_src + src_offset, head_elements * sizeof(float));
+                    std::memcpy(v_dst + dst_offset, v_src + src_offset, head_elements * sizeof(float));
+                }
+            }
+
+            if (K_split->requires_grad) {
+                auto grad_fn = std::make_shared<GQARepeatBackward>(K_split, B, n_heads, n_kv_heads, S, d_k);
+                grad_fn->add_next_edge(get_grad_edge(K_split).function, 0);
+                K_rep->grad_fn = grad_fn;
+            }
+            if (V_split->requires_grad) {
+                auto grad_fn = std::make_shared<GQARepeatBackward>(V_split, B, n_heads, n_kv_heads, S, d_k);
+                grad_fn->add_next_edge(get_grad_edge(V_split).function, 0);
+                V_rep->grad_fn = grad_fn;
+            }
+
+            K_split = K_rep;
+            V_split = V_rep;
+        }
 
         // Scaled dot product
         float scale = 1.0f / std::sqrt(static_cast<float>(d_k));

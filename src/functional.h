@@ -1121,6 +1121,135 @@ inline std::shared_ptr<Tensor> cross_entropy(const std::shared_ptr<Tensor>& pred
     return out;
 }
 
+// --- FUSED SPARSE CROSS-ENTROPY BACKWARD NODE ---
+struct FusedCrossEntropyBackward : public Node {
+    std::shared_ptr<Tensor> logits;
+    std::shared_ptr<Tensor> targets;
+    std::shared_ptr<Tensor> probs;
+    int N, V;
+    int valid_count;
+    int ignore_index;
+
+    FusedCrossEntropyBackward(std::shared_ptr<Tensor> logits,
+                              std::shared_ptr<Tensor> targets,
+                              std::shared_ptr<Tensor> probs,
+                              int N, int V, int valid_count, int ignore_index)
+        : logits(logits), targets(targets), probs(probs),
+          N(N), V(V), valid_count(valid_count), ignore_index(ignore_index) {}
+
+    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        auto dloss = grads[0];
+        float dloss_val = dloss->data_ptr<float>()[0];
+        auto grad_logits = std::make_shared<Tensor>(logits->shape, logits->device, logits->dtype, false);
+        grad_logits->fill_(0.0f);
+
+        const float* p_ptr = probs->data_ptr<float>();
+        const float* t_ptr = targets->data_ptr<float>();
+        float* g_ptr = grad_logits->data_ptr<float>();
+
+        float scale = (valid_count > 0) ? (dloss_val / static_cast<float>(valid_count)) : 0.0f;
+
+        for (int i = 0; i < N; ++i) {
+            int target_idx = static_cast<int>(t_ptr[i]);
+            if (target_idx == ignore_index) continue;
+
+            int offset = i * V;
+            for (int c = 0; c < V; ++c) {
+                float prob = p_ptr[offset + c];
+                float grad_c = (c == target_idx) ? (prob - 1.0f) : prob;
+                g_ptr[offset + c] = scale * grad_c;
+            }
+        }
+
+        return {grad_logits};
+    }
+};
+
+// Fused Logits Cross Entropy with Integer Class Targets and LogSumExp Stability
+// logits: [..., vocab_size] (unnormalized scores)
+// targets: [...] (integer token/class IDs, e.g. [batch, seq_len] or [N])
+// ignore_index: tokens with this target ID are ignored in loss computation (default: -100)
+inline std::shared_ptr<Tensor> fused_cross_entropy(
+    const std::shared_ptr<Tensor>& logits,
+    const std::shared_ptr<Tensor>& targets,
+    int ignore_index = -100
+) {
+    int ndim = logits->ndim();
+    int V = logits->shape[ndim - 1];
+    int N = logits->size() / V;
+
+    if (targets->size() != N) {
+        throw std::invalid_argument(
+            "fused_cross_entropy: target size (" + std::to_string(targets->size()) +
+            ") must match total logit positions (" + std::to_string(N) + ")"
+        );
+    }
+
+    const float* l_ptr = logits->data_ptr<float>();
+    const float* t_ptr = targets->data_ptr<float>();
+
+    auto probs = std::make_shared<Tensor>(std::vector<int64_t>{N, V}, logits->device, logits->dtype, false);
+    float* p_ptr = probs->data_ptr<float>();
+
+    float total_loss = 0.0f;
+    int valid_count = 0;
+
+    for (int i = 0; i < N; ++i) {
+        int target_idx = static_cast<int>(t_ptr[i]);
+        int offset = i * V;
+
+        // 1. Numerically stable row-max subtraction
+        float max_val = -1e20f;
+        for (int c = 0; c < V; ++c) {
+            float val = l_ptr[offset + c];
+            if (val > max_val) max_val = val;
+        }
+
+        // 2. Compute sum of exps
+        float sum_exp = 0.0f;
+        for (int c = 0; c < V; ++c) {
+            float exp_val = std::exp(l_ptr[offset + c] - max_val);
+            p_ptr[offset + c] = exp_val;
+            sum_exp += exp_val;
+        }
+
+        // 3. Normalize into probabilities
+        float inv_sum = 1.0f / sum_exp;
+        for (int c = 0; c < V; ++c) {
+            p_ptr[offset + c] *= inv_sum;
+        }
+
+        // 4. LogSumExp loss: (log(sum_exp) + max_val) - logits[target_idx]
+        if (target_idx != ignore_index) {
+            if (target_idx < 0 || target_idx >= V) {
+                throw std::out_of_range(
+                    "fused_cross_entropy: target index " + std::to_string(target_idx) +
+                    " is out of bounds for vocab size " + std::to_string(V)
+                );
+            }
+            float lse = std::log(sum_exp) + max_val;
+            total_loss += (lse - l_ptr[offset + target_idx]);
+            valid_count++;
+        }
+    }
+
+    float mean_loss = (valid_count > 0) ? (total_loss / static_cast<float>(valid_count)) : 0.0f;
+
+    bool req_grad = logits->requires_grad;
+    auto out = std::make_shared<Tensor>(std::vector<int64_t>{1, 1}, logits->device, logits->dtype, req_grad);
+    out->data_ptr<float>()[0] = mean_loss;
+
+    if (req_grad) {
+        auto grad_fn = std::make_shared<FusedCrossEntropyBackward>(
+            logits, targets, probs, N, V, valid_count, ignore_index
+        );
+        grad_fn->add_next_edge(get_grad_edge(logits).function, 0);
+        out->grad_fn = grad_fn;
+    }
+
+    return out;
+}
+
 // --- MSE BACKWARD NODE ---
 struct MseBackward : public Node {
     std::shared_ptr<Tensor> pred, target;

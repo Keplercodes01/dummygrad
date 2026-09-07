@@ -88,13 +88,11 @@ int main() {
             ArenaScope scope; // Activates scratchpad arena; auto-resets in 0 ns at scope exit
 
             auto logits = model.forward(input_ids, pos_ids);
-            auto loss = cross_entropy(logits, targets);
+            auto loss = fused_cross_entropy(logits, targets);
 
+            optimizer.zero_grad(model.parameters());
             loss->backward(); // Executes FlashAttention backward & fused LayerNorm backward
-
-            for (auto& param : model.parameters()) {
-                optimizer.step(param); // Fused AdamW GPU kernel
-            }
+            optimizer.step(model.parameters()); // Fused AdamW GPU / MPS kernel
         }
 
         std::cout << "Step " << step << " complete." << std::endl;
@@ -248,16 +246,18 @@ auto ffn_out = ffn.forward(x_norm);
 loss->backward();
 float total_norm = clip_grad_norm_(model.parameters(), 1.0f);
 
-// 5. Full Turnkey ModernTransformer (LLaMA / Mistral Architecture)
-//    RMSNorm + RoPE + SwiGLU + Tied Output Projection
+// 5. Full Turnkey ModernTransformer (LLaMA 3 / Mistral Architecture)
+//    RMSNorm + RoPE + Grouped Query Attention (GQA) + SwiGLU + Tied Output Projection
 ModernTransformer modern_model(
     /*vocab_size=*/32000,
     /*max_seq_len=*/4096,
     /*d_model=*/768,
     /*n_heads=*/12,
-    /*n_layers=*/12
+    /*n_layers=*/12,
+    /*n_kv_heads=*/4 // GQA: 12 Query heads share 4 KV heads
 );
 auto modern_logits = modern_model.forward(input_ids);
+auto loss = fused_cross_entropy(modern_logits, targets);
 ```
 
 ---

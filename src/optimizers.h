@@ -23,6 +23,12 @@ struct ParamState {
     int t = 0;
 };
 
+inline void zero_grad(const std::vector<std::shared_ptr<Tensor>>& params) {
+    for (const auto& p : params) {
+        if (p) p->zero_grad();
+    }
+}
+
 // Adam optimizer (supports arbitrary number of parameters with distinct shapes)
 class Adam {
 public:
@@ -53,6 +59,19 @@ public:
         }
 #endif
 
+        if (param->device == Device::MPS) {
+            auto& pstate = state[param.get()];
+            if (pstate.m.empty()) {
+                pstate.m.resize(size, 0.0f);
+                pstate.v.resize(size, 0.0f);
+            }
+            pstate.t++;
+            MetalBackend::get().adamw(param->data_ptr<float>(), param->grad->data_ptr<float>(),
+                                      pstate.m.data(), pstate.v.data(),
+                                      size, lr, b1, b2, E, weight_decay, pstate.t);
+            return;
+        }
+
         auto& pstate = state[param.get()];
         if (pstate.m.empty()) {
             pstate.m.resize(size, 0.0f);
@@ -67,6 +86,11 @@ public:
         float b2_corr = 1.0f - std::pow(b2, pstate.t);
 
         for (int i = 0; i < size; i++) {
+            // Decoupled weight decay (AdamW)
+            if (weight_decay != 0.0f) {
+                data[i] -= lr * weight_decay * data[i];
+            }
+
             float g = grad[i];
             pstate.m[i] = b1 * pstate.m[i] + (1.0f - b1) * g;
             pstate.v[i] = b2 * pstate.v[i] + (1.0f - b2) * g * g;
@@ -76,5 +100,15 @@ public:
 
             data[i] -= lr * m_hat / (std::sqrt(v_hat) + E);
         }
+    }
+
+    void step(const std::vector<std::shared_ptr<Tensor>>& params) {
+        for (const auto& p : params) {
+            step(p);
+        }
+    }
+
+    void zero_grad(const std::vector<std::shared_ptr<Tensor>>& params) {
+        ::zero_grad(params);
     }
 };

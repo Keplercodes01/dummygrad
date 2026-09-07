@@ -158,9 +158,9 @@ public:
     RMSNorm rms2;
     SwiGLU ffn;
 
-    ModernTransformerBlock(int d_model, int n_heads, int hidden_dim = 0, bool causal = true)
+    ModernTransformerBlock(int d_model, int n_heads, int n_kv_heads = 0, int hidden_dim = 0, bool causal = true)
         : rms1(d_model),
-          attn(d_model, n_heads, causal),
+          attn(d_model, n_heads, n_kv_heads, causal),
           rms2(d_model),
           ffn(d_model, hidden_dim) {}
 
@@ -210,18 +210,20 @@ public:
     int max_seq_len;
     int d_model;
     int n_heads;
+    int n_kv_heads;
     int head_dim;
 
     std::shared_ptr<Tensor> cos_freqs;
     std::shared_ptr<Tensor> sin_freqs;
 
-    ModernTransformer(int vocab_size, int max_seq_len, int d_model, int n_heads, int n_layers, int hidden_dim = 0)
+    ModernTransformer(int vocab_size, int max_seq_len, int d_model, int n_heads, int n_layers, int n_kv_heads = 0, int hidden_dim = 0)
         : token_emb(vocab_size, d_model),
           rms_f(d_model),
           vocab_size(vocab_size),
           max_seq_len(max_seq_len),
           d_model(d_model),
           n_heads(n_heads),
+          n_kv_heads(n_kv_heads > 0 ? n_kv_heads : n_heads),
           head_dim(d_model / n_heads) {
 
         // Precompute RoPE rotary frequency tables once at model construction
@@ -230,7 +232,7 @@ public:
         sin_freqs = s_t;
 
         for (int i = 0; i < n_layers; i++) {
-            blocks.push_back(std::make_shared<ModernTransformerBlock>(d_model, n_heads, hidden_dim, true));
+            blocks.push_back(std::make_shared<ModernTransformerBlock>(d_model, n_heads, n_kv_heads, hidden_dim, true));
 
             // Scale residual projections at initialization to prevent variance explosion
             float scale = 1.0f / std::sqrt(2.0f * n_layers);
