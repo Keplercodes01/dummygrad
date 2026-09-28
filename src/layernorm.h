@@ -14,7 +14,16 @@ struct FusedLayerNormBackward : public Node {
                            int r, int c, int batch_size)
         : x(x), gamma(gamma), inv_std(inv_std), mean(mean), xmu(xmu), r(r), c(c), batch_size(batch_size) {}
 
+    void release_variables() override {
+        x.reset();
+        gamma.reset();
+        inv_std.reset();
+        mean.reset();
+        xmu.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !x || !gamma || !inv_std || !mean || !xmu) return {nullptr, nullptr, nullptr};
         auto dout = grads[0];
         auto dx = std::make_shared<Tensor>(x->shape, x->device, x->dtype, false); dx->fill_(0.0f);
         auto dg = std::make_shared<Tensor>(gamma->shape, gamma->device, gamma->dtype, false); dg->fill_(0.0f);

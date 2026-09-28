@@ -71,10 +71,18 @@ std::shared_ptr<Tensor> Tensor::_reshape(const std::vector<int64_t>& new_shape) 
         return t;
     }
 }
-std::shared_ptr<Tensor> Tensor::reshape(const std::vector<int64_t>& new_shape) { return _reshape(new_shape); }
+std::shared_ptr<Tensor> Tensor::reshape(const std::vector<int64_t>& new_shape) {
+    try {
+        return ::reshape(const_cast<Tensor*>(this)->shared_from_this(), new_shape);
+    } catch (const std::bad_weak_ptr&) {
+        return _reshape(new_shape);
+    }
+}
 
 std::shared_ptr<Tensor> Tensor::_transpose(int64_t ax0, int64_t ax1) {
-    if (ax0 < 0 || ax0 >= ndim() || ax1 < 0 || ax1 >= ndim()) throw std::runtime_error("transpose: axis out of shape");
+    if (ax0 < 0) ax0 += ndim();
+    if (ax1 < 0) ax1 += ndim();
+    if (ax0 < 0 || ax0 >= ndim() || ax1 < 0 || ax1 >= ndim()) throw std::runtime_error("transpose: axis out of range");
     auto t = std::make_shared<Tensor>(shape, device, dtype, requires_grad);
     t->storage = storage;
     t->shape = shape;
@@ -84,7 +92,13 @@ std::shared_ptr<Tensor> Tensor::_transpose(int64_t ax0, int64_t ax1) {
     std::swap(t->strides[ax0], t->strides[ax1]);
     return t;
 }
-std::shared_ptr<Tensor> Tensor::transpose(int64_t ax0, int64_t ax1) { return _transpose(ax0, ax1); }
+std::shared_ptr<Tensor> Tensor::transpose(int64_t ax0, int64_t ax1) {
+    try {
+        return ::transpose(const_cast<Tensor*>(this)->shared_from_this(), ax0, ax1);
+    } catch (const std::bad_weak_ptr&) {
+        return _transpose(ax0, ax1);
+    }
+}
 
 void Tensor::_show_recursive(int64_t dim, int64_t pos, bool grad_mode) const {
     if (dim == ndim() - 1) {

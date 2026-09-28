@@ -15,10 +15,19 @@ public:
         weight = xavier({num_embeddings, embedding_dim});
     }
 
-    // Forward pass accepting 1D indices tensor
+    // Forward pass accepting 1D or multi-dimensional indices tensor
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& indices) {
         auto oh = one_hot(indices, num_embeddings);
-        return matmul(oh, weight);
+        if (oh->device != weight->device) {
+            oh = oh->to(weight->device);
+        }
+        auto out = matmul(oh, weight);
+        if (indices->ndim() > 1) {
+            std::vector<int64_t> out_shape = indices->shape;
+            out_shape.push_back(embedding_dim);
+            return reshape(out, out_shape);
+        }
+        return out;
     }
 
     std::vector<std::shared_ptr<Tensor>> parameters() const {

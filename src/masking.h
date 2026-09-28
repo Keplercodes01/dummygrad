@@ -36,6 +36,7 @@ struct SlidingWindowMaskBackward : public Node {
         : r(r), c(c), batch_size(batch_size), window_size(window_size) {}
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0]) return {nullptr};
         auto self_grad = grads[0];
         auto ga = std::make_shared<Tensor>(self_grad->shape, self_grad->device, self_grad->dtype, false);
         ga->fill_(0.0f);
@@ -138,6 +139,7 @@ struct PrefixCausalMaskBackward : public Node {
         : r(r), c(c), batch_size(batch_size), prefix_len(prefix_len) {}
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0]) return {nullptr};
         auto self_grad = grads[0];
         auto ga = std::make_shared<Tensor>(self_grad->shape, self_grad->device, self_grad->dtype, false);
         ga->fill_(0.0f);
@@ -223,7 +225,7 @@ inline std::shared_ptr<Tensor> alibi_bias(
     int n_heads, int seq_len, bool causal = true, Device device = Device::CPU
 ) {
     auto bias = std::make_shared<Tensor>(
-        std::vector<int64_t>{1, n_heads, seq_len, seq_len}, device, DType::Float32, false
+        std::vector<int64_t>{1, n_heads, seq_len, seq_len}, Device::CPU, DType::Float32, false
     );
     float* ptr = bias->data_ptr<float>();
 
@@ -259,15 +261,18 @@ inline std::shared_ptr<Tensor> alibi_bias(
         }
     }
 
+    if (device != Device::CPU) {
+        return bias->to(device);
+    }
     return bias;
 }
 
-// ----------------------------------------------------------------------------
+// -------------------------------------------------------------
 // 4. Arbitrary Key-Padding Mask
 //    Converts a binary/int mask [batch, seq_len] (1 = keep, 0 = pad)
 //    into an additive mask [batch, 1, 1, seq_len] (0.0f = keep, -1e9f = pad)
 //    Broadcasting handles [B, n_heads, seq_len, seq_len] automatically.
-// ----------------------------------------------------------------------------
+// -------------------------------------------------------------
 inline std::shared_ptr<Tensor> create_padding_mask(const std::shared_ptr<Tensor>& pad_mask) {
     if (pad_mask->shape.size() != 2) {
         throw std::invalid_argument("create_padding_mask requires pad_mask with shape [batch, seq_len]");
@@ -275,11 +280,12 @@ inline std::shared_ptr<Tensor> create_padding_mask(const std::shared_ptr<Tensor>
     int batch_size = pad_mask->shape[0];
     int seq_len = pad_mask->shape[1];
 
+    auto cpu_mask = pad_mask->cpu();
     auto out = std::make_shared<Tensor>(
-        std::vector<int64_t>{batch_size, 1, 1, seq_len}, pad_mask->device, DType::Float32, false
+        std::vector<int64_t>{batch_size, 1, 1, seq_len}, Device::CPU, DType::Float32, false
     );
 
-    const float* in_ptr = pad_mask->data_ptr<float>();
+    const float* in_ptr = cpu_mask->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
 
     for (int b = 0; b < batch_size; ++b) {
@@ -289,25 +295,29 @@ inline std::shared_ptr<Tensor> create_padding_mask(const std::shared_ptr<Tensor>
         }
     }
 
+    if (pad_mask->device != Device::CPU) {
+        return out->to(pad_mask->device);
+    }
     return out;
 }
 
-// ----------------------------------------------------------------------------
+// -------------------------------------------------------------
 // 5. Document-Packing Block-Diagonal Causal Mask
 //    For sequence packing / sample multiplexing in modern LLM pretraining (LLaMA 3).
 //    doc_ids is [batch, seq_len] or [seq_len] specifying document index for each token.
 //    Attention is allowed if and only if (doc_ids[i] == doc_ids[j] && j <= i).
-// ----------------------------------------------------------------------------
+// -------------------------------------------------------------
 inline std::shared_ptr<Tensor> document_causal_mask(const std::shared_ptr<Tensor>& doc_ids) {
     int ndim = doc_ids->ndim();
     int batch_size = (ndim == 2) ? doc_ids->shape[0] : 1;
     int seq_len = doc_ids->shape[ndim - 1];
 
+    auto cpu_ids = doc_ids->cpu();
     auto mask = std::make_shared<Tensor>(
-        std::vector<int64_t>{batch_size, 1, seq_len, seq_len}, doc_ids->device, DType::Float32, false
+        std::vector<int64_t>{batch_size, 1, seq_len, seq_len}, Device::CPU, DType::Float32, false
     );
 
-    const float* ids_ptr = doc_ids->data_ptr<float>();
+    const float* ids_ptr = cpu_ids->data_ptr<float>();
     float* mask_ptr = mask->data_ptr<float>();
 
     for (int b = 0; b < batch_size; ++b) {
@@ -325,6 +335,9 @@ inline std::shared_ptr<Tensor> document_causal_mask(const std::shared_ptr<Tensor
         }
     }
 
+    if (doc_ids->device != Device::CPU) {
+        return mask->to(doc_ids->device);
+    }
     return mask;
 }
 

@@ -73,11 +73,16 @@ void AutogradEngine::execute(std::shared_ptr<Node> root, const std::vector<int64
                 std::vector<std::shared_ptr<Tensor>> incoming;
                 {
                     std::lock_guard<std::mutex> lock(graph_mutex);
-                    incoming = node_grads[curr.get()];
+                    if (node_grads.count(curr.get())) {
+                        incoming = node_grads[curr.get()];
+                    }
                 }
                 
                 // MULTITHREADED EXECUTION: The expensive derivative math runs here!
-                std::vector<std::shared_ptr<Tensor>> outgoing = curr->apply(incoming);
+                std::vector<std::shared_ptr<Tensor>> outgoing;
+                if (!incoming.empty() && incoming[0]) {
+                    outgoing = curr->apply(incoming);
+                }
 
                 for (size_t i = 0; i < curr->next_edges.size(); ++i) {
                     const auto& edge = curr->next_edges[i];
@@ -86,18 +91,16 @@ void AutogradEngine::execute(std::shared_ptr<Node> root, const std::vector<int64
                     Node* next_node = edge.function.get();
                     std::shared_ptr<Tensor> grad_to_pass = (i < outgoing.size()) ? outgoing[i] : nullptr;
                     
-                    if (grad_to_pass) {
-                        std::lock_guard<std::mutex> lock(next_node->mutex); // PREVENT RACE CONDITION
-                        if (!node_grads.count(next_node)) {
-                            node_grads[next_node] = {grad_to_pass};
-                        } else {
-                            tensor_add_inplace(node_grads[next_node][0], grad_to_pass);
-                        }
-                    }
-
                     bool ready = false;
                     {
                         std::lock_guard<std::mutex> lock(graph_mutex);
+                        if (grad_to_pass) {
+                            if (!node_grads.count(next_node)) {
+                                node_grads[next_node] = {grad_to_pass};
+                            } else {
+                                tensor_add_inplace(node_grads[next_node][0], grad_to_pass);
+                            }
+                        }
                         in_degree[next_node]--;
                         if (in_degree[next_node] == 0) ready = true;
                     }
@@ -111,8 +114,8 @@ void AutogradEngine::execute(std::shared_ptr<Node> root, const std::vector<int64
                     curr->release_variables();
                 }
 
-                nodes_pending--;
-                if (nodes_pending == 0) {
+                if (--nodes_pending == 0) {
+                    std::lock_guard<std::mutex> lk(done_mutex);
                     done_cv.notify_all();
                 }
             });

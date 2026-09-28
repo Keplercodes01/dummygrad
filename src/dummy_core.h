@@ -14,3 +14,5 @@
 #include "serialization.h"
 #include "modern_layers.h"
 #include "masking.h"
+#include "transformer.h"
+#include "mars.h"

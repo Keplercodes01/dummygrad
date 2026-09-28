@@ -11,7 +11,16 @@ struct ScaleAndShiftBackward : public Node {
                           int r, int c, int batch_size, int ndim, int nout)
         : x(x), g(g), be(be), r(r), c(c), batch_size(batch_size), ndim(ndim), nout(nout) {}
 
+    void release_variables() override {
+        x.reset();
+        g.reset();
+        be.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0]) return {nullptr, nullptr, nullptr};
+        if (!x || !g || !be) return {nullptr, nullptr, nullptr};
+
         std::shared_ptr<Tensor> self_grad = grads[0];
         auto gx = std::make_shared<Tensor>(x->shape, false);
         gx->fill_(0.0f);
@@ -28,6 +37,9 @@ struct ScaleAndShiftBackward : public Node {
         float* gg_ptr = gg->data_ptr();
         float* gbe_ptr = gbe->data_ptr();
 
+        bool g_is_1d = (g->size() == c);
+        bool be_is_1d = (be->size() == c);
+
         for (int batch = 0; batch < batch_size; batch++) {
             std::vector<int64_t> batch_idx = unravel(batch, std::vector<int64_t>(x->shape.begin(), x->shape.end() - 2));
 
@@ -42,12 +54,13 @@ struct ScaleAndShiftBackward : public Node {
                 for (int j = 0; j < c; j++) {
                     int flat_x   = batch_off_x   + x->strides[ndim - 2] * i + x->strides[ndim - 1] * j;
                     int flat_out = batch_off_out  + self_grad->strides[nout - 2] * i + self_grad->strides[nout - 1] * j;
-                    int gb_idx   = j;
+                    int g_idx    = g_is_1d ? j : (i * c + j);
+                    int be_idx   = be_is_1d ? j : (i * c + j);
 
                     float dout = sg_ptr[flat_out];
-                    gx_ptr[flat_x]  += g_ptr[gb_idx] * dout;
-                    gg_ptr[gb_idx]  += x_ptr[flat_x] * dout;
-                    gbe_ptr[gb_idx] += dout;
+                    gx_ptr[flat_x]  += g_ptr[g_idx] * dout;
+                    gg_ptr[g_idx]   += x_ptr[flat_x] * dout;
+                    gbe_ptr[be_idx] += dout;
                 }
             }
         }
@@ -77,6 +90,9 @@ inline std::shared_ptr<Tensor> scale_n_shift(const std::shared_ptr<Tensor>& x,
     const float* be_ptr = be->data_ptr();
     float* out_ptr = out->data_ptr();
 
+    bool g_is_1d = (g->size() == c);
+    bool be_is_1d = (be->size() == c);
+
     for (int batch = 0; batch < batch_size; batch++) {
         std::vector<int64_t> batch_idx = unravel(batch, std::vector<int64_t>(x->shape.begin(), x->shape.end() - 2));
 
@@ -91,9 +107,10 @@ inline std::shared_ptr<Tensor> scale_n_shift(const std::shared_ptr<Tensor>& x,
             for (int j = 0; j < c; j++) {
                 int flat_x   = batch_off_x   + x->strides[ndim - 2] * i   + x->strides[ndim - 1] * j;
                 int flat_out = batch_off_out  + out->strides[nout - 2] * i + out->strides[nout - 1] * j;
-                int gb_idx   = i * c + j;
+                int g_idx    = g_is_1d ? j : (i * c + j);
+                int be_idx   = be_is_1d ? j : (i * c + j);
 
-                out_ptr[flat_out] = x_ptr[flat_x] * g_ptr[gb_idx] + be_ptr[gb_idx];
+                out_ptr[flat_out] = x_ptr[flat_x] * g_ptr[g_idx] + be_ptr[be_idx];
             }
         }
     }

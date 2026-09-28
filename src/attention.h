@@ -24,6 +24,7 @@ struct FlashAttentionBackward : public Node {
     }
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !q || !k || !v || !out) return {nullptr, nullptr, nullptr};
         auto grad_out = grads[0];
         auto gq = std::make_shared<Tensor>(q->shape, q->device, q->dtype, false);
         auto gk = std::make_shared<Tensor>(k->shape, k->device, k->dtype, false);
@@ -126,13 +127,40 @@ struct GQARepeatBackward : public Node {
     GQARepeatBackward(std::shared_ptr<Tensor> orig, int B, int n_heads, int n_kv_heads, int S, int d_k)
         : orig(orig), B(B), n_heads(n_heads), n_kv_heads(n_kv_heads), S(S), d_k(d_k) {}
 
+    void release_variables() override {
+        orig.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !orig) return {nullptr};
         auto dout = grads[0];
         auto din = std::make_shared<Tensor>(orig->shape, orig->device, orig->dtype, false);
         din->fill_(0.0f);
         int group_size = n_heads / n_kv_heads;
         const float* dout_ptr = dout->data_ptr<float>();
         float* din_ptr = din->data_ptr<float>();
+
+#ifdef USE_CUDA
+        if (orig->device == Device::CUDA) {
+            int dout_size = B * n_heads * S * d_k;
+            int din_size = B * n_kv_heads * S * d_k;
+            std::vector<float> h_dout(dout_size);
+            std::vector<float> h_din(din_size, 0.0f);
+            cudaMemcpy(h_dout.data(), dout_ptr, dout_size * sizeof(float), cudaMemcpyDeviceToHost);
+            for (int b = 0; b < B; ++b) {
+                for (int h = 0; h < n_heads; ++h) {
+                    int kv_h = h / group_size;
+                    int src_offset = (b * n_heads + h) * S * d_k;
+                    int dst_offset = (b * n_kv_heads + kv_h) * S * d_k;
+                    for (int i = 0; i < S * d_k; ++i) {
+                        h_din[dst_offset + i] += h_dout[src_offset + i];
+                    }
+                }
+            }
+            cudaMemcpy(din_ptr, h_din.data(), din_size * sizeof(float), cudaMemcpyHostToDevice);
+            return {din};
+        }
+#endif
 
         for (int b = 0; b < B; ++b) {
             for (int h = 0; h < n_heads; ++h) {
@@ -226,8 +254,16 @@ public:
                     int kv_h = h / group_size;
                     int src_offset = (b * n_kv_heads + kv_h) * head_elements;
                     int dst_offset = (b * n_heads + h) * head_elements;
-                    std::memcpy(k_dst + dst_offset, k_src + src_offset, head_elements * sizeof(float));
-                    std::memcpy(v_dst + dst_offset, v_src + src_offset, head_elements * sizeof(float));
+#ifdef USE_CUDA
+                    if (K_split->device == Device::CUDA) {
+                        cudaMemcpy(k_dst + dst_offset, k_src + src_offset, head_elements * sizeof(float), cudaMemcpyDeviceToDevice);
+                        cudaMemcpy(v_dst + dst_offset, v_src + src_offset, head_elements * sizeof(float), cudaMemcpyDeviceToDevice);
+                    } else
+#endif
+                    {
+                        std::memcpy(k_dst + dst_offset, k_src + src_offset, head_elements * sizeof(float));
+                        std::memcpy(v_dst + dst_offset, v_src + src_offset, head_elements * sizeof(float));
+                    }
                 }
             }
 

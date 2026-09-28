@@ -124,7 +124,11 @@ void free_memory(Device device, void* ptr, size_t bytes) {
         }
         CUDACachingAllocator::get().free(ptr, bytes);
     } else if (device == Device::MPS) {
-        MetalBackend::get().free_buffer(ptr, bytes);
+        if (!MetalBackend::get().is_available()) {
+            CPUCachingAllocator::get().free(ptr, bytes);
+        } else {
+            MetalBackend::get().free_buffer(ptr, bytes);
+        }
     }
 }
 

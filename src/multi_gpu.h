@@ -80,26 +80,35 @@ public:
 // Ring AllReduce via Direct NVLink / PCIe Peer-to-Peer DMA
 // Synchronizes gradients across all GPUs with zero socket overhead.
 // -------------------------------------------------------------
-inline void all_reduce_gradients_p2p(const std::vector<std::shared_ptr<Tensor>>& params, int rank, int world_size) {
+inline void all_reduce_gradients_p2p(
+    const std::vector<std::shared_ptr<Tensor>>& params,
+    const std::vector<std::shared_ptr<Tensor>>& root_params,
+    int rank, int world_size
+) {
     if (world_size <= 1) return;
 
     auto& mesh = DeviceMesh::get();
-    float scale = 1.0f / world_size;
 
-    // Rank 0 coordinates reduction across peer buffers
-    for (auto& p : params) {
-        if (!p || !p->grad) continue;
+    for (size_t i = 0; i < params.size() && i < root_params.size(); ++i) {
+        auto& p = params[i];
+        auto& root_p = root_params[i];
+        if (!p || !p->grad || !root_p || !root_p->grad) continue;
         int64_t size = p->grad->size();
         float* grad_ptr = p->grad->data_ptr<float>();
+        float* root_grad_ptr = root_p->grad->data_ptr<float>();
 
         // If direct P2P is enabled between GPUs
         if (mesh.p2p_matrix[0][rank] && rank != 0) {
             // Asynchronously transfer gradients to Rank 0 over NVLink / PCIe
-            CUDA_CHECK(cudaMemcpyPeerAsync(grad_ptr, 0, grad_ptr, rank, size * sizeof(float), mesh.streams[rank]));
+            CUDA_CHECK(cudaMemcpyPeerAsync(root_grad_ptr, 0, grad_ptr, rank, size * sizeof(float), mesh.streams[rank]));
         }
     }
 
     CUDA_CHECK(cudaStreamSynchronize(mesh.streams[rank]));
+}
+
+inline void all_reduce_gradients_p2p(const std::vector<std::shared_ptr<Tensor>>& params, int rank, int world_size) {
+    all_reduce_gradients_p2p(params, params, rank, world_size);
 }
 
 // -------------------------------------------------------------
@@ -158,7 +167,7 @@ public:
             workers.emplace_back([this, rank, &step_fn]() {
                 CUDA_CHECK(cudaSetDevice(rank));
                 step_fn(rank, *replicas[rank]);
-                all_reduce_gradients_p2p(replica_params[rank], rank, world_size);
+                all_reduce_gradients_p2p(replica_params[rank], replica_params[0], rank, world_size);
             });
         }
 

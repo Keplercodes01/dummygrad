@@ -3,7 +3,7 @@
 #include "functional.h"
 #include <random>
 
-inline std::mt19937 g_gen(std::random_device{}());
+inline thread_local std::mt19937 g_gen(std::random_device{}());
 
 inline void manual_seed(unsigned int seed) {
     g_gen.seed(seed);
@@ -70,16 +70,13 @@ inline std::shared_ptr<Tensor> one_hot(const std::shared_ptr<Tensor>& indices, i
 // ones
 inline std::shared_ptr<Tensor> ones(std::vector<int64_t> shape) {
     auto out = std::make_shared<Tensor>(shape, false);
-        out->fill_(0.0f);
-    float* ptr = out->data_ptr<float>();
-    int size = out->size();
-    for (int i = 0; i < size; i++) {
-        ptr[i] = 1.0f;
-    }
+    out->fill_(1.0f);
     return out;
 }
 
 // zeros
 inline std::shared_ptr<Tensor> zeros(std::vector<int64_t> shape) {
-    return std::make_shared<Tensor>(shape, false);
+    auto out = std::make_shared<Tensor>(shape, false);
+    out->fill_(0.0f);
+    return out;
 }

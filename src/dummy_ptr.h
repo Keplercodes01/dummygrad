@@ -56,6 +56,28 @@ public:
     dummy_ptr(const dummy_ptr& other) noexcept : _ptr(other._ptr) {
         retain_if_valid();
     }
+    //copy assignment
+    dummy_ptr& operator=(const dummy_ptr& other) noexcept {
+        if (this != &other) {
+            release_if_valid();
+            _ptr = other._ptr;
+            retain_if_valid();
+        }
+        return *this;
+    }
+    //move constructor
+    dummy_ptr(dummy_ptr&& other) noexcept : _ptr(other._ptr) {
+        other._ptr = nullptr;
+    }
+    //move assignment
+    dummy_ptr& operator=(dummy_ptr&& other) noexcept {
+        if (this != &other) {
+            release_if_valid();
+            _ptr = other._ptr;
+            other._ptr = nullptr;
+        }
+        return *this;
+    }
 
     //overloading
     T* get() const noexcept { return _ptr; }

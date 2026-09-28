@@ -7,6 +7,8 @@
 #include <memory>
 #include <iostream>
 
+#include <type_traits>
+
 class Tensor : public std::enable_shared_from_this<Tensor> {
 public:
     std::shared_ptr<Storage> storage;
@@ -27,8 +29,23 @@ public:
         : Tensor(s, Device::CPU, DType::Float32, req_grad) {}
 
 
-    template<typename T> T* data_ptr() { return static_cast<T*>(storage->data) + global_offset; }
-    template<typename T> const T* data_ptr() const { return static_cast<const T*>(storage->data) + global_offset; }
+    template<typename T = float>
+    T* data_ptr() {
+        if constexpr (std::is_void_v<T>) {
+            return static_cast<char*>(storage->data) + global_offset * dtype_size(dtype);
+        } else {
+            return static_cast<T*>(storage->data) + global_offset;
+        }
+    }
+
+    template<typename T = float>
+    const T* data_ptr() const {
+        if constexpr (std::is_void_v<T>) {
+            return static_cast<const char*>(storage->data) + global_offset * dtype_size(dtype);
+        } else {
+            return static_cast<const T*>(storage->data) + global_offset;
+        }
+    }
     template<typename T> T data_at(int64_t i) const { return data_ptr<T>()[i]; }
     template<typename T> T grad_at(int64_t i) const { return grad ? grad->data_ptr<T>()[i] : static_cast<T>(0); }
 

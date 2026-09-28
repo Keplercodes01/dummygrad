@@ -21,7 +21,10 @@ namespace cuda {
 namespace ops {
     void fill(Tensor& tensor, float value) {
         switch (tensor.device) {
-            case Device::CPU: cpu::fill(tensor, value); break;
+            case Device::CPU:
+            case Device::MPS:
+            case Device::TPU:
+                cpu::fill(tensor, value); break;
 #ifdef USE_CUDA
             case Device::CUDA: cuda::fill(tensor, value); break;
 #endif
@@ -32,7 +35,10 @@ namespace ops {
     void add_inplace(Tensor& dst, const Tensor& src) {
         if (dst.device != src.device) throw std::runtime_error("ops::add_inplace: Device mismatch");
         switch (dst.device) {
-            case Device::CPU: cpu::add_inplace(dst, src); break;
+            case Device::CPU:
+            case Device::MPS:
+            case Device::TPU:
+                cpu::add_inplace(dst, src); break;
 #ifdef USE_CUDA
             case Device::CUDA: cuda::add_inplace(dst, src); break;
 #endif
@@ -42,7 +48,10 @@ namespace ops {
 
     void copy_from_vector(Tensor& tensor, const std::vector<float>& values) {
         switch (tensor.device) {
-            case Device::CPU: cpu::copy_from_vector(tensor, values); break;
+            case Device::CPU:
+            case Device::MPS:
+            case Device::TPU:
+                cpu::copy_from_vector(tensor, values); break;
 #ifdef USE_CUDA
             case Device::CUDA: cuda::copy_from_vector(tensor, values); break;
 #endif
@@ -53,7 +62,10 @@ namespace ops {
     void make_contiguous(Tensor& dst, const Tensor& src) {
         if (dst.device != src.device) throw std::runtime_error("ops::make_contiguous: Device mismatch");
         switch (dst.device) {
-            case Device::CPU: cpu::make_contiguous(dst, src); break;
+            case Device::CPU:
+            case Device::MPS:
+            case Device::TPU:
+                cpu::make_contiguous(dst, src); break;
 #ifdef USE_CUDA
             case Device::CUDA: cuda::make_contiguous(dst, src); break;
 #endif

@@ -106,7 +106,7 @@ inline void save_safetensors(
 
     for (const auto& item : ordered_tensors) {
         auto host_tensor = item.tensor->cpu();
-        out.write(reinterpret_cast<const char*>(host_tensor->data_ptr<void>()), item.tensor->storage->total_bytes);
+        out.write(host_tensor->data_ptr<char>(), item.tensor->storage->total_bytes);
     }
 
     out.close();
@@ -239,7 +239,7 @@ inline std::unordered_map<std::string, std::shared_ptr<Tensor>> load_safetensors
         auto tensor = std::make_shared<Tensor>(entry.shape, Device::CPU, entry.dtype, false);
         const uint8_t* src = payload_base + entry.offset_start;
         size_t bytes = entry.offset_end - entry.offset_start;
-        std::memcpy(tensor->data_ptr<void>(), src, bytes);
+        std::memcpy(tensor->data_ptr<char>(), src, bytes);
 
         if (device != Device::CPU) {
             result[entry.name] = tensor->to(device);
@@ -269,7 +269,7 @@ inline std::unordered_map<std::string, std::shared_ptr<Tensor>> load_safetensors
         auto tensor = std::make_shared<Tensor>(entry.shape, Device::CPU, entry.dtype, false);
         in.seekg(payload_base + entry.offset_start);
         size_t bytes = entry.offset_end - entry.offset_start;
-        in.read(reinterpret_cast<char*>(tensor->data_ptr<void>()), bytes);
+        in.read(tensor->data_ptr<char>(), bytes);
 
         if (device != Device::CPU) {
             result[entry.name] = tensor->to(device);
@@ -321,7 +321,7 @@ inline void save_checkpoint(
         }
 
         auto cpu_tensor = tensor->cpu();
-        out.write(reinterpret_cast<const char*>(cpu_tensor->data_ptr<void>()), tensor->storage->total_bytes);
+        out.write(cpu_tensor->data_ptr<char>(), tensor->storage->total_bytes);
     }
     out.close();
 }
@@ -363,7 +363,7 @@ inline std::unordered_map<std::string, std::shared_ptr<Tensor>> load_checkpoint(
         }
 
         auto tensor = std::make_shared<Tensor>(shape, Device::CPU, dt, false);
-        in.read(reinterpret_cast<char*>(tensor->data_ptr<void>()), tensor->storage->total_bytes);
+        in.read(tensor->data_ptr<char>(), tensor->storage->total_bytes);
 
         if (device != Device::CPU) {
             state_dict[name] = tensor->to(device);

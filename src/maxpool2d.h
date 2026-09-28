@@ -14,6 +14,7 @@ struct MaxPool2dBackward : public Node {
     void release_variables() override { x = nullptr; indices = nullptr; }
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !x || !indices) return {nullptr};
         auto grad_out = grads[0];
         auto grad_x = std::make_shared<Tensor>(x->shape, x->device, x->dtype, false);
         grad_x->fill_(0.0f);

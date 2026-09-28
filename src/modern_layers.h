@@ -23,7 +23,14 @@ struct RMSNormBackward : public Node {
                     std::shared_ptr<Tensor> inv_rms, int r, int c, int batch_size)
         : x(x), gamma(gamma), inv_rms(inv_rms), r(r), c(c), batch_size(batch_size) {}
 
+    void release_variables() override {
+        x.reset();
+        gamma.reset();
+        inv_rms.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !x || !gamma || !inv_rms) return {nullptr, nullptr};
         auto dout = grads[0];
         auto dx = std::make_shared<Tensor>(x->shape, x->device, x->dtype, false); dx->fill_(0.0f);
         auto dg = std::make_shared<Tensor>(gamma->shape, gamma->device, gamma->dtype, false); dg->fill_(0.0f);
@@ -167,7 +174,14 @@ struct RoPEBackward : public Node {
         : x(x), cos_freqs(cos_freqs), sin_freqs(sin_freqs), start_pos(start_pos),
           batch_size(batch_size), seq_len(seq_len), n_heads(n_heads), head_dim(head_dim) {}
 
+    void release_variables() override {
+        x.reset();
+        cos_freqs.reset();
+        sin_freqs.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !x || !cos_freqs || !sin_freqs) return {nullptr};
         auto dout = grads[0];
         auto dx = std::make_shared<Tensor>(x->shape, x->device, x->dtype, false);
 
@@ -321,6 +335,15 @@ inline float clip_grad_norm_(
     float total_norm_sq = 0.0f;
     for (const auto& p : parameters) {
         if (p && p->grad) {
+#ifdef USE_CUDA
+            if (p->grad->device == Device::CUDA) {
+                int n = p->grad->size();
+                std::vector<float> h_g(n);
+                cudaMemcpy(h_g.data(), p->grad->data_ptr<float>(), n * sizeof(float), cudaMemcpyDeviceToHost);
+                for (int i = 0; i < n; i++) total_norm_sq += h_g[i] * h_g[i];
+                continue;
+            }
+#endif
             const float* g = p->grad->data_ptr<float>();
             int n = p->grad->size();
             for (int i = 0; i < n; i++) {
@@ -336,6 +359,16 @@ inline float clip_grad_norm_(
         float scale = max_norm / (total_norm + 1e-6f);
         for (const auto& p : parameters) {
             if (p && p->grad) {
+#ifdef USE_CUDA
+                if (p->grad->device == Device::CUDA) {
+                    int n = p->grad->size();
+                    std::vector<float> h_g(n);
+                    cudaMemcpy(h_g.data(), p->grad->data_ptr<float>(), n * sizeof(float), cudaMemcpyDeviceToHost);
+                    for (int i = 0; i < n; i++) h_g[i] *= scale;
+                    cudaMemcpy(p->grad->data_ptr<float>(), h_g.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+                    continue;
+                }
+#endif
                 float* g = p->grad->data_ptr<float>();
                 int n = p->grad->size();
                 for (int i = 0; i < n; i++) {

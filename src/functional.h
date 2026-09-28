@@ -26,7 +26,12 @@ struct ReluBackward : public Node {
     std::shared_ptr<Tensor> a;
     explicit ReluBackward(std::shared_ptr<Tensor> a) : a(a) {}
 
+    void release_variables() override {
+        a.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !a) return {nullptr};
         std::shared_ptr<Tensor> grad = grads[0];
         auto da = std::make_shared<Tensor>(a->shape, a->device, a->dtype, false);
         da->fill_(0.0f);
@@ -85,7 +90,12 @@ struct TanhBackward : public Node {
     std::shared_ptr<Tensor> out_val;
     explicit TanhBackward(std::shared_ptr<Tensor> out_val) : out_val(out_val) {}
 
+    void release_variables() override {
+        out_val.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !out_val) return {nullptr};
         std::shared_ptr<Tensor> grad = grads[0];
         auto da = std::make_shared<Tensor>(out_val->shape, out_val->device, out_val->dtype, false);
         da->fill_(0.0f);
@@ -131,7 +141,12 @@ struct GeluBackward : public Node {
     GeluBackward(std::shared_ptr<Tensor> a, float sqrt_2_over_pi, float coeff)
         : a(a), sqrt_2_over_pi(sqrt_2_over_pi), coeff(coeff) {}
 
+    void release_variables() override {
+        a.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !a) return {nullptr};
         std::shared_ptr<Tensor> grad = grads[0];
         auto da = std::make_shared<Tensor>(a->shape, a->device, a->dtype, false);
         da->fill_(0.0f);
@@ -202,7 +217,12 @@ struct SigmoidBackward : public Node {
     std::shared_ptr<Tensor> out_val;
     explicit SigmoidBackward(std::shared_ptr<Tensor> out_val) : out_val(out_val) {}
 
+    void release_variables() override {
+        out_val.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !out_val) return {nullptr};
         std::shared_ptr<Tensor> grad = grads[0];
         auto da = std::make_shared<Tensor>(out_val->shape, out_val->device, out_val->dtype, false);
         da->fill_(0.0f);
@@ -284,7 +304,12 @@ struct SiluBackward : public Node {
     std::shared_ptr<Tensor> a;
     explicit SiluBackward(std::shared_ptr<Tensor> a) : a(a) {}
 
+    void release_variables() override {
+        a.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !a) return {nullptr};
         std::shared_ptr<Tensor> grad = grads[0];
         auto da = std::make_shared<Tensor>(a->shape, a->device, a->dtype, false);
         da->fill_(0.0f);
@@ -374,7 +399,12 @@ struct LeakyReluBackward : public Node {
     LeakyReluBackward(std::shared_ptr<Tensor> a, float negative_slope)
         : a(a), negative_slope(negative_slope) {}
 
+    void release_variables() override {
+        a.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !a) return {nullptr};
         std::shared_ptr<Tensor> grad = grads[0];
         auto da = std::make_shared<Tensor>(a->shape, a->device, a->dtype, false);
         da->fill_(0.0f);
@@ -463,8 +493,9 @@ struct BroadcastBackward : public Node {
         : in_shape(in_shape), axis(axis), n(n), r(r), c(c), batch_size(batch_size) {}
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0]) return {nullptr};
         std::shared_ptr<Tensor> self_grad = grads[0];
-        auto grad_a = std::make_shared<Tensor>(in_shape, false);
+        auto grad_a = std::make_shared<Tensor>(in_shape, self_grad->device, self_grad->dtype, false);
         grad_a->fill_(0.0f);
         const float* sg_ptr = self_grad->data_ptr<float>();
         float* ga_ptr = grad_a->data_ptr<float>();
@@ -506,7 +537,7 @@ inline std::shared_ptr<Tensor> broadcast(const std::shared_ptr<Tensor>& a, int a
     axis == 0 ? out_shape[ndim - 2] = n : out_shape[ndim - 1] = n;
 
     bool req_grad = a->requires_grad;
-    auto out = std::make_shared<Tensor>(out_shape, req_grad);
+    auto out = std::make_shared<Tensor>(out_shape, a->device, a->dtype, req_grad);
     const float* a_ptr = a->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
 
@@ -711,10 +742,11 @@ struct CastSubBackward : public Node {
         : x_shape(x_shape), y_shape(y_shape), r(r), c(c), batch_size(batch_size) {}
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0]) return {nullptr, nullptr};
         std::shared_ptr<Tensor> self_grad = grads[0];
-        auto gx = std::make_shared<Tensor>(x_shape, false);
+        auto gx = std::make_shared<Tensor>(x_shape, self_grad->device, self_grad->dtype, false);
         gx->fill_(0.0f);
-        auto gy = std::make_shared<Tensor>(y_shape, false);
+        auto gy = std::make_shared<Tensor>(y_shape, self_grad->device, self_grad->dtype, false);
         gy->fill_(0.0f);
 
         const float* sg_ptr = self_grad->data_ptr<float>();
@@ -755,7 +787,7 @@ inline std::shared_ptr<Tensor> cast_n_sub(const std::shared_ptr<Tensor>& x,
     int yc = y->shape.size() > 0 ? y->shape[y->shape.size() - 1] : 1;
 
     bool req_grad = x->requires_grad || y->requires_grad;
-    auto out = std::make_shared<Tensor>(x->shape, req_grad);
+    auto out = std::make_shared<Tensor>(x->shape, x->device, x->dtype, req_grad);
     const float* x_ptr = x->data_ptr<float>();
     const float* y_ptr = y->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
@@ -790,11 +822,17 @@ struct CastMulBackward : public Node {
     CastMulBackward(std::shared_ptr<Tensor> x, std::shared_ptr<Tensor> y, int r, int c, int batch_size)
         : x(x), y(y), r(r), c(c), batch_size(batch_size) {}
 
+    void release_variables() override {
+        x.reset();
+        y.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !x || !y) return {nullptr, nullptr};
         std::shared_ptr<Tensor> self_grad = grads[0];
-        auto gx = std::make_shared<Tensor>(x->shape, false);
+        auto gx = std::make_shared<Tensor>(x->shape, x->device, x->dtype, false);
         gx->fill_(0.0f);
-        auto gy = std::make_shared<Tensor>(y->shape, false);
+        auto gy = std::make_shared<Tensor>(y->shape, y->device, y->dtype, false);
         gy->fill_(0.0f);
 
         const float* sg_ptr = self_grad->data_ptr<float>();
@@ -837,7 +875,7 @@ inline std::shared_ptr<Tensor> cast_n_mul(const std::shared_ptr<Tensor>& x,
     int yc = y->shape.size() > 0 ? y->shape[y->shape.size() - 1] : 1;
 
     bool req_grad = x->requires_grad || y->requires_grad;
-    auto out = std::make_shared<Tensor>(x->shape, req_grad);
+    auto out = std::make_shared<Tensor>(x->shape, x->device, x->dtype, req_grad);
     const float* x_ptr = x->data_ptr<float>();
     const float* y_ptr = y->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
@@ -872,11 +910,17 @@ struct CastDivBackward : public Node {
     CastDivBackward(std::shared_ptr<Tensor> x, std::shared_ptr<Tensor> y, int r, int c, int batch_size)
         : x(x), y(y), r(r), c(c), batch_size(batch_size) {}
 
+    void release_variables() override {
+        x.reset();
+        y.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !x || !y) return {nullptr, nullptr};
         std::shared_ptr<Tensor> self_grad = grads[0];
-        auto gx = std::make_shared<Tensor>(x->shape, false);
+        auto gx = std::make_shared<Tensor>(x->shape, x->device, x->dtype, false);
         gx->fill_(0.0f);
-        auto gy = std::make_shared<Tensor>(y->shape, false);
+        auto gy = std::make_shared<Tensor>(y->shape, y->device, y->dtype, false);
         gy->fill_(0.0f);
 
         const float* sg_ptr = self_grad->data_ptr<float>();
@@ -920,7 +964,7 @@ inline std::shared_ptr<Tensor> cast_n_div(const std::shared_ptr<Tensor>& x,
     int yc = y->shape.size() > 0 ? y->shape[y->shape.size() - 1] : 1;
 
     bool req_grad = x->requires_grad || y->requires_grad;
-    auto out = std::make_shared<Tensor>(x->shape, req_grad);
+    auto out = std::make_shared<Tensor>(x->shape, x->device, x->dtype, req_grad);
     const float* x_ptr = x->data_ptr<float>();
     const float* y_ptr = y->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
@@ -963,10 +1007,11 @@ struct ConcatBackward : public Node {
           r_out(r_out), c_out(c_out), batch_size(batch_size) {}
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0]) return {nullptr, nullptr};
         std::shared_ptr<Tensor> self_grad = grads[0];
-        auto ga = std::make_shared<Tensor>(a_shape, false);
+        auto ga = std::make_shared<Tensor>(a_shape, self_grad->device, self_grad->dtype, false);
         ga->fill_(0.0f);
-        auto gb = std::make_shared<Tensor>(b_shape, false);
+        auto gb = std::make_shared<Tensor>(b_shape, self_grad->device, self_grad->dtype, false);
         gb->fill_(0.0f);
 
         const float* sg_ptr = self_grad->data_ptr<float>();
@@ -1019,7 +1064,7 @@ inline std::shared_ptr<Tensor> concat(const std::shared_ptr<Tensor>& a,
     axis == 0 ? out_shape[ndim - 2] = r_a + r_b : out_shape[ndim - 1] = c_a + c_b;
 
     bool req_grad = a->requires_grad || b->requires_grad;
-    auto out = std::make_shared<Tensor>(out_shape, req_grad);
+    auto out = std::make_shared<Tensor>(out_shape, a->device, a->dtype, req_grad);
     int r_out = out_shape[ndim - 2];
     int c_out = out_shape[ndim - 1];
 
@@ -1077,9 +1122,15 @@ struct CrossEntropyBackward : public Node {
     CrossEntropyBackward(std::shared_ptr<Tensor> pred, std::shared_ptr<Tensor> target, int n)
         : pred(pred), target(target), n(n) {}
 
+    void release_variables() override {
+        pred.reset();
+        target.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !pred || !target) return {nullptr};
         std::shared_ptr<Tensor> self_grad = grads[0];
-        auto grad_pred = std::make_shared<Tensor>(pred->shape, false);
+        auto grad_pred = std::make_shared<Tensor>(pred->shape, pred->device, pred->dtype, false);
         grad_pred->fill_(0.0f);
         const float* p_ptr = pred->data_ptr<float>();
         const float* t_ptr = target->data_ptr<float>();
@@ -1087,7 +1138,7 @@ struct CrossEntropyBackward : public Node {
         float g_val = self_grad->data_ptr<float>()[0];
 
         for (int i = 0; i < n; i++) {
-            gp_ptr[i] = -(t_ptr[i] / (p_ptr[i] * n)) * g_val;
+            gp_ptr[i] = -(t_ptr[i] / ((p_ptr[i] + 1e-8f) * n)) * g_val;
         }
         return {grad_pred};
     }
@@ -1109,7 +1160,7 @@ inline std::shared_ptr<Tensor> cross_entropy(const std::shared_ptr<Tensor>& pred
     }
 
     bool req_grad = pred->requires_grad;
-    auto out = std::make_shared<Tensor>(std::vector<int64_t>{1, 1}, req_grad);
+    auto out = std::make_shared<Tensor>(std::vector<int64_t>{1, 1}, pred->device, pred->dtype, req_grad);
     out->data_ptr<float>()[0] = sum_loss / n;
 
     if (req_grad) {
@@ -1137,7 +1188,14 @@ struct FusedCrossEntropyBackward : public Node {
         : logits(logits), targets(targets), probs(probs),
           N(N), V(V), valid_count(valid_count), ignore_index(ignore_index) {}
 
+    void release_variables() override {
+        logits.reset();
+        targets.reset();
+        probs.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !logits || !targets || !probs) return {nullptr};
         auto dloss = grads[0];
         float dloss_val = dloss->data_ptr<float>()[0];
         auto grad_logits = std::make_shared<Tensor>(logits->shape, logits->device, logits->dtype, false);
@@ -1257,7 +1315,13 @@ struct MseBackward : public Node {
     MseBackward(std::shared_ptr<Tensor> pred, std::shared_ptr<Tensor> target, int n)
         : pred(pred), target(target), n(n) {}
 
+    void release_variables() override {
+        pred.reset();
+        target.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !pred || !target) return {nullptr};
         std::shared_ptr<Tensor> self_grad = grads[0];
         auto grad_pred = std::make_shared<Tensor>(pred->shape, pred->device, pred->dtype, false);
         grad_pred->fill_(0.0f);
@@ -1329,7 +1393,13 @@ struct L1LossBackward : public Node {
     L1LossBackward(std::shared_ptr<Tensor> pred, std::shared_ptr<Tensor> target, int n)
         : pred(pred), target(target), n(n) {}
 
+    void release_variables() override {
+        pred.reset();
+        target.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !pred || !target) return {nullptr};
         std::shared_ptr<Tensor> self_grad = grads[0];
         auto grad_pred = std::make_shared<Tensor>(pred->shape, pred->device, pred->dtype, false);
         grad_pred->fill_(0.0f);
@@ -1413,9 +1483,14 @@ struct BoolMaskBackward : public Node {
     BoolMaskBackward(std::shared_ptr<Tensor> m, int r, int c, int batch_size)
         : m(m), r(r), c(c), batch_size(batch_size) {}
 
+    void release_variables() override {
+        m.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !m) return {nullptr};
         std::shared_ptr<Tensor> self_grad = grads[0];
-        auto ga = std::make_shared<Tensor>(self_grad->shape, false);
+        auto ga = std::make_shared<Tensor>(self_grad->shape, self_grad->device, self_grad->dtype, false);
         ga->fill_(0.0f);
 
         const float* sg_ptr = self_grad->data_ptr<float>();
@@ -1443,7 +1518,7 @@ inline std::shared_ptr<Tensor> bool_mask(const std::shared_ptr<Tensor>& a, const
     for (int i = 0; i < ndim - 2; i++) { batch_size *= a->shape[i]; }
 
     bool req_grad = a->requires_grad;
-    auto out = std::make_shared<Tensor>(a->shape, req_grad);
+    auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
     const float* a_ptr = a->data_ptr<float>();
     const float* m_ptr = m->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
@@ -1577,8 +1652,9 @@ struct MeanBackward : public Node {
           batch_size(batch_size), ndim(ndim), nout(nout) {}
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0]) return {nullptr};
         std::shared_ptr<Tensor> self_grad = grads[0];
-        auto grad_a = std::make_shared<Tensor>(in_shape, false);
+        auto grad_a = std::make_shared<Tensor>(in_shape, self_grad->device, self_grad->dtype, false);
         grad_a->fill_(0.0f);
         const float* sg_ptr = self_grad->data_ptr<float>();
         float* ga_ptr = grad_a->data_ptr<float>();
@@ -1628,7 +1704,7 @@ inline std::shared_ptr<Tensor> mean(const std::shared_ptr<Tensor>& a, int axis) 
     axis == 0 ? out_shape[ndim - 2] = 1 : out_shape[ndim - 1] = 1;
     
     bool req_grad = a->requires_grad;
-    auto out = std::make_shared<Tensor>(out_shape, req_grad);
+    auto out = std::make_shared<Tensor>(out_shape, a->device, a->dtype, req_grad);
     int nout = out->ndim();
 
     const float* a_ptr = a->data_ptr<float>();
@@ -1689,7 +1765,7 @@ struct AddScalarBackward : public Node {
 
 inline std::shared_ptr<Tensor> add_scalar(const std::shared_ptr<Tensor>& a, float s) {
     bool req_grad = a->requires_grad;
-    auto out = std::make_shared<Tensor>(a->shape, req_grad);
+    auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
     const float* a_ptr = a->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
     int size = a->size();
@@ -1716,7 +1792,7 @@ struct SubScalarBackward : public Node {
 
 inline std::shared_ptr<Tensor> sub_scalar(const std::shared_ptr<Tensor>& a, float s) {
     bool req_grad = a->requires_grad;
-    auto out = std::make_shared<Tensor>(a->shape, req_grad);
+    auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
     const float* a_ptr = a->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
     int size = a->size();
@@ -1740,8 +1816,9 @@ struct MulScalarBackward : public Node {
     explicit MulScalarBackward(float s) : scalar(s) {}
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0]) return {nullptr};
         std::shared_ptr<Tensor> grad = grads[0];
-        auto da = std::make_shared<Tensor>(grad->shape, false);
+        auto da = std::make_shared<Tensor>(grad->shape, grad->device, grad->dtype, false);
         da->fill_(0.0f);
         const float* g_ptr = grad->data_ptr<float>();
         float* da_ptr = da->data_ptr<float>();
@@ -1756,7 +1833,7 @@ struct MulScalarBackward : public Node {
 
 inline std::shared_ptr<Tensor> mul_scalar(const std::shared_ptr<Tensor>& a, float s) {
     bool req_grad = a->requires_grad;
-    auto out = std::make_shared<Tensor>(a->shape, req_grad);
+    auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
     const float* a_ptr = a->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
     int size = a->size();
@@ -1780,8 +1857,9 @@ struct DivScalarBackward : public Node {
     explicit DivScalarBackward(float s) : scalar(s) {}
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0]) return {nullptr};
         std::shared_ptr<Tensor> grad = grads[0];
-        auto da = std::make_shared<Tensor>(grad->shape, false);
+        auto da = std::make_shared<Tensor>(grad->shape, grad->device, grad->dtype, false);
         da->fill_(0.0f);
         const float* g_ptr = grad->data_ptr<float>();
         float* da_ptr = da->data_ptr<float>();
@@ -1796,7 +1874,7 @@ struct DivScalarBackward : public Node {
 
 inline std::shared_ptr<Tensor> div_scalar(const std::shared_ptr<Tensor>& a, float s) {
     bool req_grad = a->requires_grad;
-    auto out = std::make_shared<Tensor>(a->shape, req_grad);
+    auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
     const float* a_ptr = a->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
     int size = a->size();
@@ -1821,8 +1899,9 @@ inline std::shared_ptr<Tensor> neg(const std::shared_ptr<Tensor>& a) {
 // --- RSUB SCALAR BACKWARD NODE ---
 struct RsubScalarBackward : public Node {
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0]) return {nullptr};
         std::shared_ptr<Tensor> grad = grads[0];
-        auto da = std::make_shared<Tensor>(grad->shape, false);
+        auto da = std::make_shared<Tensor>(grad->shape, grad->device, grad->dtype, false);
         da->fill_(0.0f);
         const float* g_ptr = grad->data_ptr<float>();
         float* da_ptr = da->data_ptr<float>();
@@ -1837,7 +1916,7 @@ struct RsubScalarBackward : public Node {
 
 inline std::shared_ptr<Tensor> rsub_scalar(float s, const std::shared_ptr<Tensor>& a) {
     bool req_grad = a->requires_grad;
-    auto out = std::make_shared<Tensor>(a->shape, req_grad);
+    auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
     const float* a_ptr = a->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
     int size = a->size();
@@ -1861,9 +1940,14 @@ struct RdivScalarBackward : public Node {
     float scalar;
     RdivScalarBackward(std::shared_ptr<Tensor> a, float s) : a(a), scalar(s) {}
 
+    void release_variables() override {
+        a.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !a) return {nullptr};
         std::shared_ptr<Tensor> grad = grads[0];
-        auto da = std::make_shared<Tensor>(a->shape, false);
+        auto da = std::make_shared<Tensor>(a->shape, a->device, a->dtype, false);
         da->fill_(0.0f);
         const float* g_ptr = grad->data_ptr<float>();
         const float* a_ptr = a->data_ptr<float>();
@@ -1880,7 +1964,7 @@ struct RdivScalarBackward : public Node {
 
 inline std::shared_ptr<Tensor> rdiv_scalar(float s, const std::shared_ptr<Tensor>& a) {
     bool req_grad = a->requires_grad;
-    auto out = std::make_shared<Tensor>(a->shape, req_grad);
+    auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
     const float* a_ptr = a->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
     int size = a->size();
@@ -1970,7 +2054,12 @@ struct SoftmaxBackward : public Node {
     SoftmaxBackward(std::shared_ptr<Tensor> s, int r, int c, int batch_size, int ndim)
         : s(s), r(r), c(c), batch_size(batch_size), ndim(ndim) {}
 
+    void release_variables() override {
+        s.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !s) return {nullptr};
         std::shared_ptr<Tensor> self_grad = grads[0];
         auto ga = std::make_shared<Tensor>(s->shape, s->device, s->dtype, false);
         ga->fill_(0.0f);
@@ -2064,9 +2153,14 @@ struct StdDevBackward : public Node {
     StdDevBackward(std::shared_ptr<Tensor> a, int axis, int r, int c, int batch_size)
         : a(a), axis(axis), r(r), c(c), batch_size(batch_size) {}
 
+    void release_variables() override {
+        a.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !a) return {nullptr};
         std::shared_ptr<Tensor> self_grad = grads[0];
-        auto grad_a = std::make_shared<Tensor>(a->shape, false);
+        auto grad_a = std::make_shared<Tensor>(a->shape, a->device, a->dtype, false);
         grad_a->fill_(0.0f);
         const float* sg_ptr = self_grad->data_ptr<float>();
         const float* a_ptr = a->data_ptr<float>();
@@ -2130,7 +2224,7 @@ inline std::shared_ptr<Tensor> std_dev(const std::shared_ptr<Tensor>& a, int axi
     for (int i = 0; i < ndim - 2; i++) { batch_size *= a->shape[i]; }
 
     bool req_grad = a->requires_grad;
-    auto out = std::make_shared<Tensor>(out_shape, req_grad);
+    auto out = std::make_shared<Tensor>(out_shape, a->device, a->dtype, req_grad);
     const float* a_ptr = a->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
 
@@ -2192,8 +2286,9 @@ struct SumBackward : public Node {
         : in_shape(in_shape), axis(axis), r(r), c(c), batch_size(batch_size), ndim(ndim) {}
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0]) return {nullptr};
         std::shared_ptr<Tensor> self_grad = grads[0];
-        auto grad_a = std::make_shared<Tensor>(in_shape, false);
+        auto grad_a = std::make_shared<Tensor>(in_shape, self_grad->device, self_grad->dtype, false);
         grad_a->fill_(0.0f);
         const float* sg_ptr = self_grad->data_ptr<float>();
         float* ga_ptr = grad_a->data_ptr<float>();
@@ -2235,7 +2330,7 @@ inline std::shared_ptr<Tensor> sum(const std::shared_ptr<Tensor>& a, int axis) {
     out_shape[axis] = 1;
 
     bool req_grad = a->requires_grad;
-    auto out = std::make_shared<Tensor>(out_shape, req_grad);
+    auto out = std::make_shared<Tensor>(out_shape, a->device, a->dtype, req_grad);
 
     const float* a_ptr = a->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
@@ -2330,9 +2425,14 @@ struct VarBackward : public Node {
     VarBackward(std::shared_ptr<Tensor> a, int axis, int r, int c, int batch_size)
         : a(a), axis(axis), r(r), c(c), batch_size(batch_size) {}
 
+    void release_variables() override {
+        a.reset();
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !a) return {nullptr};
         std::shared_ptr<Tensor> self_grad = grads[0];
-        auto grad_a = std::make_shared<Tensor>(a->shape, false);
+        auto grad_a = std::make_shared<Tensor>(a->shape, a->device, a->dtype, false);
         grad_a->fill_(0.0f);
         const float* sg_ptr = self_grad->data_ptr<float>();
         const float* a_ptr = a->data_ptr<float>();
@@ -2384,7 +2484,7 @@ inline std::shared_ptr<Tensor> var(const std::shared_ptr<Tensor>& a, int axis) {
     for (int i = 0; i < ndim - 2; i++) { batch_size *= a->shape[i]; }
 
     bool req_grad = a->requires_grad;
-    auto out = std::make_shared<Tensor>(out_shape, req_grad);
+    auto out = std::make_shared<Tensor>(out_shape, a->device, a->dtype, req_grad);
     const float* a_ptr = a->data_ptr<float>();
     float* out_ptr = out->data_ptr<float>();
 
@@ -2630,7 +2730,16 @@ struct MatmulBackward : public Node {
     }
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !a || !b) return {};
         std::shared_ptr<Tensor> self_grad = grads[0];
+
+#ifdef USE_CUDA
+        if (self_grad->device == Device::CUDA || a->device == Device::CUDA || b->device == Device::CUDA) {
+            std::shared_ptr<Tensor> grad_a, grad_b;
+            cuda::matmul_backward(a, b, self_grad, grad_a, grad_b);
+            return {grad_a, grad_b};
+        }
+#endif
 
         auto grad_a = std::make_shared<Tensor>(a->shape, a->device, a->dtype, false);
         grad_a->fill_(0.0f);
@@ -2812,7 +2921,39 @@ cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
 inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
 #ifdef USE_CUDA
     if (a->device == Device::CUDA || b->device == Device::CUDA) {
-        return cuda::matmul(a, b);
+        auto out = cuda::matmul(a, b);
+        if (a->requires_grad || b->requires_grad) {
+            int n1 = a->ndim();
+            int n2 = b->ndim();
+            int r1 = a->shape[n1 - 2];
+            int c1 = a->shape[n1 - 1];
+            int r2 = b->shape[n2 - 2];
+            int c2 = b->shape[n2 - 1];
+            int b1 = n1 - 2;
+            int b2 = n2 - 2;
+            int nout_batch = std::max(b1, b2);
+            int batch_size = 1;
+            for (int i = 0; i < nout_batch; i++) batch_size *= out->shape[i];
+            int nout = out->ndim();
+            std::vector<int64_t> strides_a_broad(nout_batch, 0);
+            std::vector<int64_t> strides_b_broad(nout_batch, 0);
+            for (int i = 0; i < nout_batch; ++i) {
+                int idx_a = i - (nout_batch - b1);
+                int idx_b = i - (nout_batch - b2);
+                int dim_a = (idx_a >= 0) ? a->shape[idx_a] : 1;
+                int dim_b = (idx_b >= 0) ? b->shape[idx_b] : 1;
+                strides_a_broad[i] = (idx_a >= 0 && dim_a != 1) ? a->strides[idx_a] : 0;
+                strides_b_broad[i] = (idx_b >= 0 && dim_b != 1) ? b->strides[idx_b] : 0;
+            }
+            auto grad_fn = std::make_shared<MatmulBackward>(
+                a, b, r1, c1, r2, c2, batch_size, n1, n2, nout, nout_batch,
+                strides_a_broad, strides_b_broad, out->shape
+            );
+            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(b).function, 1);
+            out->grad_fn = grad_fn;
+        }
+        return out;
     }
 #endif
     return manual_matmul(a, b);

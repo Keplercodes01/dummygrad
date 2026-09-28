@@ -12,13 +12,8 @@ public:
     Linear(int fan_in, int fan_out, float bias = 0.0f) {
         W = kaiming({fan_in, fan_out});
         b = std::make_shared<Tensor>(std::vector<int64_t>{1, fan_out});
-        if (bias != 0.0f) {
-            float* b_ptr = b->data_ptr<float>();
-            int size = b->size();
-            for (int i = 0; i < size; i++) {
-                b_ptr[i] = bias;
-            }
-        }
+        b->fill_(bias);
+        b->requires_grad = true;
     }
 
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x) {

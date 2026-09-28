@@ -6,7 +6,7 @@
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
-#elif defined(__AVX__) || defined(__x86_64__) || defined(_M_X64)
+#elif defined(__AVX__)
 #include <immintrin.h>
 #endif
 
@@ -28,7 +28,7 @@ namespace cpu {
             for (; i <= size - 4; i += 4) {
                 vst1q_f32(ptr + i, val_vec);
             }
-#elif defined(__AVX__) || defined(__x86_64__) || defined(_M_X64)
+#elif defined(__AVX__)
             __m256 val_vec = _mm256_set1_ps(value);
             for (; i <= size - 32; i += 32) {
                 _mm256_storeu_ps(ptr + i, val_vec);
@@ -101,7 +101,7 @@ namespace cpu {
                 float32x4_t b = vld1q_f32(s_ptr + i);
                 vst1q_f32(d_ptr + i, vaddq_f32(a, b));
             }
-#elif defined(__AVX__) || defined(__x86_64__) || defined(_M_X64)
+#elif defined(__AVX__)
             for (; i <= size - 32; i += 32) {
                 __m256 a0 = _mm256_loadu_ps(d_ptr + i);
                 __m256 b0 = _mm256_loadu_ps(s_ptr + i);

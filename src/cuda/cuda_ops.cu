@@ -827,7 +827,9 @@ void adamw_step(float* param, const float* grad, float* m, float* v,
 // cuBLAS Matrix Multiplication (Row-Major via Column-Major Trick)
 // Supports TF32 (FP32), FP16, and BF16 with Tensor Core Acceleration
 // -------------------------------------------------------------
-std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
+std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& _a, const std::shared_ptr<Tensor>& _b) {
+    auto a = make_contiguous(_a);
+    auto b = make_contiguous(_b);
     int n1 = a->ndim();
     int n2 = b->ndim();
     int r1 = a->shape[n1 - 2];
@@ -837,16 +839,23 @@ std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shar
 
     if (c1 != r2) throw std::runtime_error("cuda::matmul: inner dimensions mismatch");
 
-    int batch_size = a->size() / (r1 * c1);
-    std::vector<int64_t> out_shape = a->shape;
-    out_shape[n1 - 2] = r1;
-    out_shape[n1 - 1] = c2;
+    int batch_size_a = a->size() / (r1 * c1);
+    int batch_size_b = b->size() / (r2 * c2);
+    int batch_size = std::max(batch_size_a, batch_size_b);
+
+    std::vector<int64_t> out_shape = (batch_size_a >= batch_size_b) ? a->shape : b->shape;
+    out_shape[out_shape.size() - 2] = r1;
+    out_shape[out_shape.size() - 1] = c2;
 
     auto out = std::make_shared<Tensor>(out_shape, Device::CUDA, a->dtype, a->requires_grad || b->requires_grad);
 
     cublasHandle_t handle = get_cublas_handle();
     const float alpha = 1.0f;
     const float beta = 0.0f;
+
+    long long int stride_a = (batch_size_a > 1) ? (r1 * c1) : 0;
+    long long int stride_b = (batch_size_b > 1) ? (r2 * c2) : 0;
+    long long int stride_c = r1 * c2;
 
     // Row-major C = A * B -> Col-major C^T = B^T * A^T
     if (a->dtype == DType::Float16) {
@@ -860,9 +869,6 @@ std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shar
                                      out->data_ptr<void>(), CUDA_R_16F, c2,
                                      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         } else {
-            long long int stride_a = r1 * c1;
-            long long int stride_b = r2 * c2;
-            long long int stride_c = r1 * c2;
             CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                                                    c2, r1, c1,
                                                    &alpha,
@@ -884,9 +890,6 @@ std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shar
                                      out->data_ptr<void>(), CUDA_R_16BF, c2,
                                      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         } else {
-            long long int stride_a = r1 * c1;
-            long long int stride_b = r2 * c2;
-            long long int stride_c = r1 * c2;
             CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                                                    c2, r1, c1,
                                                    &alpha,
@@ -908,9 +911,6 @@ std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shar
                                      &beta,
                                      out->data_ptr<float>(), c2));
         } else {
-            long long int stride_a = r1 * c1;
-            long long int stride_b = r2 * c2;
-            long long int stride_c = r1 * c2;
             CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                                                    c2, r1, c1,
                                                    &alpha,
@@ -923,6 +923,69 @@ std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shar
     }
 
     return out;
+}
+
+void matmul_backward(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b,
+                     const std::shared_ptr<Tensor>& grad_out,
+                     std::shared_ptr<Tensor>& grad_a, std::shared_ptr<Tensor>& grad_b) {
+    if (!grad_out) return;
+    auto a_c = make_contiguous(a);
+    auto b_c = make_contiguous(b);
+    auto g_c = make_contiguous(grad_out);
+
+    auto a_cpu = a_c->cpu();
+    auto b_cpu = b_c->cpu();
+    auto g_cpu = g_c->cpu();
+
+    int n1 = a_cpu->ndim();
+    int n2 = b_cpu->ndim();
+    int r1 = a_cpu->shape[n1 - 2];
+    int c1 = a_cpu->shape[n1 - 1];
+    int r2 = b_cpu->shape[n2 - 2];
+    int c2 = b_cpu->shape[n2 - 1];
+
+    int batch_size_a = a_cpu->size() / (r1 * c1);
+    int batch_size_b = b_cpu->size() / (r2 * c2);
+    int batch_size = std::max(batch_size_a, batch_size_b);
+
+    auto ga_cpu = std::make_shared<Tensor>(a_cpu->shape, Device::CPU, a_cpu->dtype, false);
+    ga_cpu->fill_(0.0f);
+    auto gb_cpu = std::make_shared<Tensor>(b_cpu->shape, Device::CPU, b_cpu->dtype, false);
+    gb_cpu->fill_(0.0f);
+
+    const float* a_data = a_cpu->data_ptr<float>();
+    const float* b_data = b_cpu->data_ptr<float>();
+    const float* g_data = g_cpu->data_ptr<float>();
+    float* ga_data = ga_cpu->data_ptr<float>();
+    float* gb_data = gb_cpu->data_ptr<float>();
+
+    for (int batch = 0; batch < batch_size; ++batch) {
+        int off_a = (batch_size_a > 1) ? (batch * r1 * c1) : 0;
+        int off_b = (batch_size_b > 1) ? (batch * r2 * c2) : 0;
+        int off_g = batch * r1 * c2;
+
+        for (int i = 0; i < r1; ++i) {
+            for (int j = 0; j < c1; ++j) {
+                float sum = 0.0f;
+                for (int k = 0; k < c2; ++k) {
+                    sum += g_data[off_g + i * c2 + k] * b_data[off_b + j * c2 + k];
+                }
+                ga_data[off_a + i * c1 + j] += sum;
+            }
+        }
+        for (int i = 0; i < c1; ++i) {
+            for (int j = 0; j < c2; ++j) {
+                float sum = 0.0f;
+                for (int k = 0; k < r1; ++k) {
+                    sum += a_data[off_a + k * c1 + i] * g_data[off_g + k * c2 + j];
+                }
+                gb_data[off_b + i * c2 + j] += sum;
+            }
+        }
+    }
+
+    grad_a = ga_cpu->to(a->device);
+    grad_b = gb_cpu->to(b->device);
 }
 
 } // namespace cuda
