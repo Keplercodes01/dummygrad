@@ -4,7 +4,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
-#include "../types.h"
+#include "core/types.h"
 #include "pjrt_c_api.h"
 
 // RAII Handle for TPU Device Buffer managed by OpenXLA PJRT

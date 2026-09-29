@@ -8,15 +8,15 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Source files for the core engine
 set(DUMMYGRAD_SOURCES
-    src/storage.cpp
-    src/utils.cpp
-    src/node.cpp
-    src/autograd.cpp
-    src/tensor.cpp
-    src/allocator.cpp
-    src/ops.cpp
-    src/cpu_ops.cpp
-    src/tpu/pjrt_client.cpp
+    src/core/storage.cpp
+    src/core/utils.cpp
+    src/autograd/node.cpp
+    src/autograd/autograd.cpp
+    src/core/tensor.cpp
+    src/core/allocator.cpp
+    src/ops/ops.cpp
+    src/backends/cpu/cpu_ops.cpp
+    src/backends/tpu/pjrt_client.cpp
 )
 
 # Detect and configure CUDA for GPU execution (e.g. Google Colab / Linux GPU)
@@ -27,7 +27,7 @@ if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --use_fast_math")
-    list(APPEND DUMMYGRAD_SOURCES src/cuda/cuda_ops.cu)
+    list(APPEND DUMMYGRAD_SOURCES src/backends/cuda/cuda_ops.cu)
     message(STATUS "CUDA found: ${CMAKE_CUDA_COMPILER}. Building with GPU support.")
 else()
     message(STATUS "CUDA not found. Building CPU-only.")
@@ -35,7 +35,15 @@ endif()
 
 # Build engine static library
 add_library(dummygrad_engine STATIC ${DUMMYGRAD_SOURCES})
-target_include_directories(dummygrad_engine PUBLIC src)
+target_include_directories(dummygrad_engine PUBLIC 
+    src
+    src/core
+    src/autograd
+    src/ops
+    src/nn
+    src/backends
+    src/models
+)
 target_link_libraries(dummygrad_engine PRIVATE ${CMAKE_DL_LIBS})
 
 # Optional BLAS (OpenBLAS / oneMKL / MKL / Netlib) for fast CPU linear algebra
@@ -56,7 +64,7 @@ endif()
 # Configure Apple Silicon Metal and MetalPerformanceShaders on macOS
 if(APPLE)
     enable_language(OBJCXX)
-    target_sources(dummygrad_engine PRIVATE src/metal/metal_backend.mm)
+    target_sources(dummygrad_engine PRIVATE src/backends/metal/metal_backend.mm)
     find_library(METAL_LIB Metal REQUIRED)
     find_library(MPS_LIB MetalPerformanceShaders REQUIRED)
     find_library(FOUNDATION_LIB Foundation REQUIRED)

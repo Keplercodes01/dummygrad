@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
-#include "../types.h"
+#include "core/types.h"
 
 // Pure C++ Interface for Apple Silicon Metal & MPS Acceleration
 // Zero-overhead dispatch to Apple Matrix Coprocessor (AMX) and Apple GPUs

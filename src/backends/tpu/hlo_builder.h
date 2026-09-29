@@ -3,7 +3,7 @@
 #include <vector>
 #include <sstream>
 #include <iomanip>
-#include "../types.h"
+#include "core/types.h"
 
 // Pure C++ HLO (High-Level Optimizer) Graph Generator for TPU v5e
 // Compiles into optimal systolic array execution (128x128 MXU) via OpenXLA / PJRT

@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include "pjrt_client.h"
 #include "hlo_builder.h"
-#include "../tensor.h"
+#include "core/tensor.h"
 
 // High-performance TPU Execution Engine for Single & Multi-TPU Pod Slices
 // Direct OpenXLA PJRT driver integration with zero Python and near-zero host latency
