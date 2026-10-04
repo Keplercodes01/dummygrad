@@ -10,6 +10,7 @@ void Node::add_next_edge(const std::shared_ptr<Node>& fn, size_t input_slot) {
 std::vector<std::shared_ptr<Tensor>> AccumulateGrad::apply(const std::vector<std::shared_ptr<Tensor>>& grads) {
     if (auto var = variable.lock()) {
         if (!grads.empty() && grads[0]) {
+            std::lock_guard<std::mutex> lock(mutex);
             tensor_add_inplace(var->grad, grads[0]);
         }
     }

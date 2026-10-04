@@ -70,6 +70,10 @@ namespace cpu {
     }
 
     void add_inplace(Tensor& dst, const Tensor& src) {
+        if (dst.dtype != src.dtype)
+            throw std::runtime_error("add_inplace requires identical dtypes");
+        if (dst.size() != src.size())
+            throw std::runtime_error("add_inplace requires identical sizes");
         if (!dst.is_contiguous() || !src.is_contiguous()) 
             throw std::runtime_error("add_inplace requires contiguous tensors");
 
@@ -137,6 +141,9 @@ namespace cpu {
     }
 
     void copy_from_vector(Tensor& tensor, const std::vector<float>& values) {
+        if (values.size() < static_cast<size_t>(tensor.size())) {
+            throw std::runtime_error("copy_from_vector: values vector smaller than tensor size");
+        }
         if (tensor.dtype == DType::Float32 && tensor.is_contiguous()) {
             std::memcpy(tensor.data_ptr<float>(), values.data(), tensor.size() * sizeof(float));
             return;
@@ -167,6 +174,11 @@ namespace cpu {
     }
 
     void make_contiguous(Tensor& dst, const Tensor& src) {
+        if (dst.dtype != src.dtype)
+            throw std::runtime_error("make_contiguous requires identical dtypes");
+        if (dst.size() != src.size())
+            throw std::runtime_error("make_contiguous requires identical sizes");
+
         Dispatch_DType(dst.dtype, {
             scalar_type* out_ptr = dst.data_ptr<scalar_type>();
             const scalar_type* src_data = src.data_ptr<scalar_type>();

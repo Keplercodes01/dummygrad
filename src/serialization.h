@@ -70,7 +70,7 @@ inline void save_safetensors(
         const auto& tensor = pair.second;
         if (!tensor) continue;
 
-        uint64_t bytes = tensor->storage->total_bytes;
+        uint64_t bytes = static_cast<uint64_t>(tensor->size()) * dtype_size(tensor->dtype);
         uint64_t start = current_offset;
         uint64_t end = current_offset + bytes;
         current_offset = end;
@@ -105,8 +105,9 @@ inline void save_safetensors(
     out.write(json_header.data(), header_len);
 
     for (const auto& item : ordered_tensors) {
-        auto host_tensor = item.tensor->cpu();
-        out.write(host_tensor->data_ptr<char>(), item.tensor->storage->total_bytes);
+        auto host_tensor = make_contiguous(item.tensor)->cpu();
+        uint64_t bytes = item.end_byte - item.start_byte;
+        out.write(host_tensor->data_ptr<char>(), bytes);
     }
 
     out.close();
@@ -137,17 +138,30 @@ inline std::vector<SafeTensorEntry> parse_safetensors_header(const std::string& 
         std::string key = json.substr(key_start + 1, key_end - key_start - 1);
         pos = key_end + 1;
 
-        if (key == "__metadata__") {
-            continue; // Skip optional HuggingFace metadata dict
-        }
-
-        // Find entry dict
+        // Find entry dict with matching nested braces
         size_t dict_start = json.find('{', pos);
-        size_t dict_end = json.find('}', dict_start);
-        if (dict_start == std::string::npos || dict_end == std::string::npos) break;
+        if (dict_start == std::string::npos) break;
+
+        int depth = 0;
+        size_t dict_end = std::string::npos;
+        for (size_t k = dict_start; k < json.size(); ++k) {
+            if (json[k] == '{') depth++;
+            else if (json[k] == '}') {
+                depth--;
+                if (depth == 0) {
+                    dict_end = k;
+                    break;
+                }
+            }
+        }
+        if (dict_end == std::string::npos) break;
 
         std::string entry_str = json.substr(dict_start, dict_end - dict_start + 1);
         pos = dict_end + 1;
+
+        if (key == "__metadata__") {
+            continue; // Skip optional HuggingFace metadata dict safely
+        }
 
         SafeTensorEntry entry;
         entry.name = key;
@@ -215,6 +229,10 @@ inline std::unordered_map<std::string, std::shared_ptr<Tensor>> load_safetensors
         throw std::runtime_error("load_safetensors: Failed to stat file: " + filepath);
     }
     size_t file_size = sb.st_size;
+    if (file_size < 8) {
+        close(fd);
+        throw std::runtime_error("load_safetensors: Corrupt or empty file (< 8 bytes): " + filepath);
+    }
 
     void* mmapped_data = mmap(nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
     if (mmapped_data == MAP_FAILED) {
@@ -234,11 +252,23 @@ inline std::unordered_map<std::string, std::shared_ptr<Tensor>> load_safetensors
     std::string json_header(reinterpret_cast<const char*>(ptr + 8), header_len);
     auto entries = parse_safetensors_header(json_header);
     const uint8_t* payload_base = ptr + 8 + header_len;
+    size_t max_payload = file_size - (8 + header_len);
 
     for (const auto& entry : entries) {
+        if (entry.offset_start > entry.offset_end || entry.offset_end > max_payload) {
+            munmap(mmapped_data, file_size);
+            close(fd);
+            throw std::runtime_error("load_safetensors: Offset out of bounds for tensor: " + entry.name);
+        }
         auto tensor = std::make_shared<Tensor>(entry.shape, Device::CPU, entry.dtype, false);
-        const uint8_t* src = payload_base + entry.offset_start;
+        size_t expected_bytes = static_cast<size_t>(tensor->size()) * dtype_size(entry.dtype);
         size_t bytes = entry.offset_end - entry.offset_start;
+        if (bytes != expected_bytes) {
+            munmap(mmapped_data, file_size);
+            close(fd);
+            throw std::runtime_error("load_safetensors: Byte size mismatch for tensor: " + entry.name);
+        }
+        const uint8_t* src = payload_base + entry.offset_start;
         std::memcpy(tensor->data_ptr<char>(), src, bytes);
 
         if (device != Device::CPU) {
@@ -256,19 +286,37 @@ inline std::unordered_map<std::string, std::shared_ptr<Tensor>> load_safetensors
         throw std::runtime_error("load_safetensors: Unable to open file: " + filepath);
     }
 
+    in.seekg(0, std::ios::end);
+    size_t file_size = in.tellg();
+    in.seekg(0, std::ios::beg);
+    if (file_size < 8) {
+        throw std::runtime_error("load_safetensors: Corrupt or empty file (< 8 bytes): " + filepath);
+    }
+
     uint64_t header_len = 0;
     in.read(reinterpret_cast<char*>(&header_len), sizeof(header_len));
+    if (8 + header_len > file_size) {
+        throw std::runtime_error("load_safetensors: Corrupt file header size");
+    }
 
     std::string json_header(header_len, '\0');
     in.read(&json_header[0], header_len);
 
     auto entries = parse_safetensors_header(json_header);
     uint64_t payload_base = 8 + header_len;
+    size_t max_payload = file_size - payload_base;
 
     for (const auto& entry : entries) {
+        if (entry.offset_start > entry.offset_end || entry.offset_end > max_payload) {
+            throw std::runtime_error("load_safetensors: Offset out of bounds for tensor: " + entry.name);
+        }
         auto tensor = std::make_shared<Tensor>(entry.shape, Device::CPU, entry.dtype, false);
-        in.seekg(payload_base + entry.offset_start);
+        size_t expected_bytes = static_cast<size_t>(tensor->size()) * dtype_size(entry.dtype);
         size_t bytes = entry.offset_end - entry.offset_start;
+        if (bytes != expected_bytes) {
+            throw std::runtime_error("load_safetensors: Byte size mismatch for tensor: " + entry.name);
+        }
+        in.seekg(payload_base + entry.offset_start);
         in.read(tensor->data_ptr<char>(), bytes);
 
         if (device != Device::CPU) {
@@ -320,8 +368,9 @@ inline void save_checkpoint(
             out.write(reinterpret_cast<const char*>(&d), sizeof(d));
         }
 
-        auto cpu_tensor = tensor->cpu();
-        out.write(cpu_tensor->data_ptr<char>(), tensor->storage->total_bytes);
+        auto contig_cpu = make_contiguous(tensor)->cpu();
+        uint64_t bytes = static_cast<uint64_t>(tensor->size()) * dtype_size(tensor->dtype);
+        out.write(contig_cpu->data_ptr<char>(), bytes);
     }
     out.close();
 }
@@ -363,7 +412,8 @@ inline std::unordered_map<std::string, std::shared_ptr<Tensor>> load_checkpoint(
         }
 
         auto tensor = std::make_shared<Tensor>(shape, Device::CPU, dt, false);
-        in.read(tensor->data_ptr<char>(), tensor->storage->total_bytes);
+        uint64_t bytes = static_cast<uint64_t>(tensor->size()) * dtype_size(dt);
+        in.read(tensor->data_ptr<char>(), bytes);
 
         if (device != Device::CPU) {
             state_dict[name] = tensor->to(device);

@@ -23,4 +23,11 @@ public:
     std::vector<std::shared_ptr<Tensor>> parameters() const {
         return {W, b};
     }
+
+    void to(Device device, DType dtype = DType::Float32) {
+        W = W->to(device, dtype);
+        b = b->to(device, dtype);
+        W->requires_grad = true;
+        b->requires_grad = true;
+    }
 };

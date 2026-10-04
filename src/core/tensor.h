@@ -28,6 +28,8 @@ public:
     explicit Tensor(std::vector<int64_t> s, bool req_grad) 
         : Tensor(s, Device::CPU, DType::Float32, req_grad) {}
 
+    // Lightweight constructor for sharing existing storage without reallocating
+    Tensor(std::shared_ptr<Storage> stor, std::vector<int64_t> s, std::vector<int64_t> str, int64_t offset, Device d, DType type, bool req_grad);
 
     template<typename T = float>
     T* data_ptr() {
@@ -46,8 +48,19 @@ public:
             return static_cast<const T*>(storage->data) + global_offset;
         }
     }
-    template<typename T> T data_at(int64_t i) const { return data_ptr<T>()[i]; }
-    template<typename T> T grad_at(int64_t i) const { return grad ? grad->data_ptr<T>()[i] : static_cast<T>(0); }
+    template<typename T> T data_at(int64_t i) const {
+        if (device != Device::CPU) {
+            throw std::runtime_error("Tensor::data_at: cannot directly access device tensor on CPU. Call .cpu() first.");
+        }
+        return data_ptr<T>()[i];
+    }
+    template<typename T> T grad_at(int64_t i) const {
+        if (!grad) return static_cast<T>(0);
+        if (grad->device != Device::CPU) {
+            throw std::runtime_error("Tensor::grad_at: cannot directly access device grad on CPU. Call .cpu() first.");
+        }
+        return grad->data_ptr<T>()[i];
+    }
 
     std::shared_ptr<Tensor> to(Device target_device, int device_id = 0);
     std::shared_ptr<Tensor> cuda() { return to(Device::CUDA); }

@@ -54,6 +54,8 @@ public:
 
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x_in,
                                     const std::shared_ptr<Tensor>& mask = nullptr) {
+        if (!x_in) throw std::runtime_error("SelfAttention: input tensor is null");
+        if (x_in->ndim() < 2) throw std::runtime_error("SelfAttention: input must be at least 2D (S, D) or (B, S, D)");
         auto x = x_in;
         bool is_2d = (x->ndim() == 2);
         if (is_2d) {
@@ -116,6 +118,12 @@ public:
         p.insert(p.end(), pk.begin(), pk.end());
         p.insert(p.end(), pv.begin(), pv.end());
         return p;
+    }
+
+    void to(Device device, DType dtype = DType::Float32) {
+        W_q.to(device, dtype);
+        W_k.to(device, dtype);
+        W_v.to(device, dtype);
     }
 };
 
@@ -205,6 +213,8 @@ public:
                                     const std::shared_ptr<Tensor>& cos_freqs = nullptr,
                                     const std::shared_ptr<Tensor>& sin_freqs = nullptr,
                                     int start_pos = 0) {
+        if (!x_in) throw std::runtime_error("MultiHeadAttention: input tensor is null");
+        if (x_in->ndim() < 2) throw std::runtime_error("MultiHeadAttention: input must be at least 2D (S, D) or (B, S, D)");
         auto x = x_in;
         bool is_2d = (x->ndim() == 2);
         if (is_2d) {
@@ -339,5 +349,12 @@ public:
         p.insert(p.end(), pv.begin(), pv.end());
         p.insert(p.end(), po.begin(), po.end());
         return p;
+    }
+
+    void to(Device device, DType dtype = DType::Float32) {
+        W_q.to(device, dtype);
+        W_k.to(device, dtype);
+        W_v.to(device, dtype);
+        W_o.to(device, dtype);
     }
 };

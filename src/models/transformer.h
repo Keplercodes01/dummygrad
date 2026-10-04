@@ -7,6 +7,7 @@
 #include "ops.h"
 #include "embedding.h"
 #include "modern_layers.h"
+#include "serialization.h"
 
 // Transformer Feed-Forward Network (MLP Block)
 class FeedForward {
@@ -29,6 +30,11 @@ public:
         p.insert(p.end(), p2.begin(), p2.end());
         return p;
     }
+
+    void to(Device device, DType dtype = DType::Float32) {
+        fc1.to(device, dtype);
+        fc2.to(device, dtype);
+    }
 };
 
 // Single Transformer Decoder Block (Pre-LayerNorm)
@@ -39,8 +45,8 @@ public:
     LayerNorm ln2;
     FeedForward ffn;
 
-    TransformerBlock(int d_model, int n_heads, bool causal = true)
-        : ln1(d_model), attn(d_model, n_heads, causal), ln2(d_model), ffn(d_model) {}
+    TransformerBlock(int d_model, int n_heads, bool causal = true, int d_ff = 0)
+        : ln1(d_model), attn(d_model, n_heads, causal), ln2(d_model), ffn(d_model, d_ff) {}
 
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x,
                                     const std::shared_ptr<Tensor>& mask = nullptr) {
@@ -65,6 +71,13 @@ public:
         p.insert(p.end(), pf.begin(), pf.end());
         return p;
     }
+
+    void to(Device device, DType dtype = DType::Float32) {
+        ln1.to(device, dtype);
+        attn.to(device, dtype);
+        ln2.to(device, dtype);
+        ffn.to(device, dtype);
+    }
 };
 
 // GPT Language Model (Decoder-only Transformer)
@@ -86,6 +99,9 @@ public:
           vocab_size(vocab_size),
           max_seq_len(max_seq_len),
           d_model(d_model) {
+        if (n_layers <= 0) throw std::invalid_argument("GPT: n_layers must be > 0");
+        if (n_heads <= 0) throw std::invalid_argument("GPT: n_heads must be > 0");
+        if (d_model <= 0 || d_model % n_heads != 0) throw std::invalid_argument("GPT: d_model must be positive and divisible by n_heads");
         
         for (int i = 0; i < n_layers; i++) {
             blocks.push_back(std::make_shared<TransformerBlock>(d_model, n_heads, true));
@@ -109,12 +125,32 @@ public:
     }
 
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& input_ids,
-                                    const std::shared_ptr<Tensor>& pos_ids,
+                                    const std::shared_ptr<Tensor>& pos_ids = nullptr,
                                     const std::shared_ptr<Tensor>& mask = nullptr) {
+        if (!input_ids) throw std::invalid_argument("GPT::forward: input_ids is null");
+
         // Token + Positional Embeddings
         auto tok_x = token_emb.forward(input_ids);
-        auto pos_x = pos_ids ? pos_emb.forward(pos_ids) : nullptr;
-        auto x = pos_x ? add(tok_x, pos_x) : tok_x;
+
+        std::shared_ptr<Tensor> pos_x = nullptr;
+        if (pos_ids) {
+            pos_x = pos_emb.forward(pos_ids);
+        } else {
+            // Automatically generate frame position indices [0, 1, ..., T-1] safely on CPU
+            int64_t T = (input_ids->ndim() >= 2) ? input_ids->shape[1] : input_ids->shape[0];
+            int64_t B = (input_ids->ndim() >= 2) ? input_ids->shape[0] : 1;
+            auto auto_pos = std::make_shared<Tensor>(std::vector<int64_t>{B, T}, Device::CPU, DType::Float32, false);
+            float* p_ptr = auto_pos->data_ptr<float>();
+            for (int64_t b = 0; b < B; ++b) {
+                for (int64_t t = 0; t < T; ++t) {
+                    p_ptr[b * T + t] = static_cast<float>(t);
+                }
+            }
+            auto p_dev = (input_ids->device != Device::CPU) ? auto_pos->to(input_ids->device) : auto_pos;
+            pos_x = pos_emb.forward(p_dev);
+        }
+
+        auto x = add(tok_x, pos_x);
 
         // Pass through Transformer blocks
         for (auto& block : blocks) {
@@ -145,6 +181,69 @@ public:
         
         return p;
     }
+
+    std::unordered_map<std::string, std::shared_ptr<Tensor>> named_parameters() const {
+        std::unordered_map<std::string, std::shared_ptr<Tensor>> named;
+        named["token_emb.weight"] = token_emb.weight;
+        named["pos_emb.weight"] = pos_emb.weight;
+        for (size_t i = 0; i < blocks.size(); i++) {
+            std::string prefix = "blocks." + std::to_string(i) + ".";
+            named[prefix + "ln1.gamma"] = blocks[i]->ln1.gamma;
+            named[prefix + "ln1.beta"] = blocks[i]->ln1.beta;
+            named[prefix + "attn.W_q.weight"] = blocks[i]->attn.W_q.W;
+            named[prefix + "attn.W_q.bias"] = blocks[i]->attn.W_q.b;
+            named[prefix + "attn.W_k.weight"] = blocks[i]->attn.W_k.W;
+            named[prefix + "attn.W_k.bias"] = blocks[i]->attn.W_k.b;
+            named[prefix + "attn.W_v.weight"] = blocks[i]->attn.W_v.W;
+            named[prefix + "attn.W_v.bias"] = blocks[i]->attn.W_v.b;
+            named[prefix + "attn.W_o.weight"] = blocks[i]->attn.W_o.W;
+            named[prefix + "attn.W_o.bias"] = blocks[i]->attn.W_o.b;
+            named[prefix + "ln2.gamma"] = blocks[i]->ln2.gamma;
+            named[prefix + "ln2.beta"] = blocks[i]->ln2.beta;
+            named[prefix + "ffn.fc1.weight"] = blocks[i]->ffn.fc1.W;
+            named[prefix + "ffn.fc1.bias"] = blocks[i]->ffn.fc1.b;
+            named[prefix + "ffn.fc2.weight"] = blocks[i]->ffn.fc2.W;
+            named[prefix + "ffn.fc2.bias"] = blocks[i]->ffn.fc2.b;
+        }
+        named["ln_f.gamma"] = ln_f.gamma;
+        named["ln_f.beta"] = ln_f.beta;
+        return named;
+    }
+
+    void save_safetensors(const std::string& filepath) const {
+        io::save_safetensors(filepath, named_parameters());
+    }
+
+    void load_safetensors(const std::string& filepath) {
+        auto loaded = io::load_safetensors(filepath, token_emb.weight->device);
+        auto named = named_parameters();
+        for (const auto& [name, src_tensor] : loaded) {
+            auto it = named.find(name);
+            if (it != named.end() && it->second && src_tensor) {
+                auto dst = it->second;
+                if (dst->size() == src_tensor->size()) {
+                    auto converted = (src_tensor->device != dst->device || src_tensor->dtype != dst->dtype)
+                                     ? src_tensor->to(dst->device, dst->dtype) : src_tensor;
+                    dst->storage = converted->storage;
+                    dst->strides = converted->strides;
+                    dst->global_offset = converted->global_offset;
+                }
+            }
+        }
+    }
+
+    void to(Device device, DType dtype = DType::Float32) {
+        token_emb.to(device, dtype);
+        pos_emb.to(device, dtype);
+        for (auto& block : blocks) {
+            block->to(device, dtype);
+        }
+        ln_f.to(device, dtype);
+    }
+
+    void cuda() { to(Device::CUDA); }
+    void mps()  { to(Device::MPS); }
+    void cpu()  { to(Device::CPU); }
 };
 
 // ============================================================================
@@ -190,6 +289,13 @@ public:
         p.insert(p.end(), pf.begin(), pf.end());
         return p;
     }
+
+    void to(Device device, DType dtype = DType::Float32) {
+        rms1.to(device, dtype);
+        attn.to(device, dtype);
+        rms2.to(device, dtype);
+        ffn.to(device, dtype);
+    }
 };
 
 // ============================================================================
@@ -225,6 +331,9 @@ public:
           n_heads(n_heads),
           n_kv_heads(n_kv_heads > 0 ? n_kv_heads : n_heads),
           head_dim(d_model / n_heads) {
+        if (n_layers <= 0) throw std::invalid_argument("ModernTransformer: n_layers must be > 0");
+        if (n_heads <= 0) throw std::invalid_argument("ModernTransformer: n_heads must be > 0");
+        if (d_model <= 0 || d_model % n_heads != 0) throw std::invalid_argument("ModernTransformer: d_model must be positive and divisible by n_heads");
 
         // Precompute RoPE rotary frequency tables once at model construction
         auto [c_t, s_t] = precompute_freqs_cis(head_dim, max_seq_len);
@@ -253,6 +362,8 @@ public:
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& input_ids,
                                     const std::shared_ptr<Tensor>& mask = nullptr,
                                     int start_pos = 0) {
+        if (!input_ids) throw std::invalid_argument("ModernTransformer::forward: input_ids is null");
+
         // Token Embeddings (No learned positional embeddings needed with RoPE)
         auto x = token_emb.forward(input_ids);
 
@@ -279,4 +390,70 @@ public:
         p.insert(p.end(), pr.begin(), pr.end());
         return p;
     }
+
+    std::unordered_map<std::string, std::shared_ptr<Tensor>> named_parameters() const {
+        std::unordered_map<std::string, std::shared_ptr<Tensor>> named;
+        named["token_emb.weight"] = token_emb.weight;
+        for (size_t i = 0; i < blocks.size(); i++) {
+            std::string prefix = "blocks." + std::to_string(i) + ".";
+            named[prefix + "rms1.gamma"] = blocks[i]->rms1.gamma;
+            named[prefix + "attn.W_q.weight"] = blocks[i]->attn.W_q.W;
+            named[prefix + "attn.W_q.bias"] = blocks[i]->attn.W_q.b;
+            named[prefix + "attn.W_k.weight"] = blocks[i]->attn.W_k.W;
+            named[prefix + "attn.W_k.bias"] = blocks[i]->attn.W_k.b;
+            named[prefix + "attn.W_v.weight"] = blocks[i]->attn.W_v.W;
+            named[prefix + "attn.W_v.bias"] = blocks[i]->attn.W_v.b;
+            named[prefix + "attn.W_o.weight"] = blocks[i]->attn.W_o.W;
+            named[prefix + "attn.W_o.bias"] = blocks[i]->attn.W_o.b;
+            named[prefix + "rms2.gamma"] = blocks[i]->rms2.gamma;
+            named[prefix + "ffn.w_gate.weight"] = blocks[i]->ffn.w_gate.W;
+            named[prefix + "ffn.w_gate.bias"] = blocks[i]->ffn.w_gate.b;
+            named[prefix + "ffn.w_up.weight"] = blocks[i]->ffn.w_up.W;
+            named[prefix + "ffn.w_up.bias"] = blocks[i]->ffn.w_up.b;
+            named[prefix + "ffn.w_down.weight"] = blocks[i]->ffn.w_down.W;
+            named[prefix + "ffn.w_down.bias"] = blocks[i]->ffn.w_down.b;
+        }
+        named["rms_f.gamma"] = rms_f.gamma;
+        return named;
+    }
+
+    void save_safetensors(const std::string& filepath) const {
+        io::save_safetensors(filepath, named_parameters());
+    }
+
+    void load_safetensors(const std::string& filepath) {
+        auto loaded = io::load_safetensors(filepath, token_emb.weight->device);
+        auto named = named_parameters();
+        for (const auto& [name, src_tensor] : loaded) {
+            auto it = named.find(name);
+            if (it != named.end() && it->second && src_tensor) {
+                auto dst = it->second;
+                if (dst->size() == src_tensor->size()) {
+                    auto converted = (src_tensor->device != dst->device || src_tensor->dtype != dst->dtype)
+                                     ? src_tensor->to(dst->device, dst->dtype) : src_tensor;
+                    dst->storage = converted->storage;
+                    dst->strides = converted->strides;
+                    dst->global_offset = converted->global_offset;
+                }
+            }
+        }
+    }
+
+    void to(Device device, DType dtype = DType::Float32) {
+        token_emb.to(device, dtype);
+        for (auto& block : blocks) {
+            block->to(device, dtype);
+        }
+        rms_f.to(device, dtype);
+        if (cos_freqs && cos_freqs->device != device) {
+            cos_freqs = cos_freqs->to(device, dtype);
+        }
+        if (sin_freqs && sin_freqs->device != device) {
+            sin_freqs = sin_freqs->to(device, dtype);
+        }
+    }
+
+    void cuda() { to(Device::CUDA); }
+    void mps()  { to(Device::MPS); }
+    void cpu()  { to(Device::CPU); }
 };

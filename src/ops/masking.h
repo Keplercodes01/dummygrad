@@ -309,6 +309,9 @@ inline std::shared_ptr<Tensor> create_padding_mask(const std::shared_ptr<Tensor>
 // -------------------------------------------------------------
 inline std::shared_ptr<Tensor> document_causal_mask(const std::shared_ptr<Tensor>& doc_ids) {
     int ndim = doc_ids->ndim();
+    if (ndim != 1 && ndim != 2) {
+        throw std::invalid_argument("document_causal_mask requires doc_ids to be 1D [seq_len] or 2D [batch, seq_len]");
+    }
     int batch_size = (ndim == 2) ? doc_ids->shape[0] : 1;
     int seq_len = doc_ids->shape[ndim - 1];
 

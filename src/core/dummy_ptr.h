@@ -86,4 +86,11 @@ public:
     explicit operator bool() const noexcept {
         return _ptr != nullptr; 
     }
+
+    bool operator==(const dummy_ptr& other) const noexcept { return _ptr == other._ptr; }
+    bool operator!=(const dummy_ptr& other) const noexcept { return _ptr != other._ptr; }
+    bool operator==(const T* p) const noexcept { return _ptr == p; }
+    bool operator!=(const T* p) const noexcept { return _ptr != p; }
+    bool operator==(std::nullptr_t) const noexcept { return _ptr == nullptr; }
+    bool operator!=(std::nullptr_t) const noexcept { return _ptr != nullptr; }
 };

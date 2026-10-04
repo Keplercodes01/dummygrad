@@ -6,7 +6,18 @@
 inline void SGD(const std::shared_ptr<Tensor>& param, const float& lr) {
     if (!param || !param->grad) return;
     if (param->device != Device::CPU && param->device != Device::MPS) {
-        throw std::runtime_error("SGD is currently supported only for CPU and MPS (unified memory) tensors.");
+        auto p_cpu = param->to(Device::CPU);
+        auto g_cpu = param->grad->to(Device::CPU);
+        SGD(p_cpu, lr);
+        auto p_dev = p_cpu->to(param->device);
+#ifdef USE_CUDA
+        if (param->device == Device::CUDA) {
+            cudaMemcpy(param->data_ptr<void>(), p_dev->data_ptr<void>(), param->size() * sizeof(float), cudaMemcpyDeviceToDevice);
+            return;
+        }
+#endif
+        std::memcpy(param->data_ptr<void>(), p_cpu->data_ptr<void>(), param->size() * sizeof(float));
+        return;
     }
     float* data = param->data_ptr<float>();
     const float* grad = param->grad->data_ptr<float>();

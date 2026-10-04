@@ -88,23 +88,45 @@ inline void all_reduce_gradients_p2p(
     if (world_size <= 1) return;
 
     auto& mesh = DeviceMesh::get();
+    static std::mutex p2p_reduce_mutex;
 
-    for (size_t i = 0; i < params.size() && i < root_params.size(); ++i) {
-        auto& p = params[i];
-        auto& root_p = root_params[i];
-        if (!p || !p->grad || !root_p || !root_p->grad) continue;
-        int64_t size = p->grad->size();
-        float* grad_ptr = p->grad->data_ptr<float>();
-        float* root_grad_ptr = root_p->grad->data_ptr<float>();
+    // 1. Accumulate peer gradients into Rank 0 with synchronization lock
+    {
+        std::lock_guard<std::mutex> lock(p2p_reduce_mutex);
+        for (size_t i = 0; i < params.size() && i < root_params.size(); ++i) {
+            auto& p = params[i];
+            auto& root_p = root_params[i];
+            if (!p || !p->grad || !root_p || !root_p->grad) continue;
+            int64_t size = p->grad->size();
+            float* grad_ptr = p->grad->data_ptr<float>();
+            float* root_grad_ptr = root_p->grad->data_ptr<float>();
 
-        // If direct P2P is enabled between GPUs
-        if (mesh.p2p_matrix[0][rank] && rank != 0) {
-            // Asynchronously transfer gradients to Rank 0 over NVLink / PCIe
-            CUDA_CHECK(cudaMemcpyPeerAsync(root_grad_ptr, 0, grad_ptr, rank, size * sizeof(float), mesh.streams[rank]));
+            if (mesh.p2p_matrix[0][rank] && rank != 0) {
+                std::vector<float> h_grad(size);
+                CUDA_CHECK(cudaMemcpy(h_grad.data(), grad_ptr, size * sizeof(float), cudaMemcpyDeviceToHost));
+                std::vector<float> h_root(size);
+                CUDA_CHECK(cudaMemcpy(h_root.data(), root_grad_ptr, size * sizeof(float), cudaMemcpyDeviceToHost));
+                for (int64_t j = 0; j < size; ++j) {
+                    h_root[j] += h_grad[j];
+                }
+                CUDA_CHECK(cudaMemcpy(root_grad_ptr, h_root.data(), size * sizeof(float), cudaMemcpyHostToDevice));
+            }
         }
     }
 
     CUDA_CHECK(cudaStreamSynchronize(mesh.streams[rank]));
+
+    // 2. Broadcast reduced gradients from Rank 0 back to peer replica
+    if (rank != 0) {
+        for (size_t i = 0; i < params.size() && i < root_params.size(); ++i) {
+            auto& p = params[i];
+            auto& root_p = root_params[i];
+            if (!p || !p->grad || !root_p || !root_p->grad) continue;
+            int64_t size = p->grad->size();
+            CUDA_CHECK(cudaMemcpy(p->grad->data_ptr<float>(), root_p->grad->data_ptr<float>(),
+                                  size * sizeof(float), cudaMemcpyDeviceToDevice));
+        }
+    }
 }
 
 inline void all_reduce_gradients_p2p(const std::vector<std::shared_ptr<Tensor>>& params, int rank, int world_size) {
@@ -177,4 +199,23 @@ public:
     }
 };
 
+#else
+// CPU fallback stubs when CUDA is not enabled
+inline void all_reduce_gradients_p2p(
+    const std::vector<std::shared_ptr<Tensor>>& params,
+    const std::vector<std::shared_ptr<Tensor>>& root_params,
+    int rank, int world_size
+) {
+    if (world_size <= 1) return;
+    for (size_t i = 0; i < params.size() && i < root_params.size(); ++i) {
+        if (!params[i] || !params[i]->grad || !root_params[i] || !root_params[i]->grad) continue;
+        if (params[i] != root_params[i]) {
+            tensor_add_inplace(root_params[i]->grad, params[i]->grad);
+        }
+    }
+}
+
+inline void all_reduce_gradients_p2p(const std::vector<std::shared_ptr<Tensor>>& params, int rank, int world_size) {
+    all_reduce_gradients_p2p(params, params, rank, world_size);
+}
 #endif

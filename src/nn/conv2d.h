@@ -4,6 +4,14 @@
 
 inline std::shared_ptr<Tensor> conv2d(const std::shared_ptr<Tensor>& x, const std::shared_ptr<Tensor>& weight, 
                                       int stride = 1, int padding = 0) {
+    if (!x || !weight) throw std::runtime_error("conv2d: input or weight is null");
+    if (x->ndim() != 4) throw std::runtime_error("conv2d: x must be a 4D tensor (B, C_in, H, W)");
+    if (weight->ndim() != 4) throw std::runtime_error("conv2d: weight must be a 4D tensor (C_out, C_in, kH, kW)");
+    if (x->shape[1] != weight->shape[1]) throw std::runtime_error("conv2d: input channels mismatch between x and weight");
+    if (stride <= 0) throw std::runtime_error("conv2d: stride must be > 0");
+    if (padding < 0) throw std::runtime_error("conv2d: padding must be >= 0");
+    if (x->device != weight->device) throw std::runtime_error("conv2d: devices mismatch between x and weight");
+
     // x: [B, C_in, H, W]
     // weight: [C_out, C_in, kH, kW]
     

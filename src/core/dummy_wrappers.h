@@ -1,7 +1,7 @@
 #pragma once 
 
-#include "linear.h"
-#include "layernorm.h"
-#include "embedding.h"
-#include "attention.h"
-#include "transformer.h"
+#include "nn/linear.h"
+#include "nn/layernorm.h"
+#include "nn/embedding.h"
+#include "nn/attention.h"
+#include "models/transformer.h"

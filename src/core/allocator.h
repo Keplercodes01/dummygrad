@@ -20,6 +20,7 @@ private:
     size_t round_up(size_t bytes) { return (bytes + 63) & ~63; }
 public:
     static CPUCachingAllocator& get() { static CPUCachingAllocator instance; return instance; }
+    ~CPUCachingAllocator() override { empty_cache(); }
     void* allocate(size_t bytes) override;
     void free(void* ptr, size_t bytes) override;
     void empty_cache() override;
@@ -32,6 +33,7 @@ private:
     size_t round_up(size_t bytes) { return (bytes + 511) & ~511; }
 public:
     static CUDACachingAllocator& get() { static CUDACachingAllocator instance; return instance; }
+    ~CUDACachingAllocator() override { empty_cache(); }
     void* allocate(size_t bytes) override;
     void free(void* ptr, size_t bytes) override;
     void empty_cache() override;
@@ -52,7 +54,9 @@ public:
     void reset();
     bool contains(void* ptr) const {
         if (!base_ptr || !ptr) return false;
-        return ptr >= base_ptr && ptr < static_cast<const char*>(base_ptr) + capacity;
+        auto p = reinterpret_cast<uintptr_t>(ptr);
+        auto b = reinterpret_cast<uintptr_t>(base_ptr);
+        return p >= b && p < b + capacity;
     }
     ~CUDAScratchpadArena();
 };

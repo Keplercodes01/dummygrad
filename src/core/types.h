@@ -46,13 +46,13 @@ static inline float half_bits_to_float(uint16_t h) {
         if (frac == 0) {
             f = sign;
         } else {
-            exp = 1;
+            exp = 0;
             while ((frac & 0x0400) == 0) {
                 frac <<= 1;
                 exp++;
             }
             frac &= 0x03ff;
-            exp = 127 - 15 - exp + 1;
+            exp = 127 - 14 - exp;
             f = sign | (exp << 23) | (frac << 13);
         }
     } else if (exp == 31) {
@@ -68,6 +68,10 @@ static inline float half_bits_to_float(uint16_t h) {
 static inline uint16_t float_to_bfloat16_bits(float val) {
     uint32_t f;
     std::memcpy(&f, &val, sizeof(float));
+    // Preserve NaN without adding rounding bias
+    if ((f & 0x7f800000) == 0x7f800000 && (f & 0x007fffff) != 0) {
+        return static_cast<uint16_t>((f >> 16) | 0x0040);
+    }
     uint32_t lsb = (f >> 16) & 1;
     uint32_t rounding_bias = 0x7fff + lsb;
     f += rounding_bias;
@@ -84,7 +88,7 @@ static inline float bfloat16_bits_to_float(uint16_t b) {
 struct float16 { 
     uint16_t bits; 
     float16() : bits(0) {}
-    explicit float16(float f) : bits(float_to_half_bits(f)) {}
+    float16(float f) : bits(float_to_half_bits(f)) {}
     operator float() const { return half_bits_to_float(bits); }
 
     float16& operator+=(const float16& rhs) { *this = float16((float)*this + (float)rhs); return *this; }
@@ -92,14 +96,23 @@ struct float16 {
     float16& operator*=(const float16& rhs) { *this = float16((float)*this * (float)rhs); return *this; }
     float16& operator/=(const float16& rhs) { *this = float16((float)*this / (float)rhs); return *this; }
 
-    bool operator==(const float16& rhs) const { return bits == rhs.bits; }
-    bool operator!=(const float16& rhs) const { return bits != rhs.bits; }
+    bool operator==(const float16& rhs) const { return (float)*this == (float)rhs; }
+    bool operator!=(const float16& rhs) const { return (float)*this != (float)rhs; }
+    bool operator<(const float16& rhs) const { return (float)*this < (float)rhs; }
+    bool operator<=(const float16& rhs) const { return (float)*this <= (float)rhs; }
+    bool operator>(const float16& rhs) const { return (float)*this > (float)rhs; }
+    bool operator>=(const float16& rhs) const { return (float)*this >= (float)rhs; }
 };
+
+inline float16 operator+(float16 a, float16 b) { return float16((float)a + (float)b); }
+inline float16 operator-(float16 a, float16 b) { return float16((float)a - (float)b); }
+inline float16 operator*(float16 a, float16 b) { return float16((float)a * (float)b); }
+inline float16 operator/(float16 a, float16 b) { return float16((float)a / (float)b); }
 
 struct bfloat16 { 
     uint16_t bits; 
     bfloat16() : bits(0) {}
-    explicit bfloat16(float f) : bits(float_to_bfloat16_bits(f)) {}
+    bfloat16(float f) : bits(float_to_bfloat16_bits(f)) {}
     operator float() const { return bfloat16_bits_to_float(bits); }
 
     bfloat16& operator+=(const bfloat16& rhs) { *this = bfloat16((float)*this + (float)rhs); return *this; }
@@ -107,15 +120,24 @@ struct bfloat16 {
     bfloat16& operator*=(const bfloat16& rhs) { *this = bfloat16((float)*this * (float)rhs); return *this; }
     bfloat16& operator/=(const bfloat16& rhs) { *this = bfloat16((float)*this / (float)rhs); return *this; }
 
-    bool operator==(const bfloat16& rhs) const { return bits == rhs.bits; }
-    bool operator!=(const bfloat16& rhs) const { return bits != rhs.bits; }
+    bool operator==(const bfloat16& rhs) const { return (float)*this == (float)rhs; }
+    bool operator!=(const bfloat16& rhs) const { return (float)*this != (float)rhs; }
+    bool operator<(const bfloat16& rhs) const { return (float)*this < (float)rhs; }
+    bool operator<=(const bfloat16& rhs) const { return (float)*this <= (float)rhs; }
+    bool operator>(const bfloat16& rhs) const { return (float)*this > (float)rhs; }
+    bool operator>=(const bfloat16& rhs) const { return (float)*this >= (float)rhs; }
 };
 
-#define Dispatch_DType(type, MATH_CODE) \
+inline bfloat16 operator+(bfloat16 a, bfloat16 b) { return bfloat16((float)a + (float)b); }
+inline bfloat16 operator-(bfloat16 a, bfloat16 b) { return bfloat16((float)a - (float)b); }
+inline bfloat16 operator*(bfloat16 a, bfloat16 b) { return bfloat16((float)a * (float)b); }
+inline bfloat16 operator/(bfloat16 a, bfloat16 b) { return bfloat16((float)a / (float)b); }
+
+#define Dispatch_DType(type, ...) \
     switch(type) { \
-        case DType::Float32:  { using scalar_type = float; MATH_CODE; break; } \
-        case DType::Float16:  { using scalar_type = float16; MATH_CODE; break; } \
-        case DType::BFloat16: { using scalar_type = bfloat16; MATH_CODE; break; } \
-        case DType::Int8:     { using scalar_type = int8_t; MATH_CODE; break; } \
+        case DType::Float32:  { using scalar_type = float; __VA_ARGS__; break; } \
+        case DType::Float16:  { using scalar_type = float16; __VA_ARGS__; break; } \
+        case DType::BFloat16: { using scalar_type = bfloat16; __VA_ARGS__; break; } \
+        case DType::Int8:     { using scalar_type = int8_t; __VA_ARGS__; break; } \
         default: throw std::runtime_error("Unsupported dtype"); \
     }

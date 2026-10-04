@@ -61,10 +61,15 @@ public:
           ln_f(cfg.d_model),
           action_head(cfg.d_model, cfg.action_dim) {
         
+        if (cfg.n_layers <= 0) throw std::invalid_argument("MARS: n_layers must be > 0");
+        if (cfg.n_heads <= 0) throw std::invalid_argument("MARS: n_heads must be > 0");
+        if (cfg.d_model <= 0 || cfg.d_model % cfg.n_heads != 0) throw std::invalid_argument("MARS: d_model must be positive and divisible by n_heads");
+        if (cfg.action_dim <= 0) throw std::invalid_argument("MARS: action_dim must be > 0");
+
         int d_ff_dim = (cfg.d_ff > 0) ? cfg.d_ff : (4 * cfg.d_model);
 
         for (int i = 0; i < cfg.n_layers; i++) {
-            auto block = std::make_shared<TransformerBlock>(cfg.d_model, cfg.n_heads, cfg.causal);
+            auto block = std::make_shared<TransformerBlock>(cfg.d_model, cfg.n_heads, cfg.causal, d_ff_dim);
             // Residual projection scaling at initialization (stabilizes deep transformer scaling)
             float scale = 1.0f / std::sqrt(2.0f * cfg.n_layers);
 
@@ -95,6 +100,9 @@ public:
         if (!actions) {
             throw std::runtime_error("MARS::forward received null actions tensor");
         }
+        if (actions->ndim() != 2 && actions->ndim() != 3) {
+            throw std::invalid_argument("MARS::forward: actions must be 2D [T, action_dim] or 3D [B, T, action_dim]");
+        }
 
         bool is_2d = (actions->ndim() == 2);
         auto x_in = actions;
@@ -118,14 +126,17 @@ public:
         // 1. Encode continuous action tokens into latent space: [B, T, d_model]
         auto h = action_encoder.forward(x_in);
 
-        // 2. Generate frame position indices [0, 1, ..., T-1]
-        auto pos_ids = std::make_shared<Tensor>(std::vector<int64_t>{T}, actions->device, DType::Float32, false);
-        float* p_ptr = pos_ids->data_ptr<float>();
-        for (int i = 0; i < T; i++) {
-            p_ptr[i] = static_cast<float>(i);
+        // 2. Generate frame position indices [0, 1, ..., T-1] safely on CPU
+        auto pos_ids_cpu = std::make_shared<Tensor>(std::vector<int64_t>{B, T}, Device::CPU, DType::Float32, false);
+        float* p_ptr = pos_ids_cpu->data_ptr<float>();
+        for (int b = 0; b < B; b++) {
+            for (int t = 0; t < T; t++) {
+                p_ptr[b * T + t] = static_cast<float>(t);
+            }
         }
+        auto pos_ids = (actions->device != Device::CPU) ? pos_ids_cpu->to(actions->device) : pos_ids_cpu;
 
-        // 3. Positional Embedding lookup [T, d_model] and residual addition
+        // 3. Positional Embedding lookup [B, T, d_model] and residual addition
         auto pos_h = pos_emb.forward(pos_ids);
         h = add(h, pos_h);
 
@@ -176,6 +187,8 @@ public:
     std::shared_ptr<Tensor> compute_loss(const std::shared_ptr<Tensor>& inputs,
                                          const std::shared_ptr<Tensor>& targets,
                                          const std::string& loss_type = "mse") {
+        if (!inputs || !targets) throw std::invalid_argument("compute_loss: inputs and targets cannot be null");
+        if (inputs->shape != targets->shape) throw std::invalid_argument("compute_loss: inputs and targets shape mismatch");
         auto preds = forward(inputs);
         if (loss_type == "l1" || loss_type == "mae") {
             return l1_loss(preds, targets);
@@ -184,7 +197,7 @@ public:
     }
 
     // Autoregressive Rollout:
-    // Given an initial sequence of seed frames [1, T_seed, action_dim] (or [T_seed, action_dim]),
+    // Given an initial sequence of seed frames [B, T_seed, action_dim] (or [T_seed, action_dim]),
     // iteratively predicts and appends n_steps future frames into the trajectory.
     std::shared_ptr<Tensor> rollout(const std::shared_ptr<Tensor>& seed_frames, int n_steps) {
         if (!seed_frames) throw std::runtime_error("rollout: null seed_frames");
@@ -205,10 +218,16 @@ public:
             auto preds = forward(model_input);
             int T_in = model_input->shape[1];
 
-            // Slice out the final predicted frame: [1, 1, action_dim]
+            // Slice out the final predicted frame: [B, 1, action_dim]
             auto next_frame = slice(preds, 1, T_in - 1, T_in);
 
-            // Concatenate along the temporal sequence dimension (axis 0 in concat)
+            // Detach to prevent autograd graph accumulation and memory explosion during rollout
+            next_frame->requires_grad = false;
+            next_frame->grad_fn = nullptr;
+            current_traj->requires_grad = false;
+            current_traj->grad_fn = nullptr;
+
+            // Concatenate along the temporal sequence dimension (axis 0 in concat for 3D tensors)
             current_traj = concat(current_traj, next_frame, 0);
         }
 
@@ -291,30 +310,32 @@ public:
 
     // Load model weights directly from SafeTensors checkpoint
     void load_safetensors(const std::string& filepath) {
-        auto loaded = io::load_safetensors(filepath);
+        auto loaded = io::load_safetensors(filepath, action_encoder.W->device);
         auto named = named_parameters();
         for (const auto& [name, src_tensor] : loaded) {
             auto it = named.find(name);
-            if (it != named.end()) {
+            if (it != named.end() && it->second && src_tensor) {
                 auto dst_tensor = it->second;
                 if (dst_tensor->size() == src_tensor->size()) {
-                    std::memcpy(dst_tensor->data_ptr<float>(),
-                                src_tensor->data_ptr<float>(),
-                                src_tensor->size() * sizeof(float));
+                    auto converted = (src_tensor->device != dst_tensor->device || src_tensor->dtype != dst_tensor->dtype)
+                                     ? src_tensor->to(dst_tensor->device, dst_tensor->dtype) : src_tensor;
+                    dst_tensor->storage = converted->storage;
+                    dst_tensor->strides = converted->strides;
+                    dst_tensor->global_offset = converted->global_offset;
                 }
             }
         }
     }
 
     // Transfer all model parameters to target device (CPU, CUDA, MPS, TPU)
-    void to(Device dev) {
-        for (auto& p : parameters()) {
-            if (p && p->device != dev) {
-                auto moved = p->to(dev);
-                p->storage = moved->storage;
-                p->device = moved->device;
-            }
+    void to(Device dev, DType dtype = DType::Float32) {
+        action_encoder.to(dev, dtype);
+        pos_emb.to(dev, dtype);
+        for (auto& block : blocks) {
+            block->to(dev, dtype);
         }
+        ln_f.to(dev, dtype);
+        action_head.to(dev, dtype);
     }
 
     void cuda() { to(Device::CUDA); }

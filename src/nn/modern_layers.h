@@ -32,6 +32,21 @@ struct RMSNormBackward : public Node {
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
         if (grads.empty() || !grads[0] || !x || !gamma || !inv_rms) return {nullptr, nullptr};
         auto dout = grads[0];
+
+        if (x->device != Device::CPU) {
+            auto dout_cpu = dout->to(Device::CPU);
+            auto x_cpu = x->to(Device::CPU);
+            auto gamma_cpu = gamma->to(Device::CPU);
+            auto inv_rms_cpu = inv_rms->to(Device::CPU);
+            RMSNormBackward cpu_node(x_cpu, gamma_cpu, inv_rms_cpu, r, c, batch_size);
+            auto cpu_grads = cpu_node.apply({dout_cpu});
+            if (cpu_grads.size() < 2) return {nullptr, nullptr};
+            return {
+                cpu_grads[0] ? cpu_grads[0]->to(x->device) : nullptr,
+                cpu_grads[1] ? cpu_grads[1]->to(gamma->device) : nullptr
+            };
+        }
+
         auto dx = std::make_shared<Tensor>(x->shape, x->device, x->dtype, false); dx->fill_(0.0f);
         auto dg = std::make_shared<Tensor>(gamma->shape, gamma->device, gamma->dtype, false); dg->fill_(0.0f);
 
@@ -85,10 +100,36 @@ public:
     }
 
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x) {
+        if (!x) throw std::runtime_error("RMSNorm: input tensor is null");
         int ndim = x->ndim();
+        if (ndim < 1) throw std::runtime_error("RMSNorm: input tensor must be at least 1D");
         int c = x->shape[ndim - 1];
+        if (c != gamma->shape[0]) {
+            throw std::runtime_error("RMSNorm: feature dimension mismatch, expected " +
+                                     std::to_string(gamma->shape[0]) + " but got " + std::to_string(c));
+        }
         int r = (ndim >= 2) ? x->shape[ndim - 2] : 1;
         int batch_size = x->size() / (r * c);
+
+        if (x->device != Device::CPU) {
+            auto x_cpu = x->to(Device::CPU);
+            auto gamma_cpu = gamma->to(Device::CPU);
+            RMSNorm norm_cpu(gamma->shape[0], eps);
+            norm_cpu.gamma = gamma_cpu;
+            auto out_cpu = norm_cpu.forward(x_cpu);
+            auto out_res = out_cpu->to(x->device);
+            if (x->requires_grad) {
+                auto grad_fn = std::make_shared<RMSNormBackward>(
+                    x, gamma,
+                    std::static_pointer_cast<RMSNormBackward>(out_cpu->grad_fn)->inv_rms->to(x->device),
+                    r, c, batch_size
+                );
+                grad_fn->add_next_edge(get_grad_edge(x).function, 0);
+                grad_fn->add_next_edge(get_grad_edge(gamma).function, 1);
+                out_res->grad_fn = grad_fn;
+            }
+            return out_res;
+        }
 
         auto out = std::make_shared<Tensor>(x->shape, x->device, x->dtype, x->requires_grad);
         auto inv_rms = std::make_shared<Tensor>(std::vector<int64_t>{batch_size * r}, x->device, x->dtype, false);
@@ -128,6 +169,11 @@ public:
 
     std::vector<std::shared_ptr<Tensor>> parameters() const {
         return {gamma};
+    }
+
+    void to(Device device, DType dtype = DType::Float32) {
+        gamma = gamma->to(device, dtype);
+        gamma->requires_grad = true;
     }
 };
 
@@ -183,6 +229,18 @@ struct RoPEBackward : public Node {
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
         if (grads.empty() || !grads[0] || !x || !cos_freqs || !sin_freqs) return {nullptr};
         auto dout = grads[0];
+
+        if (x->device != Device::CPU) {
+            auto dout_cpu = dout->to(Device::CPU);
+            auto x_cpu = x->to(Device::CPU);
+            auto cos_cpu = cos_freqs->to(Device::CPU);
+            auto sin_cpu = sin_freqs->to(Device::CPU);
+            RoPEBackward cpu_node(x_cpu, cos_cpu, sin_cpu, start_pos, batch_size, seq_len, n_heads, head_dim);
+            auto cpu_grads = cpu_node.apply({dout_cpu});
+            if (cpu_grads.empty() || !cpu_grads[0]) return {nullptr};
+            return {cpu_grads[0]->to(x->device)};
+        }
+
         auto dx = std::make_shared<Tensor>(x->shape, x->device, x->dtype, false);
 
         const float* dout_ptr = dout->data_ptr<float>();
@@ -228,7 +286,9 @@ inline std::shared_ptr<Tensor> apply_rotary_emb(
     const std::shared_ptr<Tensor>& sin_freqs,
     int start_pos = 0
 ) {
+    if (!x || !cos_freqs || !sin_freqs) throw std::runtime_error("apply_rotary_emb: null tensor passed");
     int ndim = x->ndim();
+    if (ndim < 2) throw std::runtime_error("apply_rotary_emb: tensor must be at least 2D (seq_len, head_dim)");
     int head_dim = x->shape[ndim - 1];
     int n_heads = (ndim == 4) ? x->shape[2] : 1;
     int seq_len = (ndim >= 2) ? x->shape[ndim - 2 - (ndim == 4 ? 1 : 0)] : 1;
@@ -236,6 +296,21 @@ inline std::shared_ptr<Tensor> apply_rotary_emb(
 
     if (head_dim % 2 != 0) {
         throw std::invalid_argument("RoPE head dimension must be even, got: " + std::to_string(head_dim));
+    }
+
+    if (x->device != Device::CPU) {
+        auto x_cpu = x->to(Device::CPU);
+        auto cos_cpu = cos_freqs->to(Device::CPU);
+        auto sin_cpu = sin_freqs->to(Device::CPU);
+        auto out_cpu = apply_rotary_emb(x_cpu, cos_cpu, sin_cpu, start_pos);
+        auto out_res = out_cpu->to(x->device);
+        if (x->requires_grad) {
+            auto grad_fn = std::make_shared<RoPEBackward>(x, cos_freqs, sin_freqs, start_pos,
+                                                          batch_size, seq_len, n_heads, head_dim);
+            grad_fn->add_next_edge(get_grad_edge(x).function, 0);
+            out_res->grad_fn = grad_fn;
+        }
+        return out_res;
     }
 
     auto out = std::make_shared<Tensor>(x->shape, x->device, x->dtype, x->requires_grad);
@@ -316,6 +391,12 @@ public:
         p.insert(p.end(), p_down.begin(), p_down.end());
         return p;
     }
+
+    void to(Device device, DType dtype = DType::Float32) {
+        w_gate.to(device, dtype);
+        w_up.to(device, dtype);
+        w_down.to(device, dtype);
+    }
 };
 
 // ============================================================================
@@ -335,19 +416,24 @@ inline float clip_grad_norm_(
     float total_norm_sq = 0.0f;
     for (const auto& p : parameters) {
         if (p && p->grad) {
+            if (p->grad->device == Device::CPU) {
+                const float* g = p->grad->data_ptr<float>();
+                int n = p->grad->size();
+                for (int i = 0; i < n; i++) total_norm_sq += g[i] * g[i];
+            }
 #ifdef USE_CUDA
-            if (p->grad->device == Device::CUDA) {
+            else if (p->grad->device == Device::CUDA) {
                 int n = p->grad->size();
                 std::vector<float> h_g(n);
                 cudaMemcpy(h_g.data(), p->grad->data_ptr<float>(), n * sizeof(float), cudaMemcpyDeviceToHost);
                 for (int i = 0; i < n; i++) total_norm_sq += h_g[i] * h_g[i];
-                continue;
             }
 #endif
-            const float* g = p->grad->data_ptr<float>();
-            int n = p->grad->size();
-            for (int i = 0; i < n; i++) {
-                total_norm_sq += g[i] * g[i];
+            else {
+                auto g_cpu = p->grad->to(Device::CPU);
+                const float* g = g_cpu->data_ptr<float>();
+                int n = g_cpu->size();
+                for (int i = 0; i < n; i++) total_norm_sq += g[i] * g[i];
             }
         }
     }
@@ -359,20 +445,26 @@ inline float clip_grad_norm_(
         float scale = max_norm / (total_norm + 1e-6f);
         for (const auto& p : parameters) {
             if (p && p->grad) {
+                if (p->grad->device == Device::CPU) {
+                    float* g = p->grad->data_ptr<float>();
+                    int n = p->grad->size();
+                    for (int i = 0; i < n; i++) g[i] *= scale;
+                }
 #ifdef USE_CUDA
-                if (p->grad->device == Device::CUDA) {
+                else if (p->grad->device == Device::CUDA) {
                     int n = p->grad->size();
                     std::vector<float> h_g(n);
                     cudaMemcpy(h_g.data(), p->grad->data_ptr<float>(), n * sizeof(float), cudaMemcpyDeviceToHost);
                     for (int i = 0; i < n; i++) h_g[i] *= scale;
                     cudaMemcpy(p->grad->data_ptr<float>(), h_g.data(), n * sizeof(float), cudaMemcpyHostToDevice);
-                    continue;
                 }
 #endif
-                float* g = p->grad->data_ptr<float>();
-                int n = p->grad->size();
-                for (int i = 0; i < n; i++) {
-                    g[i] *= scale;
+                else {
+                    auto g_cpu = p->grad->to(Device::CPU);
+                    float* g = g_cpu->data_ptr<float>();
+                    int n = g_cpu->size();
+                    for (int i = 0; i < n; i++) g[i] *= scale;
+                    p->grad = g_cpu->to(p->grad->device);
                 }
             }
         }

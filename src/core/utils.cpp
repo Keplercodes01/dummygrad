@@ -3,7 +3,7 @@
 
 std::vector<int64_t> make_strides(const std::vector<int64_t>& shape) {
     int64_t ndim = (int64_t)shape.size();
-    assert(ndim > 0 && "make_strides: shape cannot be empty");
+    if (ndim == 0) return {};
     std::vector<int64_t> st(ndim);
     st[ndim - 1] = 1; 
     for (int64_t i = ndim - 2; i >= 0; i--) 
