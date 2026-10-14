@@ -1007,6 +1007,12 @@ inline std::shared_ptr<Tensor> cast_n_mul(const std::shared_ptr<Tensor>& x,
     return out;
 }
 
+// Intelligent elementwise / broadcast multiplication
+inline std::shared_ptr<Tensor> mul(const std::shared_ptr<Tensor>& x,
+                                   const std::shared_ptr<Tensor>& y) {
+    return cast_n_mul(x, y);
+}
+
 // --- CAST DIV BACKWARD NODE ---
 struct CastDivBackward : public Node {
     std::shared_ptr<Tensor> x, y;
