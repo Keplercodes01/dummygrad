@@ -12,13 +12,21 @@
 #include "tpu/tpu_runner.h"
 
 #if defined(USE_BLAS) || defined(USE_OPENBLAS) || defined(USE_MKL)
-    #define BFLOAT16 1
-    #define bfloat16 openblas_bfloat16
-    #include <cblas.h>
-    #undef bfloat16
-    #define HAS_BLAS 1
+extern "C" {
+    #ifndef CBLAS_ENUM_DEFINED
+    #define CBLAS_ENUM_DEFINED
+    typedef enum { CblasRowMajor=101, CblasColMajor=102 } CBLAS_LAYOUT;
+    typedef enum { CblasNoTrans=111, CblasTrans=112, CblasConjTrans=113 } CBLAS_TRANSPOSE;
+    #endif
+    void cblas_sgemm(CBLAS_LAYOUT layout, CBLAS_TRANSPOSE TransA,
+                     CBLAS_TRANSPOSE TransB, const int M, const int N,
+                     const int K, const float alpha, const float *A,
+                     const int lda, const float *B, const int ldb,
+                     const float beta, float *C, const int ldc);
+}
+#define HAS_BLAS 1
 #else
-    #define HAS_BLAS 0
+#define HAS_BLAS 0
 #endif
 
 // ========================================
