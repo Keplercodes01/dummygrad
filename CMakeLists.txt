@@ -19,18 +19,23 @@ set(DUMMYGRAD_SOURCES
     src/backends/tpu/pjrt_client.cpp
 )
 
-# Detect and configure CUDA for GPU execution (e.g. Google Colab / Linux GPU)
-include(CheckLanguage)
-check_language(CUDA)
+# Detect and configure CUDA for GPU execution
+option(ENABLE_CUDA "Enable NVIDIA CUDA GPU acceleration" ON)
 
-if(CMAKE_CUDA_COMPILER)
-    enable_language(CUDA)
-    set(CMAKE_CUDA_STANDARD 17)
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --use_fast_math")
-    list(APPEND DUMMYGRAD_SOURCES src/backends/cuda/cuda_ops.cu)
-    message(STATUS "CUDA found: ${CMAKE_CUDA_COMPILER}. Building with GPU support.")
+if(ENABLE_CUDA)
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(CMAKE_CUDA_COMPILER)
+        enable_language(CUDA)
+        set(CMAKE_CUDA_STANDARD 17)
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --use_fast_math")
+        list(APPEND DUMMYGRAD_SOURCES src/backends/cuda/cuda_ops.cu)
+        message(STATUS "CUDA found: ${CMAKE_CUDA_COMPILER}. Building with GPU support.")
+    else()
+        message(STATUS "CUDA compiler not found. Building CPU-only.")
+    endif()
 else()
-    message(STATUS "CUDA not found. Building CPU-only.")
+    message(STATUS "CUDA disabled by user (ENABLE_CUDA=OFF). Building CPU-only.")
 endif()
 
 # Build engine static library
@@ -55,7 +60,7 @@ if(BLAS_FOUND)
 endif()
 
 # Link CUDA libraries when CUDA is enabled
-if(CMAKE_CUDA_COMPILER)
+if(ENABLE_CUDA AND CMAKE_CUDA_COMPILER)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(dummygrad_engine PRIVATE CUDA::cudart CUDA::cublas)
     target_compile_definitions(dummygrad_engine PUBLIC USE_CUDA=1)
