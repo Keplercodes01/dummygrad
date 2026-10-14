@@ -12,7 +12,10 @@
 #include "tpu/tpu_runner.h"
 
 #if defined(USE_BLAS) || defined(USE_OPENBLAS) || defined(USE_MKL)
+    #define BFLOAT16 1
+    #define bfloat16 openblas_bfloat16
     #include <cblas.h>
+    #undef bfloat16
     #define HAS_BLAS 1
 #else
     #define HAS_BLAS 0
