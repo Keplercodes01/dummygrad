@@ -73,8 +73,14 @@ if(APPLE)
     message(STATUS "Apple Silicon Metal & MPS configured.")
 endif()
 
-# Optional: Add an executable for testing
+# Optional: Add executables for testing
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
     add_executable(dummygrad_test src/main.cpp)
     target_link_libraries(dummygrad_test PRIVATE dummygrad_engine)
 endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/train_colab.cpp")
+    add_executable(train_colab src/train_colab.cpp)
+    target_link_libraries(train_colab PRIVATE dummygrad_engine)
+endif()
+
