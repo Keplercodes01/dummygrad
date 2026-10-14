@@ -63,6 +63,8 @@ public:
     }
 
     std::shared_ptr<Tensor> to(Device target_device, int device_id = 0);
+    std::shared_ptr<Tensor> to(Device target_device, DType target_dtype, int device_id = 0);
+    std::shared_ptr<Tensor> to(DType target_dtype);
     std::shared_ptr<Tensor> cuda() { return to(Device::CUDA); }
     std::shared_ptr<Tensor> cpu() { return to(Device::CPU); }
     std::shared_ptr<Tensor> tpu(int device_id = 0) { return to(Device::TPU, device_id); }

@@ -194,15 +194,100 @@ void Tensor::backward(bool retain_graph) {
 }
 
 std::shared_ptr<Tensor> Tensor::to(Device target_device, int device_id) {
-    if (this->device == target_device) {
+    return to(target_device, this->dtype, device_id);
+}
+
+std::shared_ptr<Tensor> Tensor::to(DType target_dtype) {
+    return to(this->device, target_dtype, 0);
+}
+
+std::shared_ptr<Tensor> Tensor::to(Device target_device, DType target_dtype, int device_id) {
+    if (this->device == target_device && this->dtype == target_dtype) {
         return shared_from_this();
     }
 
     if (!this->is_contiguous()) {
         auto contiguous_self = make_contiguous(const_cast<Tensor*>(this)->shared_from_this());
-        return contiguous_self->to(target_device, device_id);
+        return contiguous_self->to(target_device, target_dtype, device_id);
     }
 
+    // Step 1: If dtype conversion is needed and tensor is on an accelerator (CUDA/TPU/MPS),
+    // stage through CPU to perform the dtype conversion.
+    if (this->dtype != target_dtype && this->device != Device::CPU) {
+        auto host_tensor = this->to(Device::CPU, this->dtype, 0);
+        auto converted_host = host_tensor->to(Device::CPU, target_dtype, 0);
+        if (target_device == Device::CPU) {
+            return converted_host;
+        }
+        return converted_host->to(target_device, target_dtype, device_id);
+    }
+
+    // Step 2: DType conversion on CPU (same device CPU -> CPU)
+    if (this->dtype != target_dtype && this->device == Device::CPU && target_device == Device::CPU) {
+        auto out = std::make_shared<Tensor>(this->shape, Device::CPU, target_dtype, this->requires_grad);
+        int64_t n = this->size();
+        const void* src = this->data_ptr<void>();
+        void* dst = out->data_ptr<void>();
+
+        if (this->dtype == DType::Float32) {
+            const float* s = reinterpret_cast<const float*>(src);
+            if (target_dtype == DType::Float16) {
+                float16* d = reinterpret_cast<float16*>(dst);
+                for (int64_t i = 0; i < n; ++i) d[i] = float16(s[i]);
+            } else if (target_dtype == DType::BFloat16) {
+                bfloat16* d = reinterpret_cast<bfloat16*>(dst);
+                for (int64_t i = 0; i < n; ++i) d[i] = bfloat16(s[i]);
+            } else if (target_dtype == DType::Int8) {
+                int8_t* d = reinterpret_cast<int8_t*>(dst);
+                for (int64_t i = 0; i < n; ++i) d[i] = static_cast<int8_t>(s[i]);
+            }
+        } else if (this->dtype == DType::Float16) {
+            const float16* s = reinterpret_cast<const float16*>(src);
+            if (target_dtype == DType::Float32) {
+                float* d = reinterpret_cast<float*>(dst);
+                for (int64_t i = 0; i < n; ++i) d[i] = static_cast<float>(s[i]);
+            } else if (target_dtype == DType::BFloat16) {
+                bfloat16* d = reinterpret_cast<bfloat16*>(dst);
+                for (int64_t i = 0; i < n; ++i) d[i] = bfloat16(static_cast<float>(s[i]));
+            } else if (target_dtype == DType::Int8) {
+                int8_t* d = reinterpret_cast<int8_t*>(dst);
+                for (int64_t i = 0; i < n; ++i) d[i] = static_cast<int8_t>(static_cast<float>(s[i]));
+            }
+        } else if (this->dtype == DType::BFloat16) {
+            const bfloat16* s = reinterpret_cast<const bfloat16*>(src);
+            if (target_dtype == DType::Float32) {
+                float* d = reinterpret_cast<float*>(dst);
+                for (int64_t i = 0; i < n; ++i) d[i] = static_cast<float>(s[i]);
+            } else if (target_dtype == DType::Float16) {
+                float16* d = reinterpret_cast<float16*>(dst);
+                for (int64_t i = 0; i < n; ++i) d[i] = float16(static_cast<float>(s[i]));
+            } else if (target_dtype == DType::Int8) {
+                int8_t* d = reinterpret_cast<int8_t*>(dst);
+                for (int64_t i = 0; i < n; ++i) d[i] = static_cast<int8_t>(static_cast<float>(s[i]));
+            }
+        } else if (this->dtype == DType::Int8) {
+            const int8_t* s = reinterpret_cast<const int8_t*>(src);
+            if (target_dtype == DType::Float32) {
+                float* d = reinterpret_cast<float*>(dst);
+                for (int64_t i = 0; i < n; ++i) d[i] = static_cast<float>(s[i]);
+            } else if (target_dtype == DType::Float16) {
+                float16* d = reinterpret_cast<float16*>(dst);
+                for (int64_t i = 0; i < n; ++i) d[i] = float16(static_cast<float>(s[i]));
+            } else if (target_dtype == DType::BFloat16) {
+                bfloat16* d = reinterpret_cast<bfloat16*>(dst);
+                for (int64_t i = 0; i < n; ++i) d[i] = bfloat16(static_cast<float>(s[i]));
+            }
+        }
+        return out;
+    }
+
+    // Step 3: If dtype needs conversion and device is changing from CPU to accelerator:
+    if (this->dtype != target_dtype && this->device == Device::CPU) {
+        auto converted_host = this->to(Device::CPU, target_dtype, 0);
+        return converted_host->to(target_device, target_dtype, device_id);
+    }
+
+    // Step 4: Device transfer with matching dtype (this->dtype == target_dtype)
     auto out = std::make_shared<Tensor>(this->shape, target_device, this->dtype, this->requires_grad);
     size_t copy_bytes = this->size() * dtype_size(this->dtype);
 
@@ -240,7 +325,7 @@ std::shared_ptr<Tensor> Tensor::to(Device target_device, int device_id) {
         std::memcpy(out->data_ptr<void>(), this->data_ptr<void>(), copy_bytes);
     } else {
         // Automatically stage through host CPU memory
-        return this->to(Device::CPU)->to(target_device, device_id);
+        return this->to(Device::CPU, this->dtype, 0)->to(target_device, target_dtype, device_id);
     }
 
     return out;

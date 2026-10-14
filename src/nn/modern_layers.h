@@ -378,7 +378,7 @@ public:
         // 2. Up projection
         auto up = w_up.forward(x);
         // 3. Element-wise gated modulation
-        auto h = mul(gate, up);
+        auto h = fmul(gate, up);
         // 4. Down projection back to in_features
         return w_down.forward(h);
     }

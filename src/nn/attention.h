@@ -71,8 +71,8 @@ public:
         // Scaled dot-product attention
         float scale = 1.0f / std::sqrt(static_cast<float>(d_k));
 
-#ifdef USE_CUDA
         std::shared_ptr<Tensor> out;
+#ifdef USE_CUDA
         if (x->device == Device::CUDA && !mask) {
             auto Q_4d = make_contiguous(reshape(Q, {B, 1, S, d_k}));
             auto K_4d = make_contiguous(reshape(K, {B, 1, S, d_k}));
@@ -102,7 +102,7 @@ public:
         if (mask) scores = add(scores, mask);
         else if (causal) scores = causal_mask(scores); 
         auto weights = softmax(scores); 
-        auto out = matmul(weights, V);
+        out = matmul(weights, V);
 #endif
 
         if (is_2d) {
@@ -295,8 +295,8 @@ public:
         // Scaled dot product
         float scale = 1.0f / std::sqrt(static_cast<float>(d_k));
 
-#ifdef USE_CUDA
         std::shared_ptr<Tensor> attn_out;
+#ifdef USE_CUDA
         if (x->device == Device::CUDA && !mask) {
             auto Q_c = make_contiguous(Q_split);
             auto K_c = make_contiguous(K_split);
