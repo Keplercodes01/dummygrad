@@ -77,3 +77,36 @@ public:
 
     virtual void synchronize() = 0;
 };
+
+#ifndef USE_METAL
+inline MetalBackend& MetalBackend::get() {
+    class NullMetalBackend : public MetalBackend {
+    public:
+        bool is_available() const override { return false; }
+        std::string device_name() const override { return "Metal unavailable (built without USE_METAL)"; }
+        void* allocate_shared_buffer(size_t) override { throw std::runtime_error("MetalBackend not supported on non-Apple platform"); }
+        void free_buffer(void*, size_t) override {}
+        void matmul(const float*, const float*, float*, int64_t, int64_t, int64_t) override { throw std::runtime_error("MetalBackend not supported on non-Apple platform"); }
+        void fused_add_bias_gelu(const float*, const float*, float*, size_t, size_t) override {}
+        void fused_add_bias_relu(const float*, const float*, float*, size_t, size_t) override {}
+        void layernorm(const float*, const float*, const float*, float*, size_t, size_t, float) override {}
+        void adamw(float*, const float*, float*, float*, size_t, float, float, float, float, float, int) override {}
+        void sigmoid_forward(const float*, float*, size_t) override {}
+        void sigmoid_backward(const float*, const float*, float*, size_t) override {}
+        void silu_forward(const float*, float*, size_t) override {}
+        void silu_backward(const float*, const float*, float*, size_t) override {}
+        void leaky_relu_forward(const float*, float*, size_t, float) override {}
+        void leaky_relu_backward(const float*, const float*, float*, size_t, float) override {}
+        void mse_backward(const float*, const float*, float*, size_t, float) override {}
+        void l1_loss_backward(const float*, const float*, float*, size_t, float) override {}
+        void flash_attention(const float*, const float*, const float*, float*, size_t, size_t, size_t) override {}
+        void causal_mask(const float*, float*, size_t, size_t) override {}
+        void causal_mask_backward(const float*, float*, size_t, size_t) override {}
+        void sliding_window_mask(const float*, float*, size_t, size_t, size_t) override {}
+        void sliding_window_mask_backward(const float*, float*, size_t, size_t, size_t) override {}
+        void synchronize() override {}
+    };
+    static NullMetalBackend instance;
+    return instance;
+}
+#endif
