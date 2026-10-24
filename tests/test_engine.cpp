@@ -201,10 +201,13 @@ static std::string compare(const std::vector<float>& ref, const std::vector<floa
     if (ref.size() != got.size()) {
         return "size " + std::to_string(got.size()) + " vs expected " + std::to_string(ref.size());
     }
-    float scale = 1e-6f;
+    // Absolute floor: some gradients are exactly zero in theory (e.g. an attention key bias
+    // without RoPE, which softmax's shift invariance cancels) and both sides are rounding noise.
+    const float atol = 1e-5f;
+    float scale = 0.0f;
     for (float v : ref) scale = std::max(scale, std::fabs(v));
     for (size_t k = 0; k < ref.size(); ++k) {
-        if (!std::isfinite(got[k]) || std::fabs(ref[k] - got[k]) > rtol * scale) {
+        if (!std::isfinite(got[k]) || std::fabs(ref[k] - got[k]) > atol + rtol * scale) {
             std::ostringstream os;
             os << "element " << k << ": " << got[k] << " vs expected " << ref[k] << " (scale " << scale << ")";
             return os.str();
@@ -484,6 +487,9 @@ static std::string train_tiny_transformer(Device dev) {
     ModernTransformer model(V, 16, 32, 4, 2, 2);  // GQA: 4 query heads share 2 kv heads
     if (dev == Device::CUDA) model.cuda(); else model.cpu();
     auto params = model.parameters();
+    for (size_t i = 0; i < params.size(); ++i) {
+        if (params[i]->device != dev) return "parameter " + std::to_string(i) + " is not on " + device_name(dev);
+    }
     Adam opt(1e-2f, 0.9f, 0.999f, 1e-8f, 0.0f);
 
     // Next-token task: token i is always followed by token i + 1
@@ -498,12 +504,15 @@ static std::string train_tiny_transformer(Device dev) {
         opt.zero_grad(params);
         auto inputs = upload(in, {B, T}, dev, false);
         auto targets = upload(tg, {B, T}, dev, false);
-        auto loss = fused_cross_entropy(model.forward(inputs), targets);
+        auto logits = model.forward(inputs);
+        if (logits->device != dev) return std::string("logits computed on the wrong device");
+        auto loss = fused_cross_entropy(logits, targets);
         loss->backward();
 
         if (step == 0) {
             for (size_t i = 0; i < params.size(); ++i) {
                 if (!params[i]->grad) return "parameter " + std::to_string(i) + " received no gradient";
+                if (params[i]->grad->device != dev) return "gradient of parameter " + std::to_string(i) + " is not on " + device_name(dev);
                 double norm = 0.0;
                 for (float g : download(params[i]->grad)) norm += (double)g * g;
                 if (!(norm > 0.0) || !std::isfinite(norm)) {
