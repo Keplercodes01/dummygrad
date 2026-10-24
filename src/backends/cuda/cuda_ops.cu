@@ -1011,6 +1011,14 @@ std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& _a, const std::sha
 
     auto out = std::make_shared<Tensor>(out_shape, Device::CUDA, a->dtype, a->requires_grad || b->requires_grad);
 
+    // A shared weight (b has batch 1) multiplies every row of a: run one GEMM over a viewed as
+    // [batch * r1, c1] instead of a batched GEMM. The memory layout is identical.
+    if (batch_size_b == 1 && batch_size_a > 1) {
+        r1 *= batch_size_a;
+        batch_size_a = 1;
+        batch_size = 1;
+    }
+
     cublasHandle_t handle = get_cublas_handle();
     const float alpha = 1.0f;
     const float beta = 0.0f;
@@ -1112,6 +1120,14 @@ void matmul_backward(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Ten
     grad_a->fill_(0.0f);
     grad_b = std::make_shared<Tensor>(b_c->shape, Device::CUDA, b_c->dtype, false);
     grad_b->fill_(0.0f);
+
+    // Shared weight: dA = dC @ B^T is one GEMM over [batch * r1] rows, and dB = A^T @ dC sums over
+    // the batch inside a single GEMM whose inner dimension spans every row
+    if (batch_size_b == 1 && batch_size_a > 1) {
+        r1 *= batch_size_a;
+        batch_size_a = 1;
+        batch_size = 1;
+    }
 
     cublasHandle_t handle = get_cublas_handle();
     const float alpha = 1.0f;

@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <functional>
+#include <string>
 
 // Anomaly detection: when enabled, backward checks every gradient as it is produced and throws
 // at the first NaN/Inf, naming the backward function that produced it. Costs a scan per
@@ -24,6 +25,20 @@ struct DetectAnomalyGuard {
     DetectAnomalyGuard(const DetectAnomalyGuard&) = delete;
     DetectAnomalyGuard& operator=(const DetectAnomalyGuard&) = delete;
 };
+
+// Backward profiling: when enabled, the engine runs backward nodes one at a time and synchronizes
+// the GPU around each, so every node's time is exact, and accumulates time and call counts per
+// node name (Node::name()). This serializes backward, so enable it only to find where time goes.
+struct ProfileEntry {
+    std::string name;
+    int64_t calls = 0;
+    double total_ms = 0.0;
+};
+void set_profiling(bool enabled);
+bool profiling_enabled();
+void reset_profile();
+// Entries sorted by total time, largest first
+std::vector<ProfileEntry> profile_report();
 
 class AutogradEngine {
 private:

@@ -2,6 +2,7 @@
 #include "ops.h"
 #include <unordered_map>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -13,6 +14,53 @@ static std::atomic<bool> g_detect_anomaly{false};
 
 void set_detect_anomaly(bool enabled) { g_detect_anomaly = enabled; }
 bool detect_anomaly_enabled() { return g_detect_anomaly; }
+
+static std::atomic<bool> g_profiling{false};
+static std::mutex g_profile_mutex;     // guards g_profile
+static std::mutex g_profile_serial;    // runs one node at a time while profiling
+static std::unordered_map<std::string, ProfileEntry> g_profile;
+
+void set_profiling(bool enabled) { g_profiling = enabled; }
+bool profiling_enabled() { return g_profiling; }
+
+void reset_profile() {
+    std::lock_guard<std::mutex> lock(g_profile_mutex);
+    g_profile.clear();
+}
+
+std::vector<ProfileEntry> profile_report() {
+    std::vector<ProfileEntry> out;
+    {
+        std::lock_guard<std::mutex> lock(g_profile_mutex);
+        for (const auto& kv : g_profile) out.push_back(kv.second);
+    }
+    std::sort(out.begin(), out.end(), [](const ProfileEntry& a, const ProfileEntry& b) { return a.total_ms > b.total_ms; });
+    return out;
+}
+
+static void device_sync() {
+#ifdef USE_CUDA
+    cudaDeviceSynchronize();
+#endif
+}
+
+// Runs node.apply, timing it when profiling is on.
+static std::vector<std::shared_ptr<Tensor>> apply_node(Node& node, const std::vector<std::shared_ptr<Tensor>>& incoming) {
+    if (!g_profiling) return node.apply(incoming);
+    std::lock_guard<std::mutex> serial(g_profile_serial);
+    device_sync();
+    auto t0 = std::chrono::steady_clock::now();
+    auto outgoing = node.apply(incoming);
+    device_sync();
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::string name = node.name();
+    std::lock_guard<std::mutex> lock(g_profile_mutex);
+    auto& entry = g_profile[name];
+    entry.name = name;
+    entry.calls++;
+    entry.total_ms += ms;
+    return outgoing;
+}
 
 // Throws if any float gradient a node produced contains NaN or Inf.
 static void check_finite_grads(const Node& node, const std::vector<std::shared_ptr<Tensor>>& grads) {
@@ -158,7 +206,7 @@ void AutogradEngine::execute(std::shared_ptr<Node> root, const std::vector<int64
         // MULTITHREADED EXECUTION: The expensive derivative math runs here!
         std::vector<std::shared_ptr<Tensor>> outgoing;
         if (!incoming.empty() && incoming[0]) {
-            outgoing = curr->apply(incoming);
+            outgoing = apply_node(*curr, incoming);
         }
         incoming.clear();
         if (detect_anomaly_enabled()) check_finite_grads(*curr, outgoing);

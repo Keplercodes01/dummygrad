@@ -380,34 +380,42 @@ static std::vector<GradTest> build_grad_tests() {
         });
     }
 
-    // Multi-head attention: d_model 8. Leaves: x, then (W, b) for q, k, v, o.
-    auto attention_test = [&](const std::string& name, int n_heads, int n_kv_heads, bool use_rope) {
-        auto mha = std::make_shared<MultiHeadAttention>(8, n_heads, n_kv_heads, true);
-        int d_k = 8 / n_heads;
+    // Multi-head attention. Leaves: x, then (W, b) for q, k, v, o. Weights scale with 1/sqrt(d_model)
+    // so the softmax stays smooth. On CUDA, head dims 16/32/64/128 run the tiled kernels (sequence
+    // lengths here cross their tile and block boundaries); other head dims use the untiled ones.
+    auto attention_test = [&](const std::string& name, int d_model, int n_heads, int n_kv_heads, bool use_rope,
+                              int batch, int seq) {
+        auto mha = std::make_shared<MultiHeadAttention>(d_model, n_heads, n_kv_heads, true);
+        int d_k = d_model / n_heads;
         int kv_dim = mha->n_kv_heads * d_k;
-        auto freqs = precompute_freqs_cis(d_k, 8);
+        auto freqs = precompute_freqs_cis(d_k, seq);
         auto cos_h = download(freqs.first);
         auto sin_h = download(freqs.second);
         int64_t half = d_k / 2;
+        float w = 1.7f / std::sqrt((float)d_model);
         add_test(name,
-                 {leaf({2, 3, 8}),
-                  leaf({8, 8}, -0.5f, 0.5f), leaf({1, 8}, -0.5f, 0.5f),
-                  leaf({8, kv_dim}, -0.5f, 0.5f), leaf({1, kv_dim}, -0.5f, 0.5f),
-                  leaf({8, kv_dim}, -0.5f, 0.5f), leaf({1, kv_dim}, -0.5f, 0.5f),
-                  leaf({8, 8}, -0.5f, 0.5f), leaf({1, 8}, -0.5f, 0.5f)},
-                 [mha, use_rope, cos_h, sin_h, half](const Leaves& L, Device dev) {
+                 {leaf({batch, seq, d_model}),
+                  leaf({d_model, d_model}, -w, w), leaf({1, d_model}, -w, w),
+                  leaf({d_model, kv_dim}, -w, w), leaf({1, kv_dim}, -w, w),
+                  leaf({d_model, kv_dim}, -w, w), leaf({1, kv_dim}, -w, w),
+                  leaf({d_model, d_model}, -w, w), leaf({1, d_model}, -w, w)},
+                 [mha, use_rope, cos_h, sin_h, half, seq](const Leaves& L, Device dev) {
                      mha->W_q.W = L[1]; mha->W_q.b = L[2];
                      mha->W_k.W = L[3]; mha->W_k.b = L[4];
                      mha->W_v.W = L[5]; mha->W_v.b = L[6];
                      mha->W_o.W = L[7]; mha->W_o.b = L[8];
                      if (!use_rope) return mha->forward(L[0]);
                      return mha->forward(L[0], nullptr,
-                                         upload(cos_h, {8, half}, dev, false),
-                                         upload(sin_h, {8, half}, dev, false), 0);
+                                         upload(cos_h, {seq, half}, dev, false),
+                                         upload(sin_h, {seq, half}, dev, false), 0);
                  });
     };
-    attention_test("nn.MultiHeadAttention", 2, 0, false);
-    attention_test("nn.MultiHeadAttention_gqa_rope", 4, 2, true);
+    attention_test("nn.MultiHeadAttention", 8, 2, 0, false, 2, 3);
+    attention_test("nn.MultiHeadAttention_gqa_rope", 8, 4, 2, true, 2, 3);
+    attention_test("attention_d16_two_blocks", 32, 2, 0, false, 1, 70);
+    attention_test("attention_d32_gqa_rope", 128, 4, 2, true, 2, 37);
+    attention_test("attention_d64", 128, 2, 0, false, 2, 20);
+    attention_test("attention_d128_two_blocks", 256, 2, 0, false, 1, 40);
 
     // --- Shape ops ---
     add_test("concat_rows", {leaf({2, 3, 4}), leaf({2, 2, 4})},
@@ -665,6 +673,19 @@ static std::string broadcast_semantics() {
         return "";
     }
     return "incompatible shapes were accepted";
+}
+
+static std::string engine_profiler() {
+    auto x = upload({1, 2, 3, 4}, {2, 2}, Device::CPU, true);
+    reset_profile();
+    set_profiling(true);
+    scalar_sum(mul_scalar(relu(x), 2.0f))->backward();
+    set_profiling(false);
+    auto report = profile_report();
+    bool saw_scalar = false;
+    for (const auto& e : report) saw_scalar |= (e.name == "ScalarOpBackward(mul)" && e.calls == 1);
+    reset_profile();
+    return saw_scalar ? "" : "profile_report() did not record ScalarOpBackward(mul)";
 }
 
 static std::string engine_retain_graph() {
@@ -1202,6 +1223,7 @@ int main() {
     run_case(r, "engine/detect_anomaly", engine_detect_anomaly);
     run_case(r, "engine/gradcheck_rejects_wrong_backward", gradcheck_rejects_wrong_backward);
     run_case(r, "engine/broadcast_semantics", broadcast_semantics);
+    run_case(r, "engine/profiler", engine_profiler);
     run_case(r, "engine/retain_graph", engine_retain_graph);
     run_case(r, "engine/exception_propagates", engine_exception_propagates);
     run_case(r, "engine/concurrent_fanin", engine_concurrent_fanin);
