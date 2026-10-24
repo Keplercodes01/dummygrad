@@ -5,11 +5,6 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
-#include <typeinfo>
-#if defined(__GNUC__) || defined(__clang__)
-#include <cxxabi.h>
-#include <cstdlib>
-#endif
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -18,20 +13,6 @@ static std::atomic<bool> g_detect_anomaly{false};
 
 void set_detect_anomaly(bool enabled) { g_detect_anomaly = enabled; }
 bool detect_anomaly_enabled() { return g_detect_anomaly; }
-
-static std::string node_name(const Node& node) {
-    const char* mangled = typeid(node).name();
-#if defined(__GNUC__) || defined(__clang__)
-    int status = 0;
-    char* demangled = abi::__cxa_demangle(mangled, nullptr, nullptr, &status);
-    if (status == 0 && demangled) {
-        std::string name(demangled);
-        std::free(demangled);
-        return name;
-    }
-#endif
-    return mangled;
-}
 
 // Throws if any float gradient a node produced contains NaN or Inf.
 static void check_finite_grads(const Node& node, const std::vector<std::shared_ptr<Tensor>>& grads) {
@@ -43,7 +24,7 @@ static void check_finite_grads(const Node& node, const std::vector<std::shared_p
         const float* p = host->data_ptr<float>();
         for (int64_t k = 0; k < host->size(); ++k) {
             if (!std::isfinite(p[k])) {
-                throw std::runtime_error("detect_anomaly: " + node_name(node) + " produced " +
+                throw std::runtime_error("detect_anomaly: " + node.name() + " produced " +
                                          (std::isnan(p[k]) ? "NaN" : "Inf") + " in the gradient for its input " +
                                          std::to_string(i) + " (element " + std::to_string(k) + ")");
             }

@@ -59,14 +59,14 @@ namespace cuda {
 
     // ---- cuda_core_ops.cu: deterministic training-step kernels ----
 
-    // Broadcast binary ops (op: 0 add, 1 sub, 2 mul, 3 div). x is [batch, r, c]; y is
-    // [y_batch, yr, yc] with dummygrad's broadcast mapping (see broadcast_binary in functional.h).
+    // Broadcast binary ops (op: 0 add, 1 sub, 2 mul, 3 div), NumPy-style: y_shape is aligned to
+    // x_shape's rank and each y dimension is 1 or equal to x's. Output and gx have x's shape.
     void broadcast_binary_forward(int op, const float* x, const float* y, float* out,
-                                  int batch, int r, int c, int y_batch, int yr, int yc);
+                                  const std::vector<int64_t>& x_shape, const std::vector<int64_t>& y_shape);
     void broadcast_binary_backward_x(int op, const float* grad, const float* y, float* gx,
-                                     int batch, int r, int c, int y_batch, int yr, int yc);
+                                     const std::vector<int64_t>& x_shape, const std::vector<int64_t>& y_shape);
     void broadcast_binary_backward_y(int op, const float* grad, const float* x, const float* y, float* gy,
-                                     int batch, int r, int c, int y_batch, int yr, int yc);
+                                     const std::vector<int64_t>& x_shape, const std::vector<int64_t>& y_shape);
 
     // Scalar ops (op: 0 add, 1 sub, 2 mul, 3 div, 4 rsub = s - a, 5 rdiv = s / a)
     void scalar_forward(int op, const float* a, float s, float* out, int64_t n);

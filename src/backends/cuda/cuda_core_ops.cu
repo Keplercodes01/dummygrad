@@ -84,27 +84,60 @@ void reduce_terms(const Term& term, int64_t n_out, int64_t K, float* out) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Broadcast binary ops. x is [batch, r, c]; y is [y_batch, yr, yc] with yr in {1, r}, yc in
-// {1, c}, and y_batch equal to batch, 1, or a divisor of batch whose batches are shared by
-// contiguous groups (GQA). Mirrors broadcast_binary in functional.h.
+// Broadcast binary ops (NumPy-style): y's shape is aligned to x's rank, and every y dimension is
+// 1 or equal to x's. The output has x's shape. Mirrors broadcast_binary in functional.h.
 // ---------------------------------------------------------------------------------------------
 
-struct BroadcastGeom {
-    int64_t batch, r, c, y_batch, yr, yc;
+constexpr int kMaxDims = 8;
 
-    __device__ int64_t y_batch_of(int64_t b) const {
-        if (y_batch == batch) return b;
-        if (y_batch > 1) return b / (batch / y_batch);
-        return 0;
-    }
-    __device__ int64_t y_index(int64_t x_idx) const {
-        int64_t rc = r * c;
-        int64_t b = x_idx / rc;
-        int64_t rem = x_idx - b * rc;
-        int64_t i = rem / c, j = rem - i * c;
-        return (y_batch_of(b) * yr + (yr == 1 ? 0 : i)) * yc + (yc == 1 ? 0 : j);
+struct BroadcastDims {
+    int ndim;
+    int64_t x_shape[kMaxDims];
+    int64_t x_strides[kMaxDims];
+    int64_t y_strides[kMaxDims];  // 0 where y broadcasts
+    // Dimensions y is broadcast along (y size 1, x size > 1), for reducing dL/dy
+    int nred;
+    int64_t red_size[kMaxDims];
+    int64_t red_stride[kMaxDims];  // x strides of those dimensions
+    // y's own shape (aligned) and the matching x strides, for locating y element t in x
+    int64_t y_shape[kMaxDims];
+
+    __device__ int64_t y_offset(int64_t x_idx) const {
+        int64_t off = 0;
+        for (int d = ndim - 1; d >= 0; --d) {
+            int64_t i = x_idx % x_shape[d];
+            x_idx /= x_shape[d];
+            off += i * y_strides[d];
+        }
+        return off;
     }
 };
+
+BroadcastDims make_dims(const std::vector<int64_t>& x_shape, const std::vector<int64_t>& y_shape) {
+    if (x_shape.size() != y_shape.size() || x_shape.size() > (size_t)kMaxDims || x_shape.empty()) {
+        throw std::runtime_error("cuda broadcast: shapes must be aligned to the same rank (1 to 8 dims)");
+    }
+    BroadcastDims b{};
+    b.ndim = (int)x_shape.size();
+    int64_t xs = 1, ys = 1;
+    for (int d = b.ndim - 1; d >= 0; --d) {
+        b.x_shape[d] = x_shape[d];
+        b.y_shape[d] = y_shape[d];
+        b.x_strides[d] = xs;
+        b.y_strides[d] = (y_shape[d] == 1) ? 0 : ys;
+        xs *= x_shape[d];
+        ys *= y_shape[d];
+    }
+    b.nred = 0;
+    for (int d = 0; d < b.ndim; ++d) {
+        if (y_shape[d] == 1 && x_shape[d] > 1) {
+            b.red_size[b.nred] = x_shape[d];
+            b.red_stride[b.nred] = b.x_strides[d];
+            ++b.nred;
+        }
+    }
+    return b;
+}
 
 __device__ __forceinline__ float apply_binary(int op, float a, float b) {
     switch (op) {
@@ -115,66 +148,58 @@ __device__ __forceinline__ float apply_binary(int op, float a, float b) {
     }
 }
 
-__global__ void k_broadcast_forward(int op, const float* x, const float* y, float* out, BroadcastGeom g, int64_t n) {
+__global__ void k_broadcast_forward(int op, const float* x, const float* y, float* out, BroadcastDims b, int64_t n) {
     for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
-        out[i] = apply_binary(op, x[i], y[g.y_index(i)]);
+        out[i] = apply_binary(op, x[i], y[b.y_offset(i)]);
     }
 }
 
-__global__ void k_broadcast_backward_x(int op, const float* grad, const float* y, float* gx, BroadcastGeom g, int64_t n) {
+__global__ void k_broadcast_backward_x(int op, const float* grad, const float* y, float* gx, BroadcastDims b, int64_t n) {
     for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
         float d = grad[i];
-        if (op == 2) d *= y[g.y_index(i)];
-        else if (op == 3) d /= y[g.y_index(i)];
+        if (op == 2) d *= y[b.y_offset(i)];
+        else if (op == 3) d /= y[b.y_offset(i)];
         gx[i] = d;
     }
 }
 
-// dL/dy[t] sums over every x element mapped to y element t.
+// dL/dy[t] sums over the x elements that read y element t: those varying only along the
+// broadcast dimensions, visited in row-major order.
 struct BroadcastGradY {
     int op;
     const float* grad;
     const float* x;
     const float* y;
-    BroadcastGeom g;
-    int64_t ni, nj;  // rows and columns reduced per y element (r or 1, c or 1)
+    BroadcastDims b;
 
     struct Ctx {
-        int64_t b0, i0, j0;
+        int64_t base;
         float yv;
     };
     __device__ Ctx context(int64_t t) const {
-        int64_t yb = t / (g.yr * g.yc);
-        int64_t rem = t - yb * g.yr * g.yc;
-        int64_t yi = rem / g.yc, yj = rem - yi * g.yc;
-        Ctx ctx;
-        if (g.y_batch == g.batch) ctx.b0 = yb;
-        else if (g.y_batch > 1) ctx.b0 = yb * (g.batch / g.y_batch);
-        else ctx.b0 = 0;
-        ctx.i0 = (g.yr == 1) ? 0 : yi;
-        ctx.j0 = (g.yc == 1) ? 0 : yj;
-        ctx.yv = (op >= 2) ? y[t] : 0.0f;
-        return ctx;
+        int64_t base = 0, rest = t;
+        for (int d = b.ndim - 1; d >= 0; --d) {
+            int64_t i = rest % b.y_shape[d];
+            rest /= b.y_shape[d];
+            base += i * b.x_strides[d];  // i is 0 along broadcast dimensions
+        }
+        return Ctx{base, (op >= 2) ? y[t] : 0.0f};
     }
     __device__ float operator()(const Ctx& ctx, int64_t k) const {
-        int64_t per_batch = ni * nj;
-        int64_t b = ctx.b0 + k / per_batch;
-        int64_t rem = k - (k / per_batch) * per_batch;
-        int64_t i = ctx.i0 + rem / nj, j = ctx.j0 + rem % nj;
-        int64_t xi = (b * g.r + i) * g.c + j;
-        float d = grad[xi];
+        int64_t off = ctx.base;
+        for (int d = b.nred - 1; d >= 0; --d) {
+            off += (k % b.red_size[d]) * b.red_stride[d];
+            k /= b.red_size[d];
+        }
+        float g = grad[off];
         switch (op) {
-            case 0: return d;
-            case 1: return -d;
-            case 2: return d * x[xi];
-            default: return -(d * x[xi]) / (ctx.yv * ctx.yv);
+            case 0: return g;
+            case 1: return -g;
+            case 2: return g * x[off];
+            default: return -(g * x[off]) / (ctx.yv * ctx.yv);
         }
     }
 };
-
-BroadcastGeom make_geom(int batch, int r, int c, int y_batch, int yr, int yc) {
-    return BroadcastGeom{batch, r, c, y_batch, yr, yc};
-}
 
 // ---------------------------------------------------------------------------------------------
 // Scalar ops: 0 add, 1 sub, 2 mul, 3 div, 4 rsub (s - a), 5 rdiv (s / a)
@@ -407,29 +432,34 @@ __global__ void k_sum_squares_finish(const double* partial, double* out, int buf
 // Host wrappers
 // ---------------------------------------------------------------------------------------------
 
+static int64_t numel(const std::vector<int64_t>& shape) {
+    int64_t n = 1;
+    for (int64_t d : shape) n *= d;
+    return n;
+}
+
 void broadcast_binary_forward(int op, const float* x, const float* y, float* out,
-                              int batch, int r, int c, int y_batch, int yr, int yc) {
-    int64_t n = (int64_t)batch * r * c;
+                              const std::vector<int64_t>& x_shape, const std::vector<int64_t>& y_shape) {
+    int64_t n = numel(x_shape);
     if (n == 0) return;
-    k_broadcast_forward<<<grid_for(n), kThreads>>>(op, x, y, out, make_geom(batch, r, c, y_batch, yr, yc), n);
+    k_broadcast_forward<<<grid_for(n), kThreads>>>(op, x, y, out, make_dims(x_shape, y_shape), n);
     CUDA_CHECK(cudaGetLastError());
 }
 
 void broadcast_binary_backward_x(int op, const float* grad, const float* y, float* gx,
-                                 int batch, int r, int c, int y_batch, int yr, int yc) {
-    int64_t n = (int64_t)batch * r * c;
+                                 const std::vector<int64_t>& x_shape, const std::vector<int64_t>& y_shape) {
+    int64_t n = numel(x_shape);
     if (n == 0) return;
-    k_broadcast_backward_x<<<grid_for(n), kThreads>>>(op, grad, y, gx, make_geom(batch, r, c, y_batch, yr, yc), n);
+    k_broadcast_backward_x<<<grid_for(n), kThreads>>>(op, grad, y, gx, make_dims(x_shape, y_shape), n);
     CUDA_CHECK(cudaGetLastError());
 }
 
 void broadcast_binary_backward_y(int op, const float* grad, const float* x, const float* y, float* gy,
-                                 int batch, int r, int c, int y_batch, int yr, int yc) {
-    BroadcastGeom g = make_geom(batch, r, c, y_batch, yr, yc);
-    int64_t ni = (yr == 1) ? r : 1, nj = (yc == 1) ? c : 1;
-    int64_t nb = (y_batch == batch) ? 1 : (y_batch > 1 ? batch / y_batch : batch);
-    BroadcastGradY term{op, grad, x, y, g, ni, nj};
-    reduce_terms(term, (int64_t)y_batch * yr * yc, nb * ni * nj, gy);
+                                 const std::vector<int64_t>& x_shape, const std::vector<int64_t>& y_shape) {
+    BroadcastDims b = make_dims(x_shape, y_shape);
+    int64_t K = 1;
+    for (int d = 0; d < b.nred; ++d) K *= b.red_size[d];
+    reduce_terms(BroadcastGradY{op, grad, x, y, b}, numel(y_shape), K, gy);
 }
 
 void scalar_forward(int op, const float* a, float s, float* out, int64_t n) {

@@ -270,9 +270,16 @@ static std::vector<GradTest> build_grad_tests() {
              [](const Leaves& L, Device) { return mul(L[0], L[1]); });
     add_test("div_broadcast", {leaf({2, 3, 4}), leaf({1, 4}, 0.5f, 1.5f)},
              [](const Leaves& L, Device) { return cast_n_div(L[0], L[1]); });
-    // GQA-style grouped broadcast: 8 flattened x batches share 4 y batches in pairs
-    add_test("mul_grouped_broadcast", {leaf({2, 4, 3, 2}), leaf({2, 2, 3, 2})},
+    // Batch > 1 with per-head (ALiBi-style) and per-sequence (padding-mask-style) operands
+    add_test("add_head_broadcast", {leaf({2, 3, 4, 4}), leaf({1, 3, 4, 4})},
+             [](const Leaves& L, Device) { return add(L[0], L[1]); });
+    add_test("add_mask_broadcast", {leaf({2, 3, 4, 4}), leaf({2, 1, 1, 4})},
+             [](const Leaves& L, Device) { return add(L[0], L[1]); });
+    add_test("mul_middle_broadcast", {leaf({2, 4, 3, 2}), leaf({1, 4, 1, 2})},
              [](const Leaves& L, Device) { return mul(L[0], L[1]); });
+    add_test("div_scalar_tensor", {leaf({2, 3, 4}), leaf({1}, 0.5f, 1.5f)},
+             [](const Leaves& L, Device) { return cast_n_div(L[0], L[1]); });
+    add_test("repeat_kv", {leaf({2, 2, 3, 4})}, [](const Leaves& L, Device) { return repeat_kv(L[0], 2); });
 
     // --- Reductions & softmax ---
     add_test("sum_last", {leaf({2, 3, 4})}, [](const Leaves& L, Device) { return sum(L[0], -1); });
@@ -597,7 +604,7 @@ static std::string engine_detect_anomaly() {
             msg = e.what();
         }
         if (msg.empty()) return "a non-finite gradient was not detected";
-        if (msg.find("RdivScalarBackward") == std::string::npos) return "anomaly message does not name the op: " + msg;
+        if (msg.find("ScalarOpBackward(rdiv)") == std::string::npos) return "anomaly message does not name the op: " + msg;
     }
     if (detect_anomaly_enabled()) return "DetectAnomalyGuard did not restore the previous setting";
     auto y = upload({0.0f, 1.0f, 2.0f, 4.0f}, {2, 2}, Device::CPU, true);
@@ -635,6 +642,29 @@ static std::string gradcheck_rejects_wrong_backward() {
     if (err.empty()) return "gradcheck accepted a backward pass that is off by a factor of 2";
     auto ok = dummygrad::gradcheck([](const Leaves& L) { return mul(L[0], L[0]); }, {randn({3, 4})});
     return ok.empty() ? "" : "gradcheck rejected a correct op: " + ok;
+}
+
+// Gradient checks cannot catch a wrong broadcast mapping (forward and backward would agree), so
+// check NumPy semantics on values directly.
+static std::string broadcast_semantics() {
+    auto x = upload(std::vector<float>(12, 0.0f), {2, 3, 1, 2}, Device::CPU, false);
+    auto per_head = upload({1, 2, 3, 4, 5, 6}, {1, 3, 1, 2}, Device::CPU, false);
+    auto out = download(add(x, per_head));
+    for (int b = 0; b < 2; ++b)
+        for (int k = 0; k < 6; ++k)
+            if (out[b * 6 + k] != (float)(k + 1)) return "a [1, H, ...] operand was not repeated across the batch";
+    auto per_seq = upload({10, 20, 30, 40}, {2, 1, 1, 2}, Device::CPU, false);
+    out = download(add(x, per_seq));
+    for (int b = 0; b < 2; ++b)
+        for (int h = 0; h < 3; ++h)
+            for (int j = 0; j < 2; ++j)
+                if (out[b * 6 + h * 2 + j] != (float)(10 * (b * 2 + j + 1))) return "a [B, 1, 1, S] operand was misapplied";
+    try {
+        add(upload({1, 2, 3, 4, 5, 6}, {2, 3}, Device::CPU, false), upload(std::vector<float>(9, 1.0f), {3, 3}, Device::CPU, false));
+    } catch (const std::invalid_argument&) {
+        return "";
+    }
+    return "incompatible shapes were accepted";
 }
 
 static std::string engine_retain_graph() {
@@ -1171,6 +1201,7 @@ int main() {
     run_case(r, "engine/no_grad", engine_no_grad);
     run_case(r, "engine/detect_anomaly", engine_detect_anomaly);
     run_case(r, "engine/gradcheck_rejects_wrong_backward", gradcheck_rejects_wrong_backward);
+    run_case(r, "engine/broadcast_semantics", broadcast_semantics);
     run_case(r, "engine/retain_graph", engine_retain_graph);
     run_case(r, "engine/exception_propagates", engine_exception_propagates);
     run_case(r, "engine/concurrent_fanin", engine_concurrent_fanin);
