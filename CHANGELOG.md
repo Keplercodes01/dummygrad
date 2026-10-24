@@ -2,6 +2,18 @@
 
 All notable changes to dummygrad are documented here. Versions follow [Semantic Versioning](https://semver.org/); while the major version is 0, minor releases may change behavior.
 
+## [Unreleased]
+
+### Fixed
+- **Ops give correct results for strided inputs.** Forward kernels indexed raw memory, so an op applied to a view from `transpose()` or `slice()` — e.g. `relu(transpose(x))` — silently computed on the wrong elements. Every op that indexes raw memory now densifies its inputs first (no cost for already-dense tensors).
+- **Slicing along any dimension except the first** produced zero gradients (an error in 0.2.0). `SliceBackward` now writes the gradient window directly.
+- `one_hot` reads strided index tensors correctly.
+
+### Added
+- `contiguous(x)`: a differentiable dense copy of a strided view; returns `x` itself when already contiguous.
+- **Continuous integration** (GitHub Actions): builds and runs the test suite on Linux and macOS for every pull request and push to `main`, and builds a downstream project via `FetchContent`.
+- **Test coverage**: gradient checks for `concat`, `slice`, `broadcast`, `var`, `std_dev`, the attention masks, `cross_entropy`, `l1_loss`, `scale_n_shift`, `conv1d`, `conv2d`, `max_pool2d` and `Embedding`; strided-input variants of every elementwise, reduction, normalization, loss and binary op; and a check that strided and dense inputs give identical forward results (91 CPU checks in total).
+
 ## [0.2.1] - 2026-10-24
 
 Documentation and packaging: everything needed to install dummygrad, try it, and build on it.

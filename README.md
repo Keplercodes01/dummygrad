@@ -1,5 +1,6 @@
 # dummygrad
 
+[![CI](https://github.com/Keplercodes01/dummygrad/actions/workflows/ci.yml/badge.svg)](https://github.com/Keplercodes01/dummygrad/actions/workflows/ci.yml)
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Keplercodes01/dummygrad/blob/main/notebooks/dummygrad_colab.ipynb)
 
 A pure C++ deep learning engine engineered for absolute speed, zero abstraction bloat, and minimal codebase maintenance.
@@ -79,8 +80,8 @@ The notebook builds dummygrad with CUDA, runs the test suite, the quickstart exa
 
 | Platform | Backends | Status |
 |---|---|---|
-| Linux (Ubuntu / Debian) | CPU, CUDA | Tested on Colab (T4, CUDA 13) |
-| macOS (Apple Silicon) | CPU, Metal | Engine builds; test suite not yet run on macOS |
+| Linux (Ubuntu / Debian) | CPU, CUDA | CPU tested in CI on every change; CUDA tested on Colab (T4, CUDA 13) |
+| macOS (Apple Silicon) | CPU, Metal | CPU tested in CI on every change; Metal kernels not covered by tests |
 | Windows | CPU, CUDA via WSL2 | Use the Linux steps inside WSL2 |
 
 You need a C++17 compiler (GCC ≥ 9 or Clang ≥ 11), CMake ≥ 3.18 and git. CUDA and BLAS are optional.
@@ -477,12 +478,11 @@ auto out = gpt.forward(input_ids, /*pos_ids=*/nullptr, /*mask=*/doc_mask);
 
 dummygrad is pre-1.0: the core training path (CPU and CUDA, FP32) is covered by `test_engine`; other paths are less exercised.
 
-- **Strided inputs in forward ops.** Most forward kernels assume contiguous inputs. `matmul`, `reshape` and the attention layers densify their inputs, but e.g. `relu(transpose(x))` does not — call `make_contiguous` after a `transpose` you feed into elementwise or reduction ops.
 - **Half precision on CUDA.** FP16/BF16 are supported by `matmul` and data movement; elementwise, normalization and attention kernels are FP32.
 - **Flash attention** is limited to head dimensions ≤ 512 and computes one query row per block (not yet tiled).
 - **Embeddings** are computed as a one-hot matmul, which costs `O(tokens × vocab × d_model)`.
 - **Multi-GPU gradient aggregation** currently reduces through host memory.
-- **Metal and TPU backends** are not covered by the test suite.
+- **Metal and TPU kernels** are not covered by the test suite (macOS CI runs the CPU backend).
 
 Bug reports with a failing `test_engine` case are the fastest way to get something fixed.
 
