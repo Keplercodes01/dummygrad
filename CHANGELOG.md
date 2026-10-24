@@ -2,6 +2,19 @@
 
 All notable changes to dummygrad are documented here. Versions follow [Semantic Versioning](https://semver.org/); while the major version is 0, minor releases may change behavior.
 
+## [0.2.1] - 2026-10-24
+
+Documentation and packaging: everything needed to install dummygrad, try it, and build on it.
+
+### Added
+- **Getting Started guide** in the README: per-platform prerequisites (Ubuntu, macOS, Windows via WSL2, CUDA), build and verification steps, a walkthrough of a first program, and a troubleshooting table.
+- **`examples/quickstart.cpp`**: a runnable tour of tensors, autograd and training (a two-layer network on XOR). Built by default and run by CTest as `example_quickstart`, so the README's code is compiled on every build.
+- **Use dummygrad from your own project** with `FetchContent` or `add_subdirectory`, linking the new `dummygrad::dummygrad` target.
+- The Colab notebook runs the quickstart and builds a separate project that depends on dummygrad via `FetchContent`.
+
+### Changed
+- When dummygrad is included in another CMake project, tests and examples are no longer built (`DUMMYGRAD_BUILD_TESTS` and the new `DUMMYGRAD_BUILD_EXAMPLES` default to `ON` only for top-level builds).
+
 ## [0.2.0] - 2026-10-24
 
 The correctness release. Training the transformer models in 0.1 computed wrong results in several places — most severely on CUDA, where transposed tensors, wide softmax/LayerNorm rows and attention gradients were all affected. This release fixes those paths, hardens the multithreaded autograd engine and multi-GPU support, and adds a test suite that runs on a free Colab GPU.
