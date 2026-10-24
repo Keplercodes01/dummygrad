@@ -15,6 +15,13 @@ No Python. No bindings. No GIL. No multi-layer dispatcher overhead. Just raw, fr
 
 Full details for every release are in [CHANGELOG.md](CHANGELOG.md).
 
+### v0.4.0: the workflow release
+- **Build models from modules.** A `Module` base class gives every layer and model `parameters()`, `to()`, train/eval, freezing, and strict checkpoint loading from one `visit()` declaration.
+- **Train like a real project.** Resumable checkpoints (model, optimizer state, step, scalars), `DataLoader` and `TokenDataset`, a CSV metrics logger, AdamW and SGD, and a complete [training template](examples/train_lm.cpp).
+- **Write and trust your own ops.** `dummygrad::gradcheck` verifies custom backward passes, `NoGradGuard` runs evaluation without graphs, and `DetectAnomalyGuard` names the op that produced a NaN.
+- **Reproducible:** gradients are summed in a fixed order, so the same code and seed give bitwise-identical results, and resumed runs match uninterrupted ones exactly.
+- **Fixed:** `GPT` was not causal (it attended to future tokens), and SGD never updated CUDA parameters.
+
 ### v0.3.0: the trust release
 - **No more silently wrong results on views.** Ops applied to transposed or sliced tensors (`relu(transpose(x))`, ops on `slice()` results) now compute on the right elements, and gradients through slices along any dimension are correct.
 - **Every op and layer is gradient-checked**, including with strided inputs, and a dedicated test checks that strided and dense inputs give identical results.
@@ -192,7 +199,7 @@ set(CMAKE_CXX_STANDARD 17)
 include(FetchContent)
 FetchContent_Declare(dummygrad
     GIT_REPOSITORY https://github.com/Keplercodes01/dummygrad.git
-    GIT_TAG        v0.3.0)
+    GIT_TAG        v0.4.0)
 FetchContent_MakeAvailable(dummygrad)
 
 add_executable(my_app main.cpp)
