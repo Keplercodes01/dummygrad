@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # GitHub-hosted runners have no NVIDIA GPU, so CI covers the CPU backend (and the
+  # Metal build on macOS). CUDA is verified with notebooks/dummygrad_colab.ipynb.
+  build-test:
+    name: ${{ matrix.os }} (CPU)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=OFF
+
+      - name: Build
+        run: cmake --build build -j 4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  consumer:
+    name: FetchContent consumer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure downstream project against this checkout
+        run: >
+          cmake -S tests/consumer -B build-consumer -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=OFF
+          -DFETCHCONTENT_SOURCE_DIR_DUMMYGRAD=${{ github.workspace }}
+
+      - name: Build
+        run: cmake --build build-consumer -j 4
+
+      - name: Run
+        run: ./build-consumer/my_app
