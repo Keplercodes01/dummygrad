@@ -768,21 +768,20 @@ inline void forward_host(BinaryOp op, const float* x, const float* y, float* out
     }
 }
 
-// gx and/or gy may be null. gy accumulates in x order, so the result is deterministic.
-inline void backward_host(BinaryOp op, const float* g, const float* x, const float* y, float* gx, float* gy,
-                          const BroadcastLayout& l) {
-    l.for_each([&](int64_t i, int64_t yo) {
-        float d = g[i];
-        if (gx) gx[i] = (op == BinaryOp::Mul) ? d * y[yo] : (op == BinaryOp::Div) ? d / y[yo] : d;
-        if (gy) {
-            switch (op) {
-                case BinaryOp::Add: gy[yo] += d; break;
-                case BinaryOp::Sub: gy[yo] -= d; break;
-                case BinaryOp::Mul: gy[yo] += d * x[i]; break;
-                default: gy[yo] -= d * x[i] / (y[yo] * y[yo]); break;
-            }
-        }
-    });
+// dL/dx for mul and div (for add and sub it is the incoming gradient itself)
+inline void grad_x_host(BinaryOp op, const float* g, const float* y, float* gx, const BroadcastLayout& l) {
+    if (op == BinaryOp::Mul) l.for_each([&](int64_t i, int64_t yo) { gx[i] = g[i] * y[yo]; });
+    else l.for_each([&](int64_t i, int64_t yo) { gx[i] = g[i] / y[yo]; });
+}
+
+// dL/dy accumulated in x order, so the result is deterministic. gy must start zeroed.
+inline void grad_y_host(BinaryOp op, const float* g, const float* x, const float* y, float* gy, const BroadcastLayout& l) {
+    switch (op) {
+        case BinaryOp::Add: l.for_each([&](int64_t i, int64_t yo) { gy[yo] += g[i]; }); break;
+        case BinaryOp::Sub: l.for_each([&](int64_t i, int64_t yo) { gy[yo] -= g[i]; }); break;
+        case BinaryOp::Mul: l.for_each([&](int64_t i, int64_t yo) { gy[yo] += g[i] * x[i]; }); break;
+        default: l.for_each([&](int64_t i, int64_t yo) { gy[yo] -= g[i] * x[i] / (y[yo] * y[yo]); }); break;
+    }
 }
 
 }  // namespace broadcast_detail
@@ -813,21 +812,24 @@ struct BroadcastBinaryBackward : public Node {
         if (uses_values && (!x || !y)) return {nullptr, nullptr};
         auto g = grads[0];
         Device dev = g->device;
-
-        // add/sub with equal shapes: gradients are grad itself (and its negation for sub's y)
-        if (!uses_values && layout.y_shape == layout.x_shape) {
-            std::shared_ptr<Tensor> gy;
-            if (need_y) gy = (op == BinaryOp::Add) ? g->_reshape(y_shape) : mul_scalar(g, -1.0f)->_reshape(y_shape);
-            return {need_x ? g : nullptr, gy};
-        }
-
         std::shared_ptr<Tensor> gx, gy;
+
+        // add/sub: dL/dx is the incoming gradient itself (the output has x's shape)
+        if (need_x && !uses_values) gx = g;
+        // add/sub with equal shapes: dL/dy is the gradient (or its negation)
+        if (need_y && !uses_values && layout.y_shape == layout.x_shape) {
+            gy = (op == BinaryOp::Add) ? g->_reshape(y_shape) : mul_scalar(g, -1.0f)->_reshape(y_shape);
+            need_y = false;
+        }
+        need_x = need_x && uses_values;
+        if (!need_x && !need_y) return {gx, gy};
+
 #ifdef USE_CUDA
         if (dev == Device::CUDA) {
             if (need_x) {
                 gx = std::make_shared<Tensor>(x_shape, dev, g->dtype, false);
-                cuda::broadcast_binary_backward_x((int)op, g->data_ptr<float>(), uses_values ? y->data_ptr<float>() : nullptr,
-                                                  gx->data_ptr<float>(), layout.x_shape, layout.y_shape);
+                cuda::broadcast_binary_backward_x((int)op, g->data_ptr<float>(), y->data_ptr<float>(), gx->data_ptr<float>(),
+                                                  layout.x_shape, layout.y_shape);
             }
             if (need_y) {
                 gy = std::make_shared<Tensor>(y_shape, dev, g->dtype, false);
@@ -841,17 +843,17 @@ struct BroadcastBinaryBackward : public Node {
         // Host: CPU tensors directly; other devices through CPU copies
         auto host = [](const std::shared_ptr<Tensor>& t) { return (!t || t->device == Device::CPU) ? t : t->cpu(); };
         auto gh = host(g), xh = uses_values ? host(x) : nullptr, yh = uses_values ? host(y) : nullptr;
-        if (need_x) gx = std::make_shared<Tensor>(x_shape, Device::CPU, g->dtype, false);
-        if (need_y) {
-            gy = std::make_shared<Tensor>(y_shape, Device::CPU, g->dtype, false);
-            gy->fill_(0.0f);
+        if (need_x) {
+            auto gxh = std::make_shared<Tensor>(x_shape, Device::CPU, g->dtype, false);
+            broadcast_detail::grad_x_host(op, gh->data_ptr<float>(), yh->data_ptr<float>(), gxh->data_ptr<float>(), layout);
+            gx = (dev == Device::CPU) ? gxh : gxh->to(dev);
         }
-        broadcast_detail::backward_host(op, gh->data_ptr<float>(), xh ? xh->data_ptr<float>() : nullptr,
-                                        yh ? yh->data_ptr<float>() : nullptr, gx ? gx->data_ptr<float>() : nullptr,
-                                        gy ? gy->data_ptr<float>() : nullptr, layout);
-        if (dev != Device::CPU) {
-            if (gx) gx = gx->to(dev);
-            if (gy) gy = gy->to(dev);
+        if (need_y) {
+            auto gyh = std::make_shared<Tensor>(y_shape, Device::CPU, g->dtype, false);
+            gyh->fill_(0.0f);
+            broadcast_detail::grad_y_host(op, gh->data_ptr<float>(), xh ? xh->data_ptr<float>() : nullptr,
+                                          yh ? yh->data_ptr<float>() : nullptr, gyh->data_ptr<float>(), layout);
+            gy = (dev == Device::CPU) ? gyh : gyh->to(dev);
         }
         return {gx, gy};
     }
