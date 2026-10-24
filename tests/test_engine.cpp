@@ -18,6 +18,8 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <iterator>
+#include <fstream>
 #include <iostream>
 #include <random>
 #include <sstream>
@@ -856,6 +858,205 @@ static std::string module_modes_and_zero_grad() {
 }
 
 // ---------------------------------------------------------------------------
+// Workflow: determinism, checkpoints, data, logging
+// ---------------------------------------------------------------------------
+
+static std::vector<std::vector<float>> all_grads(Module& m) {
+    std::vector<std::vector<float>> out;
+    for (auto& p : m.parameters()) out.push_back(p->grad ? download(p->grad) : std::vector<float>{});
+    return out;
+}
+
+// Gradients meeting at a node are summed in a fixed order, so repeated runs are bitwise equal
+static std::string workflow_deterministic_backward() {
+    ModernTransformer model(16, 8, 16, 2, 2, 1);
+    auto run = [&]() {
+        model.zero_grad();
+        fused_cross_entropy(model.forward(upload({1, 2, 3, 4, 5, 6}, {2, 3}, Device::CPU, false)),
+                            upload({2, 3, 4, 5, 6, 7}, {2, 3}, Device::CPU, false))->backward();
+        return all_grads(model);
+    };
+    auto first = run();
+    for (int i = 0; i < 5; ++i) {
+        auto again = run();
+        for (size_t k = 0; k < first.size(); ++k) {
+            if (first[k] != again[k]) return "gradients of parameter " + std::to_string(k) + " differ between identical runs";
+        }
+    }
+    return "";
+}
+
+template <typename Optimizer>
+static void train_steps(ModernTransformer& model, Optimizer& opt, int first_step, int steps) {
+    auto params = model.parameters();
+    for (int s = first_step; s < first_step + steps; ++s) {
+        // The batch depends on the global step, so a resumed run sees the same data
+        std::vector<float> in(8), tg(8);
+        for (int i = 0; i < 8; ++i) {
+            in[i] = (float)((i + 3 * s) % 16);
+            tg[i] = (float)((i + 3 * s + 1) % 16);
+        }
+        opt.zero_grad(params);
+        fused_cross_entropy(model.forward(upload(in, {2, 4}, Device::CPU, false)), upload(tg, {2, 4}, Device::CPU, false))->backward();
+        opt.step(params);
+    }
+}
+
+// Training 3 steps, checkpointing, and resuming into a fresh model and optimizer for 3 more
+// must reproduce 6 uninterrupted steps exactly.
+template <typename MakeOptimizer>
+static std::string resume_matches_uninterrupted(MakeOptimizer make_optimizer, const std::string& what) {
+    manual_seed(3);
+    ModernTransformer straight(16, 8, 16, 2, 1, 1);
+    auto opt_a = make_optimizer();
+    train_steps(straight, opt_a, 0, 6);
+
+    manual_seed(3);
+    ModernTransformer first(16, 8, 16, 2, 1, 1);
+    auto opt_b = make_optimizer();
+    train_steps(first, opt_b, 0, 3);
+    const std::string path = "test_resume.safetensors";
+    save_checkpoint(path, first, &opt_b, TrainingState{3, {}});
+
+    manual_seed(99);  // a different initialization, fully overwritten by the checkpoint
+    ModernTransformer resumed(16, 8, 16, 2, 1, 1);
+    auto opt_c = make_optimizer();
+    TrainingState state = load_checkpoint(path, resumed, &opt_c);
+    std::remove(path.c_str());
+    if (state.step != 3) return what + ": step was not restored";
+    train_steps(resumed, opt_c, 3, 3);
+
+    auto a = straight.parameters(), c = resumed.parameters();
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (download(a[i]) != download(c[i])) return what + ": parameter " + std::to_string(i) + " differs from the uninterrupted run";
+    }
+    return "";
+}
+
+static std::string workflow_resume_adam() {
+    return resume_matches_uninterrupted([] { return Adam(1e-2f); }, "Adam");
+}
+
+static std::string workflow_resume_sgd_momentum() {
+    return resume_matches_uninterrupted([] { return SGD(0.1f, /*momentum=*/0.9f, /*weight_decay=*/1e-3f); }, "SGD");
+}
+
+static std::string workflow_checkpoint_scalars() {
+    Linear layer(2, 2);
+    TrainingState saved{123456789012345LL, {{"best_val", 0.1}, {"epoch", 7.0}}};
+    const std::string path = "test_scalars.safetensors";
+    save_checkpoint(path, layer, saved);
+    Linear fresh(2, 2);
+    TrainingState loaded = load_checkpoint(path, fresh);
+    std::remove(path.c_str());
+    if (loaded.step != saved.step) return "step changed: " + std::to_string(loaded.step);
+    if (loaded.scalars != saved.scalars) return "scalars changed in the round trip";
+    return compare(download(layer.W), download(fresh.W), 0.0f);
+}
+
+static std::string workflow_clip_grad_norm() {
+    auto a = upload({0, 0, 0, 0}, {2, 2}, Device::CPU, true);
+    auto b = upload({0, 0}, {1, 2}, Device::CPU, true);
+    a->grad = upload({3, 0, 0, 0}, {2, 2}, Device::CPU, false);
+    b->grad = upload({0, 4}, {1, 2}, Device::CPU, false);
+    float norm = clip_grad_norm_({a, b}, 1.0f);
+    if (std::fabs(norm - 5.0f) > 1e-5f) return "reported norm " + std::to_string(norm) + ", expected 5";
+    float ga = download(a->grad)[0], gb = download(b->grad)[1];
+    if (std::fabs(ga - 0.6f) > 1e-5f || std::fabs(gb - 0.8f) > 1e-5f) return "gradients not rescaled to norm 1";
+    float unclipped = clip_grad_norm_({a, b}, 10.0f);
+    return std::fabs(unclipped - 1.0f) < 1e-4f ? "" : "a norm under the limit was changed";
+}
+
+static std::string workflow_dataloader() {
+    const int64_t n = 10;
+    std::vector<float> xs(n * 3), ys(n);
+    for (int64_t i = 0; i < n; ++i) {
+        for (int k = 0; k < 3; ++k) xs[i * 3 + k] = (float)(i * 10 + k);
+        ys[i] = (float)i;
+    }
+    auto X = upload(xs, {n, 3}, Device::CPU, false), Y = upload(ys, {n}, Device::CPU, false);
+
+    DataLoader loader(X, Y, /*batch_size=*/4, /*shuffle=*/true, /*seed=*/5);
+    if (loader.num_batches() != 3) return "expected 3 batches (4 + 4 + 2)";
+    auto epoch_order = [&](int64_t epoch) {
+        loader.set_epoch(epoch);
+        std::vector<int> seen;
+        for (auto [x, y] : loader) {
+            auto xv = download(x), yv = download(y);
+            if (x->shape[1] != 3 || x->shape[0] != y->shape[0]) seen.push_back(-1000);
+            for (int64_t r = 0; r < y->shape[0]; ++r) {
+                int id = (int)yv[r];
+                if (xv[r * 3] != (float)(id * 10)) seen.push_back(-1000);  // row and target misaligned
+                seen.push_back(id);
+            }
+        }
+        return seen;
+    };
+    auto e0 = epoch_order(0), e0_again = epoch_order(0), e1 = epoch_order(1);
+    auto sorted = e0;
+    std::sort(sorted.begin(), sorted.end());
+    for (int64_t i = 0; i < n; ++i) {
+        if (sorted.size() != (size_t)n || sorted[i] != i) return "an epoch did not visit every sample exactly once (or rows were misaligned)";
+    }
+    if (e0 != e0_again) return "the same epoch produced a different order";
+    if (e0 == e1) return "different epochs produced the same order";
+
+    DataLoader ordered(X, nullptr, 4, /*shuffle=*/false, 0, /*drop_last=*/true);
+    if (ordered.num_batches() != 2) return "drop_last should leave 2 full batches";
+    Batch b = ordered.batch(1);
+    if (b.targets || download(b.inputs)[0] != 40.0f) return "unshuffled loader returned the wrong rows";
+    return "";
+}
+
+static std::string workflow_token_dataset() {
+    std::vector<int32_t> ids(100);
+    for (int i = 0; i < 100; ++i) ids[i] = i;
+    TokenDataset data(ids);
+    if (data.vocab_size() != 100) return "vocab_size should be max id + 1";
+    std::mt19937 rng(1);
+    Batch b = data.sample(4, 8, rng);
+    auto x = download(b.inputs), y = download(b.targets);
+    for (size_t k = 0; k < x.size(); ++k) {
+        if (y[k] != x[k] + 1) return "targets are not the inputs shifted by one token";
+    }
+    if (data.num_windows(8) != 12) return "expected 12 windows of 8 tokens in 100";
+    auto w = data.windows(10, 4, 8);
+    if (w.inputs->shape[0] != 2 || download(w.inputs)[0] != 80.0f) return "windows() returned the wrong slice";
+    auto parts = data.split(0.9);
+    if (parts.first.size() != 90 || parts.second.tokens()[0] != 90) return "split() cut in the wrong place";
+
+    const std::string path = "test_tokens.bin";
+    {
+        std::ofstream out(path, std::ios::binary);
+        for (uint16_t v : {7, 65535, 3}) out.write(reinterpret_cast<const char*>(&v), 2);
+    }
+    auto from_file = TokenDataset::from_file(path);
+    std::remove(path.c_str());
+    if (from_file.tokens() != std::vector<int32_t>{7, 65535, 3}) return "from_file misread uint16 tokens";
+    auto text = TokenDataset::from_string("hi!");
+    if (text.vocab_size() != 256 || text.tokens()[0] != 'h') return "from_string should give byte tokens with vocab 256";
+    return "";
+}
+
+static std::string workflow_metrics_logger() {
+    const std::string path = "test_metrics.csv";
+    {
+        MetricsLogger log(path, /*echo=*/false);
+        log.log(1, {{"loss", 2.5}});
+        log.log(2, {{"loss", 2.0}, {"lr", 0.001}});
+    }
+    {
+        MetricsLogger resumed(path, /*echo=*/false, /*append=*/true);
+        resumed.log(3, {{"val_loss", 1.5}});
+    }
+    std::ifstream in(path);
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::remove(path.c_str());
+    const std::string expected = "step,metric,value\n1,loss,2.5\n2,loss,2\n2,lr,0.001\n3,val_loss,1.5\n";
+    return content == expected ? "" : "unexpected CSV contents:\n" + content;
+}
+
+// ---------------------------------------------------------------------------
 // End-to-end training
 // ---------------------------------------------------------------------------
 
@@ -982,6 +1183,16 @@ int main() {
     run_case(r, "module/strict_loading", module_strict_loading);
     run_case(r, "module/to_tied_and_frozen", module_to_tied_and_frozen);
     run_case(r, "module/modes_and_zero_grad", module_modes_and_zero_grad);
+
+    std::cout << "\n-- workflow\n";
+    run_case(r, "workflow/deterministic_backward", workflow_deterministic_backward);
+    run_case(r, "workflow/resume_adam", workflow_resume_adam);
+    run_case(r, "workflow/resume_sgd_momentum", workflow_resume_sgd_momentum);
+    run_case(r, "workflow/checkpoint_scalars", workflow_checkpoint_scalars);
+    run_case(r, "workflow/clip_grad_norm", workflow_clip_grad_norm);
+    run_case(r, "workflow/dataloader", workflow_dataloader);
+    run_case(r, "workflow/token_dataset", workflow_token_dataset);
+    run_case(r, "workflow/metrics_logger", workflow_metrics_logger);
 
     std::cout << "\n-- end-to-end training\n";
     run_case(r, "train/tiny_transformer_cpu", [] { return train_tiny_transformer(Device::CPU); });

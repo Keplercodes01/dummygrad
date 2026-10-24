@@ -16,7 +16,7 @@ endif()
 
 option(ENABLE_CUDA "Enable NVIDIA CUDA GPU acceleration" ON)
 option(DUMMYGRAD_BUILD_TESTS "Build the gradient-check test suite (test_engine)" ${DUMMYGRAD_IS_TOP_LEVEL})
-option(DUMMYGRAD_BUILD_EXAMPLES "Build the examples (quickstart, custom_op, train_colab)" ${DUMMYGRAD_IS_TOP_LEVEL})
+option(DUMMYGRAD_BUILD_EXAMPLES "Build the examples (quickstart, custom_op, train_lm, train_colab)" ${DUMMYGRAD_IS_TOP_LEVEL})
 
 # Source files for the core engine
 set(DUMMYGRAD_SOURCES
@@ -131,6 +131,10 @@ if(DUMMYGRAD_BUILD_EXAMPLES)
     add_executable(custom_op examples/custom_op.cpp)
     target_link_libraries(custom_op PRIVATE dummygrad_engine)
     add_test(NAME example_custom_op COMMAND custom_op)
+
+    add_executable(train_lm examples/train_lm.cpp)
+    target_link_libraries(train_lm PRIVATE dummygrad_engine)
+    add_test(NAME example_train_lm COMMAND train_lm)
 
     add_executable(train_colab src/train_colab.cpp)
     target_link_libraries(train_colab PRIVATE dummygrad_engine)

@@ -1,6 +1,7 @@
 #include "autograd.h"
 #include "ops.h"
 #include <unordered_map>
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -106,19 +107,35 @@ void AutogradEngine::execute(std::shared_ptr<Node> root, const std::vector<int64
         }
     }
 
-    // A slot's first contribution is stored by reference. The producing node may have
-    // handed that same tensor to other edges (AddBackward, AddScalarBackward, views),
-    // so it is copied before any in-place accumulation touches it.
-    struct GradSlot {
+    // Gradients flowing into a node are collected, not summed on arrival: worker threads finish
+    // in any order, and float addition is not associative. Once the node is ready they are summed
+    // in a fixed order (producer creation order, then edge index), so identical runs produce
+    // bitwise-identical gradients. Summing also happens outside the graph lock.
+    struct Contribution {
+        uint64_t producer;
+        size_t edge;
         std::shared_ptr<Tensor> grad;
-        bool owned = false;
     };
-    std::unordered_map<Node*, std::vector<GradSlot>> node_grads;
+    using Slot = std::vector<Contribution>;
+    std::unordered_map<Node*, std::vector<Slot>> node_grads;
     std::mutex graph_mutex;
 
     auto seed_grad = std::make_shared<Tensor>(shape, device, dtype, false);
     seed_grad->fill_(1.0f);
-    node_grads[root.get()] = {GradSlot{seed_grad, true}};
+    node_grads[root.get()] = {Slot{Contribution{0, 0, seed_grad}}};
+
+    auto sum_slot = [](Slot& slot) -> std::shared_ptr<Tensor> {
+        if (slot.empty()) return nullptr;
+        if (slot.size() == 1) return slot[0].grad;
+        std::sort(slot.begin(), slot.end(), [](const Contribution& a, const Contribution& b) {
+            return a.producer != b.producer ? a.producer < b.producer : a.edge < b.edge;
+        });
+        // Producers may hand one tensor to several edges (AddBackward, views), so accumulate into
+        // a fresh copy rather than into any contribution.
+        std::shared_ptr<Tensor> total;
+        for (auto& c : slot) tensor_add_inplace(total, c.grad);
+        return total;
+    };
 
     // Queued tasks reference this stack frame, so execute() must not return until every
     // scheduled task has finished -- including after a failure.
@@ -139,15 +156,18 @@ void AutogradEngine::execute(std::shared_ptr<Node> root, const std::vector<int64
 
     auto run_node = [&](const std::shared_ptr<Node>& curr) {
         // All contributions have arrived once a node is scheduled, so its slots can be taken now
-        std::vector<std::shared_ptr<Tensor>> incoming;
+        std::vector<Slot> slots;
         {
             std::lock_guard<std::mutex> lock(graph_mutex);
             auto it = node_grads.find(curr.get());
             if (it != node_grads.end()) {
-                for (auto& s : it->second) incoming.push_back(s.grad);
+                slots = std::move(it->second);
                 node_grads.erase(it);
             }
         }
+        std::vector<std::shared_ptr<Tensor>> incoming;
+        for (auto& slot : slots) incoming.push_back(sum_slot(slot));
+        slots.clear();
         // Backward nodes index grads as dense row-major buffers, but view ops
         // (TransposeBackward) hand back strided views. Densify once here instead of in every node.
         for (auto& g : incoming) {
@@ -174,20 +194,9 @@ void AutogradEngine::execute(std::shared_ptr<Node> root, const std::vector<int64
             {
                 std::lock_guard<std::mutex> lock(graph_mutex);
                 if (grad_to_pass) {
-                    auto& slots = node_grads[next_node];
-                    if (slots.size() <= edge.input_slot) slots.resize(edge.input_slot + 1);
-                    auto& slot = slots[edge.input_slot];
-                    if (!slot.grad) {
-                        slot.grad = grad_to_pass;
-                    } else {
-                        if (!slot.owned) {
-                            std::shared_ptr<Tensor> copy;
-                            tensor_add_inplace(copy, slot.grad);  // null dst => deep copy
-                            slot.grad = copy;
-                            slot.owned = true;
-                        }
-                        tensor_add_inplace(slot.grad, grad_to_pass);
-                    }
+                    auto& next_slots = node_grads[next_node];
+                    if (next_slots.size() <= edge.input_slot) next_slots.resize(edge.input_slot + 1);
+                    next_slots[edge.input_slot].push_back(Contribution{curr->sequence_nr, i, grad_to_pass});
                 }
                 ready = (--in_degree[next_node] == 0);
             }
