@@ -27,6 +27,37 @@
 // Interoperable with Hugging Face SafeTensors checkpoints with zero Python dependencies
 namespace io {
 
+// Exact 64-bit scalars (step counters, metrics) stored as the raw bytes of a 2-element Float32
+// tensor, so they survive a SafeTensors round trip without float rounding.
+inline std::shared_ptr<Tensor> encode_int64(int64_t value) {
+    auto t = std::make_shared<Tensor>(std::vector<int64_t>{2}, Device::CPU, DType::Float32, false);
+    std::memcpy(t->data_ptr<void>(), &value, sizeof(value));
+    return t;
+}
+
+inline std::shared_ptr<Tensor> encode_double(double value) {
+    auto t = std::make_shared<Tensor>(std::vector<int64_t>{2}, Device::CPU, DType::Float32, false);
+    std::memcpy(t->data_ptr<void>(), &value, sizeof(value));
+    return t;
+}
+
+inline int64_t decode_int64(const std::shared_ptr<Tensor>& t) {
+    if (!t || t->size() * dtype_size(t->dtype) != sizeof(int64_t)) throw std::runtime_error("decode_int64: not an encoded scalar");
+    int64_t value;
+    auto host = make_contiguous(t)->cpu();
+    std::memcpy(&value, host->data_ptr<void>(), sizeof(value));
+    return value;
+}
+
+inline double decode_double(const std::shared_ptr<Tensor>& t) {
+    if (!t || t->size() * dtype_size(t->dtype) != sizeof(double)) throw std::runtime_error("decode_double: not an encoded scalar");
+    double value;
+    auto host = make_contiguous(t)->cpu();
+    std::memcpy(&value, host->data_ptr<void>(), sizeof(value));
+    return value;
+}
+
+
 inline std::string dtype_to_safetensors_str(DType dt) {
     switch (dt) {
         case DType::Float32:  return "F32";

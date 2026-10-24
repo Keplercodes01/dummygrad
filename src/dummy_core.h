@@ -47,3 +47,7 @@
 
 // Gradient checking for custom ops and layers
 #include "testing.h"
+
+// Training workflow: data loading, checkpoints, metric logging
+#include "data.h"
+#include "training.h"

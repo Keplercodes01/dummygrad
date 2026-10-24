@@ -12,11 +12,21 @@ All notable changes to dummygrad are documented here. Versions follow [Semantic 
 - `needs_grad(t)`: whether an op should record a graph edge for `t` (false inside `NoGradGuard`).
 - **`Module` base class** (`nn/module.h`): a module declares its parameters, buffers and children in `visit()`, and gets `parameters()`, `named_parameters()`, `state_dict()`, `to()`, `train()`/`eval()`, `requires_grad_()`, `zero_grad()`, `num_parameters()`, `save_safetensors()` and `load_safetensors()`. Every built-in layer and model is now a `Module`; their hand-written copies of these methods (about 380 lines) are gone. Checkpoint tensor names are unchanged.
 
+- **Resumable checkpoints** (`training.h`): `save_checkpoint` / `load_checkpoint` store the model, optimizer state, step and arbitrary scalars in one SafeTensors file, written atomically. Resuming reproduces an uninterrupted run exactly.
+- **Deterministic gradients:** gradients that meet at a node are summed in a fixed order (node creation order) instead of thread arrival order, so identical runs give bitwise-identical gradients on CPU. The summing also moved out of the engine's global lock.
+- **Data loading** (`data.h`): `DataLoader` for in-memory tensors with deterministic per-epoch shuffling, and `TokenDataset` for language-model token streams (raw uint16/int32 id files, byte-level text, random and sequential windows, train/validation split).
+- **`MetricsLogger`:** long-format CSV metric logging with optional console echo and append-on-resume.
+- **`SGD` optimizer class** with momentum and weight decay; `Adam` and `SGD` expose `state_dict` / `load_state_dict`. `AdamW` is an alias of `Adam`.
+- **`examples/train_lm.cpp`:** a complete training-run template (character-level LM with validation, schedule, clipping, logging, checkpoints, `--resume`, sampling), run by CTest.
+
 ### Fixed
+- **`SGD` on CUDA never updated parameters:** it copied the parameter to the CPU without its gradient, so the update was skipped. The free function is replaced by the `SGD` class, which works on every device.
+- `clip_grad_norm_` accumulated the squared norm in single precision, losing accuracy on large models; it now uses double precision and works on any device. Its unused `norm_type` parameter is removed.
 - **`GPT` was not causal.** `TransformerBlock` passed `causal` into `MultiHeadAttention`'s `n_kv_heads` parameter, so every GPT layer attended to future tokens and used a single shared K/V head. GPT is now causal with full multi-head attention; GPT checkpoints from earlier versions have the wrong `W_k`/`W_v` shapes and will not load (and were trained on a model that could see the future).
 - `MARS::rollout` built a full autograd graph at every step and cleared `requires_grad` on the caller's seed tensor; it now runs under `NoGradGuard` and leaves its input untouched.
 
 ### Changed
+- **Optimizer state is stored as tensors on each parameter's device** instead of CPU vectors plus hand-managed CUDA buffers. State is tied to the parameter's identity, so a new tensor that reuses a freed parameter's address no longer inherits stale moments, and state follows parameters across `to()`. `Adam`'s fields are now `beta1`, `beta2`, `eps` (previously `b1`, `b2`, `E`).
 - **Loading checkpoints is strict by default.** Missing, unexpected and wrong-shape tensors raise an error listing them, instead of being silently skipped (a renamed layer previously meant training from random initialization unnoticed). Pass `strict=false` to load a subset; shape mismatches always raise.
 - Loading copies values into the existing parameter tensors instead of swapping their storage, so tensor identity (and optimizer state attached to it) survives a load, and shapes are checked.
 - `to()` preserves `requires_grad`, so frozen parameters stay frozen; previously every move re-enabled gradients. Tied tensors stay tied across moves.

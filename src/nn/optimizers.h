@@ -1,42 +1,18 @@
-#pragma once 
+#pragma once
 #include "tensor.h"
 #include "functional.h"
+#include "init.h"
+#include "module.h"
+#include "ops.h"
+#include "serialization.h"
 
-// SGD
-inline void SGD(const std::shared_ptr<Tensor>& param, const float& lr) {
-    if (!param || !param->grad) return;
-    if (param->device != Device::CPU && param->device != Device::MPS) {
-        auto p_cpu = param->to(Device::CPU);
-        auto g_cpu = param->grad->to(Device::CPU);
-        SGD(p_cpu, lr);
-        auto p_dev = p_cpu->to(param->device);
-#ifdef USE_CUDA
-        if (param->device == Device::CUDA) {
-            cudaMemcpy(param->data_ptr<void>(), p_dev->data_ptr<void>(), param->size() * sizeof(float), cudaMemcpyDeviceToDevice);
-            return;
-        }
-#endif
-        std::memcpy(param->data_ptr<void>(), p_cpu->data_ptr<void>(), param->size() * sizeof(float));
-        return;
-    }
-    float* data = param->data_ptr<float>();
-    const float* grad = param->grad->data_ptr<float>();
-    int size = param->size();
-
-    for (int i = 0; i < size; i++) {
-        data[i] -= lr * grad[i];
-    }
-}
-
-// Per-parameter state for Adam
-struct ParamState {
-    std::vector<float> m;
-    std::vector<float> v;
-    float* gpu_m = nullptr;
-    float* gpu_v = nullptr;
-    size_t gpu_bytes = 0;
-    int t = 0;
-};
+#include <cmath>
+#include <iterator>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 inline void zero_grad(const std::vector<std::shared_ptr<Tensor>>& params) {
     for (const auto& p : params) {
@@ -44,107 +20,220 @@ inline void zero_grad(const std::vector<std::shared_ptr<Tensor>>& params) {
     }
 }
 
-// Adam optimizer (supports arbitrary number of parameters with distinct shapes)
-class Adam {
+namespace optim_detail {
+
+// Per-parameter optimizer state, keyed by tensor address but bound to the tensor's identity:
+// when a parameter is freed and another tensor reuses its address, the stale state is dropped
+// instead of being applied to the new tensor.
+template <typename State>
+class StateMap {
 public:
-    std::unordered_map<Tensor*, ParamState> state;
-    float lr, b1, b2, E, weight_decay;
-
-    Adam(float lr = 0.001f, float b1 = 0.9f, float b2 = 0.999f, float E = 1e-8f, float weight_decay = 0.01f)
-        : lr(lr), b1(b1), b2(b2), E(E), weight_decay(weight_decay) {}
-
-    Adam(const Adam&) = delete;
-    Adam& operator=(const Adam&) = delete;
-    Adam(Adam&&) noexcept = default;
-    Adam& operator=(Adam&&) noexcept = default;
-
-    ~Adam() {
-#ifdef USE_CUDA
-        for (auto& pair : state) {
-            if (pair.second.gpu_m) {
-                free_memory(Device::CUDA, pair.second.gpu_m, pair.second.gpu_bytes);
-                pair.second.gpu_m = nullptr;
-            }
-            if (pair.second.gpu_v) {
-                free_memory(Device::CUDA, pair.second.gpu_v, pair.second.gpu_bytes);
-                pair.second.gpu_v = nullptr;
-            }
-        }
-#endif
+    // Returns the state for p, creating it (and its moment tensors) on p's device if needed.
+    State& get(const std::shared_ptr<Tensor>& p) {
+        auto& slot = slots_[p.get()];
+        if (slot.owner.lock() != p) slot = Slot{p, State{}};
+        slot.state.follow(p);
+        return slot.state;
     }
 
-    void step(const std::shared_ptr<Tensor>& param) {
-        if (!param || !param->grad) return;
-        int size = param->size();
+    const State* find(const std::shared_ptr<Tensor>& p) const {
+        auto it = slots_.find(p.get());
+        if (it == slots_.end() || it->second.owner.lock() != p) return nullptr;
+        return &it->second.state;
+    }
 
-#ifdef USE_CUDA
-        if (param->device == Device::CUDA) {
-            auto& pstate = state[param.get()];
-            if (!pstate.gpu_m) {
-                pstate.gpu_bytes = size * sizeof(float);
-                pstate.gpu_m = static_cast<float*>(get_memory(Device::CUDA, pstate.gpu_bytes));
-                pstate.gpu_v = static_cast<float*>(get_memory(Device::CUDA, pstate.gpu_bytes));
-                cudaMemset(pstate.gpu_m, 0, pstate.gpu_bytes);
-                cudaMemset(pstate.gpu_v, 0, pstate.gpu_bytes);
-            }
-            pstate.t++;
-            cuda::adamw_step(param->data_ptr<float>(), param->grad->data_ptr<float>(),
-                             pstate.gpu_m, pstate.gpu_v,
-                             lr, b1, b2, E, weight_decay, pstate.t, size);
-            return;
-        }
-#endif
-
-        if (param->device == Device::MPS) {
-            auto& pstate = state[param.get()];
-            if (pstate.m.empty()) {
-                pstate.m.resize(size, 0.0f);
-                pstate.v.resize(size, 0.0f);
-            }
-            pstate.t++;
-            MetalBackend::get().adamw(param->data_ptr<float>(), param->grad->data_ptr<float>(),
-                                      pstate.m.data(), pstate.v.data(),
-                                      size, lr, b1, b2, E, weight_decay, pstate.t);
-            return;
-        }
-
-        auto& pstate = state[param.get()];
-        if (pstate.m.empty()) {
-            pstate.m.resize(size, 0.0f);
-            pstate.v.resize(size, 0.0f);
-        }
-        pstate.t++;
-
-        float* data = param->data_ptr<float>();
-        const float* grad = param->grad->data_ptr<float>();
-
-        float b1_corr = 1.0f - std::pow(b1, pstate.t);
-        float b2_corr = 1.0f - std::pow(b2, pstate.t);
-
-        for (int i = 0; i < size; i++) {
-            // Decoupled weight decay (AdamW)
-            if (weight_decay != 0.0f) {
-                data[i] -= lr * weight_decay * data[i];
-            }
-
-            float g = grad[i];
-            pstate.m[i] = b1 * pstate.m[i] + (1.0f - b1) * g;
-            pstate.v[i] = b2 * pstate.v[i] + (1.0f - b2) * g * g;
-
-            float m_hat = pstate.m[i] / b1_corr; 
-            float v_hat = pstate.v[i] / b2_corr; 
-
-            data[i] -= lr * m_hat / (std::sqrt(v_hat) + E);
+    // Forget state whose parameter no longer exists (e.g. after a model moved devices).
+    void prune() {
+        for (auto it = slots_.begin(); it != slots_.end();) {
+            it = it->second.owner.expired() ? slots_.erase(it) : std::next(it);
         }
     }
+
+private:
+    struct Slot {
+        std::weak_ptr<Tensor> owner;
+        State state;
+    };
+    std::unordered_map<Tensor*, Slot> slots_;
+};
+
+inline std::shared_ptr<Tensor> zeros_like(const std::shared_ptr<Tensor>& p) {
+    return zeros(p->shape, p->device, DType::Float32, false);
+}
+
+// Moves a state tensor to p's device when the model was moved after training started.
+inline void follow_device(std::shared_ptr<Tensor>& t, const std::shared_ptr<Tensor>& p) {
+    if (t && t->device != p->device) t = t->to(p->device);
+}
+
+inline void check_param(const std::shared_ptr<Tensor>& p, const char* who) {
+    if (p->dtype != DType::Float32) throw std::runtime_error(std::string(who) + ": only Float32 parameters are supported");
+    if (!p->is_contiguous()) throw std::runtime_error(std::string(who) + ": parameters must be contiguous");
+    if (p->grad->device != p->device) throw std::runtime_error(std::string(who) + ": gradient and parameter are on different devices");
+}
+
+inline void load_into(const std::shared_ptr<Tensor>& dst, const std::shared_ptr<Tensor>& src, const std::string& name) {
+    if (src->shape != dst->shape) throw std::runtime_error("optimizer state " + name + " has the wrong shape");
+    ops::make_contiguous(*dst, *src->to(dst->device, dst->dtype));
+}
+
+}  // namespace optim_detail
+
+// SGD with optional momentum and (coupled, L2-style) weight decay:
+//   g = grad + weight_decay * p;  buf = momentum * buf + g;  p -= lr * buf
+class SGD {
+public:
+    float lr, momentum, weight_decay;
+
+    explicit SGD(float lr = 0.01f, float momentum = 0.0f, float weight_decay = 0.0f)
+        : lr(lr), momentum(momentum), weight_decay(weight_decay) {}
 
     void step(const std::vector<std::shared_ptr<Tensor>>& params) {
-        for (const auto& p : params) {
-            step(p);
+        for (const auto& p : params) step(p);
+        state_.prune();
+    }
+
+    void step(const std::shared_ptr<Tensor>& p) {
+        if (!p || !p->grad) return;
+        optim_detail::check_param(p, "SGD");
+        NoGradGuard no_grad;
+        auto g = make_contiguous(p->grad);
+        if (weight_decay != 0.0f) g = add(g, mul_scalar(p, weight_decay));
+        if (momentum != 0.0f) {
+            auto& s = state_.get(p);
+            // A fresh tensor: the buffer must not alias p->grad, which backward may accumulate into
+            s.buf = s.buf ? add(mul_scalar(s.buf, momentum), g) : mul_scalar(g, 1.0f);
+            g = s.buf;
+        }
+        ops::add_inplace(*p, *mul_scalar(g, -lr));
+    }
+
+    void zero_grad(const std::vector<std::shared_ptr<Tensor>>& params) { ::zero_grad(params); }
+
+    NamedTensors state_dict(const NamedTensors& named_params) const {
+        NamedTensors out;
+        for (const auto& [name, p] : named_params) {
+            const State* s = state_.find(p);
+            if (s && s->buf) out.emplace_back(name + ".momentum_buffer", s->buf);
+        }
+        return out;
+    }
+
+    void load_state_dict(const NamedTensors& named_params,
+                         const std::unordered_map<std::string, std::shared_ptr<Tensor>>& state) {
+        for (const auto& [name, p] : named_params) {
+            auto it = state.find(name + ".momentum_buffer");
+            if (it == state.end()) continue;
+            auto& s = state_.get(p);
+            s.buf = optim_detail::zeros_like(p);
+            optim_detail::load_into(s.buf, it->second, it->first);
         }
     }
 
-    void zero_grad(const std::vector<std::shared_ptr<Tensor>>& params) {
-        ::zero_grad(params);
-    }
+private:
+    struct State {
+        std::shared_ptr<Tensor> buf;
+        void follow(const std::shared_ptr<Tensor>& p) { optim_detail::follow_device(buf, p); }
+    };
+    optim_detail::StateMap<State> state_;
 };
+
+// AdamW: Adam with decoupled weight decay (Loshchilov & Hutter, 2019). The moment estimates live
+// in tensors on each parameter's device and are updated by a fused kernel on CUDA and Metal.
+class Adam {
+public:
+    float lr, beta1, beta2, eps, weight_decay;
+
+    explicit Adam(float lr = 1e-3f, float beta1 = 0.9f, float beta2 = 0.999f, float eps = 1e-8f, float weight_decay = 0.01f)
+        : lr(lr), beta1(beta1), beta2(beta2), eps(eps), weight_decay(weight_decay) {}
+
+    void step(const std::vector<std::shared_ptr<Tensor>>& params) {
+        for (const auto& p : params) step(p);
+        state_.prune();
+    }
+
+    void step(const std::shared_ptr<Tensor>& p) {
+        if (!p || !p->grad) return;
+        optim_detail::check_param(p, "Adam");
+        auto g = make_contiguous(p->grad);
+        auto& s = state_.get(p);
+        s.step++;
+        int64_t n = p->size();
+
+#ifdef USE_CUDA
+        if (p->device == Device::CUDA) {
+            cuda::adamw_step(p->data_ptr<float>(), g->data_ptr<float>(), s.m->data_ptr<float>(), s.v->data_ptr<float>(),
+                             lr, beta1, beta2, eps, weight_decay, (int)s.step, n);
+            return;
+        }
+#endif
+        if (p->device == Device::MPS && MetalBackend::get().is_available()) {
+            MetalBackend::get().adamw(p->data_ptr<float>(), g->data_ptr<float>(), s.m->data_ptr<float>(), s.v->data_ptr<float>(),
+                                      (size_t)n, lr, beta1, beta2, eps, weight_decay, (int)s.step);
+            return;
+        }
+        if (p->device != Device::CPU && p->device != Device::MPS) throw std::runtime_error("Adam: unsupported device");
+
+        float* w = p->data_ptr<float>();
+        const float* grad = g->data_ptr<float>();
+        float* m = s.m->data_ptr<float>();
+        float* v = s.v->data_ptr<float>();
+        const float bias1 = 1.0f - (float)std::pow((double)beta1, (double)s.step);
+        const float bias2 = 1.0f - (float)std::pow((double)beta2, (double)s.step);
+        for (int64_t i = 0; i < n; ++i) {
+            w[i] -= lr * weight_decay * w[i];
+            m[i] = beta1 * m[i] + (1.0f - beta1) * grad[i];
+            v[i] = beta2 * v[i] + (1.0f - beta2) * grad[i] * grad[i];
+            w[i] -= lr * (m[i] / bias1) / (std::sqrt(v[i] / bias2) + eps);
+        }
+    }
+
+    void zero_grad(const std::vector<std::shared_ptr<Tensor>>& params) { ::zero_grad(params); }
+
+    // State of the given parameters, keyed "<name>.exp_avg", "<name>.exp_avg_sq", "<name>.step".
+    // Parameters that never received a gradient have no state and are omitted.
+    NamedTensors state_dict(const NamedTensors& named_params) const {
+        NamedTensors out;
+        for (const auto& [name, p] : named_params) {
+            const State* s = state_.find(p);
+            if (!s || !s->m) continue;
+            out.emplace_back(name + ".exp_avg", s->m);
+            out.emplace_back(name + ".exp_avg_sq", s->v);
+            out.emplace_back(name + ".step", io::encode_int64(s->step));
+        }
+        return out;
+    }
+
+    // Restores state saved by state_dict(). Parameters without saved state start fresh;
+    // wrong-shaped state throws.
+    void load_state_dict(const NamedTensors& named_params,
+                         const std::unordered_map<std::string, std::shared_ptr<Tensor>>& state) {
+        for (const auto& [name, p] : named_params) {
+            auto m = state.find(name + ".exp_avg");
+            auto v = state.find(name + ".exp_avg_sq");
+            auto step = state.find(name + ".step");
+            if (m == state.end() || v == state.end() || step == state.end()) continue;
+            auto& s = state_.get(p);
+            optim_detail::load_into(s.m, m->second, m->first);
+            optim_detail::load_into(s.v, v->second, v->first);
+            s.step = io::decode_int64(step->second);
+        }
+    }
+
+private:
+    struct State {
+        std::shared_ptr<Tensor> m, v;
+        int64_t step = 0;
+        void follow(const std::shared_ptr<Tensor>& p) {
+            if (!m) {
+                m = optim_detail::zeros_like(p);
+                v = optim_detail::zeros_like(p);
+            }
+            optim_detail::follow_device(m, p);
+            optim_detail::follow_device(v, p);
+        }
+    };
+    optim_detail::StateMap<State> state_;
+};
+
+using AdamW = Adam;

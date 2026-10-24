@@ -129,7 +129,7 @@ CMake prints whether it found CUDA (`Building with GPU support`) or is building 
 | `ENABLE_CUDA` | `ON` | Build the CUDA backend when `nvcc` is found; set `OFF` to force CPU-only |
 | `CMAKE_CUDA_ARCHITECTURES` | `native` (CMake ≥ 3.24) | GPU generations to compile for, e.g. `75` for T4, `80` for A100, `89` for RTX 40xx |
 | `DUMMYGRAD_BUILD_TESTS` | `ON`* | Build the `test_engine` test suite |
-| `DUMMYGRAD_BUILD_EXAMPLES` | `ON`* | Build the examples: `quickstart`, `custom_op`, `train_colab` |
+| `DUMMYGRAD_BUILD_EXAMPLES` | `ON`* | Build the examples: `quickstart`, `custom_op`, `train_lm`, `train_colab` |
 
 \* Only when dummygrad is the top-level project; off when used inside your own project.
 
@@ -238,6 +238,47 @@ block.load_safetensors("block.safetensors");   // strict: mismatched names or sh
 - Non-trainable state that should move with the module goes in `v.buffer(name, tensor)`; pass `/*persistent=*/false` for state you recompute (like RoPE tables) so it isn't saved.
 - `load_safetensors(path, /*strict=*/false)` loads the matching subset of a checkpoint, e.g. to initialize part of a new model. Shape mismatches still throw.
 - `requires_grad_(false)` freezes a module's parameters; `.to()` keeps them frozen.
+
+### A complete training run
+
+[`examples/train_lm.cpp`](examples/train_lm.cpp) is a template for real experiments: a character-level language model with train/validation data, AdamW with warmup and cosine decay, gradient clipping, metric logging, periodic evaluation, sampling, and resumable checkpoints. Run `./build/train_lm my_text.txt` on any text file, and add `--resume` to continue after an interruption. The core of it:
+
+```cpp
+auto parts = TokenDataset::from_bytes("my_text.txt").split(0.9);   // or from_file("train.bin") for uint16 ids
+TokenDataset train = parts.first, val = parts.second;
+
+ModernTransformer model(256, seq_len, 64, 4, 2, 2);
+model.to(device);
+auto params = model.parameters();
+Adam optimizer(3e-3f, 0.9f, 0.95f, 1e-8f, /*weight_decay=*/0.1f);
+CosineAnnealingLR schedule(3e-3f, steps, /*warmup_steps=*/20, /*min_lr=*/3e-4f);
+MetricsLogger logger("metrics.csv");                    // step,metric,value
+std::mt19937 rng(0);
+
+for (int64_t step = 0; step < steps; ++step) {
+    optimizer.lr = schedule.get_lr();
+    Batch b = train.sample(batch_size, seq_len, rng, device);   // targets = inputs shifted by one
+    optimizer.zero_grad(params);
+    auto loss = fused_cross_entropy(model.forward(b.inputs), b.targets);
+    loss->backward();
+    float grad_norm = clip_grad_norm_(params, 1.0f);
+    optimizer.step(params);
+    schedule.step();
+    logger.log(step, {{"train_loss", loss->cpu()->data_ptr<float>()[0]}, {"grad_norm", grad_norm}});
+
+    if ((step + 1) % 500 == 0)                         // model, optimizer state and step in one file
+        save_checkpoint("ckpt.safetensors", model, &optimizer, TrainingState{step + 1, {{"val_loss", val_loss}}});
+}
+
+// Later, or after a crash:
+TrainingState state = load_checkpoint("ckpt.safetensors", model, &optimizer);   // continue from state.step
+```
+
+- **Checkpoints** hold the model, the optimizer's moment estimates and step counts, and any scalars you add (`TrainingState::scalars`), and are written atomically, so a crash mid-save keeps the previous file intact. Resuming reproduces an uninterrupted run exactly: gradients are summed in a fixed order, so the same code with the same seed gives bitwise-identical results on CPU.
+- **`DataLoader(X, Y, batch_size, shuffle, seed)`** batches in-memory tensors along their first dimension; call `set_epoch(e)` for a deterministic per-epoch shuffle and iterate with `for (auto [x, y] : loader)`.
+- **`TokenDataset`** reads token streams (`from_file` for raw uint16/int32 ids, `from_bytes` for byte-level text), samples random windows with `sample()`, and walks the whole stream for evaluation with `windows()`.
+- **Optimizers:** `Adam` (AdamW, decoupled weight decay) and `SGD` (momentum, weight decay). Their state lives on each parameter's device and follows the model if you move it.
+- **`MetricsLogger`** writes long-format CSV, so any metric can be logged at any step. Load it with `pandas.read_csv(path).pivot(index="step", columns="metric", values="value")`.
 
 ### Writing your own ops
 

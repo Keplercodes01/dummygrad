@@ -423,71 +423,25 @@ public:
 //    Matches PyTorch's torch.nn.utils.clip_grad_norm_ semantics.
 // ============================================================================
 
-inline float clip_grad_norm_(
-    const std::vector<std::shared_ptr<Tensor>>& parameters,
-    float max_norm,
-    float norm_type = 2.0f
-) {
-    if (parameters.empty()) return 0.0f;
-
-    // 1. Compute total global L2 norm
-    float total_norm_sq = 0.0f;
+inline float clip_grad_norm_(const std::vector<std::shared_ptr<Tensor>>& parameters, float max_norm) {
+    // Accumulate in double: summing millions of squared floats in float loses precision
+    double total_sq = 0.0;
     for (const auto& p : parameters) {
-        if (p && p->grad) {
-            if (p->grad->device == Device::CPU) {
-                const float* g = p->grad->data_ptr<float>();
-                int n = p->grad->size();
-                for (int i = 0; i < n; i++) total_norm_sq += g[i] * g[i];
-            }
-#ifdef USE_CUDA
-            else if (p->grad->device == Device::CUDA) {
-                int n = p->grad->size();
-                std::vector<float> h_g(n);
-                cudaMemcpy(h_g.data(), p->grad->data_ptr<float>(), n * sizeof(float), cudaMemcpyDeviceToHost);
-                for (int i = 0; i < n; i++) total_norm_sq += h_g[i] * h_g[i];
-            }
-#endif
-            else {
-                auto g_cpu = p->grad->to(Device::CPU);
-                const float* g = g_cpu->data_ptr<float>();
-                int n = g_cpu->size();
-                for (int i = 0; i < n; i++) total_norm_sq += g[i] * g[i];
-            }
-        }
+        if (!p || !p->grad) continue;
+        auto g = make_contiguous(p->grad);
+        if (g->device != Device::CPU) g = g->cpu();
+        const float* d = g->data_ptr<float>();
+        for (int64_t i = 0; i < g->size(); ++i) total_sq += (double)d[i] * (double)d[i];
     }
+    float total_norm = (float)std::sqrt(total_sq);
 
-    float total_norm = std::sqrt(total_norm_sq);
-
-    // 2. Rescale in-place if norm exceeds max_norm
     if (total_norm > max_norm) {
         float scale = max_norm / (total_norm + 1e-6f);
+        NoGradGuard no_grad;
         for (const auto& p : parameters) {
-            if (p && p->grad) {
-                if (p->grad->device == Device::CPU) {
-                    float* g = p->grad->data_ptr<float>();
-                    int n = p->grad->size();
-                    for (int i = 0; i < n; i++) g[i] *= scale;
-                }
-#ifdef USE_CUDA
-                else if (p->grad->device == Device::CUDA) {
-                    int n = p->grad->size();
-                    std::vector<float> h_g(n);
-                    cudaMemcpy(h_g.data(), p->grad->data_ptr<float>(), n * sizeof(float), cudaMemcpyDeviceToHost);
-                    for (int i = 0; i < n; i++) h_g[i] *= scale;
-                    cudaMemcpy(p->grad->data_ptr<float>(), h_g.data(), n * sizeof(float), cudaMemcpyHostToDevice);
-                }
-#endif
-                else {
-                    auto g_cpu = p->grad->to(Device::CPU);
-                    float* g = g_cpu->data_ptr<float>();
-                    int n = g_cpu->size();
-                    for (int i = 0; i < n; i++) g[i] *= scale;
-                    p->grad = g_cpu->to(p->grad->device);
-                }
-            }
+            if (p && p->grad) p->grad = mul_scalar(p->grad, scale);
         }
     }
-
     return total_norm;
 }
 
