@@ -2,7 +2,9 @@
 
 All notable changes to dummygrad are documented here. Versions follow [Semantic Versioning](https://semver.org/); while the major version is 0, minor releases may change behavior.
 
-## [Unreleased]
+## [0.3.0] - 2026-10-24
+
+The trust release: results no longer go silently wrong for strided tensors, every op is covered by gradient checks, and CI tests every change on Linux and macOS.
 
 ### Fixed
 - **Ops give correct results for strided inputs.** Forward kernels indexed raw memory, so an op applied to a view from `transpose()` or `slice()` — e.g. `relu(transpose(x))` — silently computed on the wrong elements. Every op that indexes raw memory now densifies its inputs first (no cost for already-dense tensors).

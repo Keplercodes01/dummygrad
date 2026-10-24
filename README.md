@@ -11,18 +11,24 @@ No Python. No bindings. No GIL. No multi-layer dispatcher overhead. Just raw, fr
 
 ---
 
-## What's New in v0.2.0
+## What's New
 
-The correctness release. Highlights below; full details in [CHANGELOG.md](CHANGELOG.md).
+Full details for every release are in [CHANGELOG.md](CHANGELOG.md).
 
+### v0.3.0: the trust release
+- **No more silently wrong results on views.** Ops applied to transposed or sliced tensors (`relu(transpose(x))`, ops on `slice()` results) now compute on the right elements, and gradients through slices along any dimension are correct.
+- **Every op and layer is gradient-checked**, including with strided inputs, and a dedicated test checks that strided and dense inputs give identical results.
+- **CI on every change:** the test suite runs on Linux and macOS for every pull request.
+
+### v0.2.1
+- A full [Getting Started](#getting-started) guide: per-OS install, a runnable [quickstart](examples/quickstart.cpp), using dummygrad from your own CMake project, troubleshooting.
+
+### v0.2.0: the correctness release
 - **Correct CUDA training.** Strided copies on the GPU now honor strides (transposed tensors, including the tied LM head, were wrong), softmax and LayerNorm reduce across the whole block for rows wider than 32, and flash-attention backward always produces correct weight gradients.
 - **Correct attention everywhere.** Grouped-query attention no longer reads scrambled K/V heads, and strided gradients flowing through RoPE and tied embeddings are handled on every backend.
 - **A safer autograd engine.** No more gradient corruption in residual connections, and no use-after-free races in the multithreaded backward pass — including when a backward node throws.
 - **Multi-GPU fixes.** Backward runs on each replica's own GPU, and the CUDA caching allocator keeps a separate pool per device.
-- **CUDA RoPE kernels** and FP16/BF16-safe strided copies.
-- **A real test suite.** `test_engine` checks every op and layer against finite differences, compares CUDA with CPU, stress-tests the engine, and trains a small transformer end to end.
-- **One-click Colab.** Build, test and train on a free GPU from [`notebooks/dummygrad_colab.ipynb`](notebooks/dummygrad_colab.ipynb).
-- **v0.2.1:** a full [Getting Started](#getting-started) guide — per-OS install, a runnable [quickstart](examples/quickstart.cpp), using dummygrad from your own CMake project, troubleshooting.
+- **CUDA RoPE kernels**, FP16/BF16-safe strided copies, the `test_engine` suite and a one-click [Colab notebook](notebooks/dummygrad_colab.ipynb).
 
 > **Upgrading from 0.1:** checkpoints still load, but models using CUDA, grouped-query attention or tied embeddings were trained with incorrect activations or gradients — retrain rather than fine-tune.
 
@@ -186,7 +192,7 @@ set(CMAKE_CXX_STANDARD 17)
 include(FetchContent)
 FetchContent_Declare(dummygrad
     GIT_REPOSITORY https://github.com/Keplercodes01/dummygrad.git
-    GIT_TAG        v0.2.1)
+    GIT_TAG        v0.3.0)
 FetchContent_MakeAvailable(dummygrad)
 
 add_executable(my_app main.cpp)
