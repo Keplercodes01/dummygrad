@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD 17)
 include(FetchContent)
 FetchContent_Declare(dummygrad
     GIT_REPOSITORY https://github.com/Keplercodes01/dummygrad.git
-    GIT_TAG        v0.4.0)
+    GIT_TAG        v0.5.0)
 FetchContent_MakeAvailable(dummygrad)
 
 add_executable(my_app main.cpp)

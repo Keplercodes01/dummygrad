@@ -15,6 +15,14 @@ No Python. No bindings. No GIL. No multi-layer dispatcher overhead. Just raw, fr
 
 Full details for every release are in [CHANGELOG.md](CHANGELOG.md).
 
+### v0.5.0: the speed release
+- **Faster than PyTorch on small models, at parity on larger ones.** On a T4, a ModernTransformer training step takes 3.5 ms vs PyTorch's 9.2 ms (0.4M params), 23.6 vs 27.1 ms (3.9M), and 112.6 vs 108.6 ms (23M). See [Performance](#performance).
+- **Everything stays on the GPU.** New kernels for broadcast and scalar ops, RMSNorm, cross entropy, embedding lookup, GQA and gradient clipping removed 1.5 GB of host-device copies per step.
+- **Tiled attention:** FlashAttention-style forward and an atomic-free FlashAttention-2 backward.
+- **Reproducible on the GPU:** the new kernels use fixed-order sums instead of atomics, so ModernTransformer training gives the same results run to run.
+- **Profiler:** `dg_bench --profile` (or `set_profiling(true)`) shows where backward time goes.
+- **Fixed:** broadcasting now follows NumPy rules; `[1, H, S, S]` operands such as ALiBi biases were applied to the wrong heads with batch size above 1.
+
 ### v0.4.0: the workflow release
 - **Build models from modules.** A `Module` base class gives every layer and model `parameters()`, `to()`, train/eval, freezing, and strict checkpoint loading from one `visit()` declaration.
 - **Train like a real project.** Resumable checkpoints (model, optimizer state, step, scalars), `DataLoader` and `TokenDataset`, a CSV metrics logger, AdamW and SGD, and a complete [training template](examples/train_lm.cpp).
@@ -199,7 +207,7 @@ set(CMAKE_CXX_STANDARD 17)
 include(FetchContent)
 FetchContent_Declare(dummygrad
     GIT_REPOSITORY https://github.com/Keplercodes01/dummygrad.git
-    GIT_TAG        v0.4.0)
+    GIT_TAG        v0.5.0)
 FetchContent_MakeAvailable(dummygrad)
 
 add_executable(my_app main.cpp)
@@ -620,13 +628,27 @@ auto out = gpt.forward(input_ids, /*pos_ids=*/nullptr, /*mask=*/doc_mask);
 
 ---
 
+## Performance
+
+Training-step time (forward, backward, AdamW) for the same ModernTransformer architecture (RMSNorm, RoPE, GQA, SwiGLU, tied embeddings) in dummygrad and eager PyTorch, float32, on a Colab T4:
+
+| config | params | dummygrad | PyTorch 2.11 | |
+|---|---|---|---|---|
+| tiny (d=128, 2 layers, batch 8x64) | 0.4M | **3.5 ms** | 9.2 ms | 2.6x faster |
+| small (d=256, 4 layers, batch 16x128) | 3.9M | **23.6 ms** | 27.1 ms | 15% faster |
+| medium (d=512, 6 layers, batch 8x256) | 23.1M | 112.6 ms | **108.6 ms** | within 4% |
+
+dummygrad's advantage is per-op overhead (no Python, no dispatcher), which dominates small models; at larger sizes both are bound by cuBLAS matrix multiplies. Reproduce it with the [Colab notebook](notebooks/dummygrad_colab.ipynb), or run `./build/dg_bench` and `python bench/bench_torch.py` on your own GPU. `./build/dg_bench --profile` breaks backward time down by op.
+
+---
+
 ## Status & Known Limitations
 
 dummygrad is pre-1.0: the core training path (CPU and CUDA, FP32) is covered by `test_engine`; other paths are less exercised.
 
-- **Half precision on CUDA.** FP16/BF16 are supported by `matmul` and data movement; elementwise, normalization and attention kernels are FP32.
-- **Flash attention** is limited to head dimensions ≤ 512 and computes one query row per block (not yet tiled).
-- **Embeddings** are computed as a one-hot matmul, which costs `O(tokens × vocab × d_model)`.
+- **Half precision on CUDA.** FP16/BF16 are supported by `matmul` and data movement; elementwise, normalization and attention kernels are FP32, so there is no mixed-precision training yet.
+- **Attention** uses tiled kernels for head dimensions 16, 32, 64 and 128; other head dimensions (up to 512) fall back to slower untiled kernels.
+- **LayerNorm backward on CUDA** still accumulates gamma/beta gradients with atomics, so GPT-style models are not bitwise reproducible on the GPU (ModernTransformer is).
 - **Multi-GPU gradient aggregation** currently reduces through host memory.
 - **Metal and TPU kernels** are not covered by the test suite (macOS CI runs the CPU backend).
 
