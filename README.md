@@ -1,5 +1,7 @@
 # dummygrad
 
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Keplercodes01/dummygrad/blob/main/notebooks/dummygrad_colab.ipynb)
+
 A pure C++ deep learning engine engineered for absolute speed, zero abstraction bloat, and minimal codebase maintenance.
 
 No Python. No bindings. No GIL. No multi-layer dispatcher overhead. Just raw, frontier-grade execution directly on the metal.
@@ -29,15 +31,17 @@ No Python. No bindings. No GIL. No multi-layer dispatcher overhead. Just raw, fr
 ```
 
 - **Zero-Overhead Dispatch**: Pure C++ inline execution drops op launch overhead from PyTorch's $\sim 3\text{ }\mu\text{s}$ down to sub-$100\text{ ns}$.
-- **Hardware Tensor Cores (cuBLAS)**: Full hardware saturation across `Float32` (with TF32 Tensor Cores), `Float16`, and `BFloat16` using row-major transpose identities that eliminate memory transposition copies.
-- **Tiled FlashAttention**: Custom CUDA forward and backward attention kernels using online softmax. Eliminates the $O(N^2)$ memory bottleneck, executing in strictly $O(N)$ memory.
+- **Hardware Tensor Cores (cuBLAS)**: Full hardware saturation across `Float32` (with TF32 Tensor Cores), `Float16`, and `BFloat16` using thread-safe per-device cuBLAS handles and row-major transpose identities.
+- **Tiled FlashAttention**: Custom CUDA forward and backward attention kernels using online softmax, scaling to head dimensions up to 512 in strictly $O(N)$ memory.
 - **Single-Pass Fused Kernels**:
-  - **LayerNorm**: Warp-shuffle parallel reductions for row mean and variance; fused affine scaling and backward passes.
-  - **AdamW**: Updates parameters, gradients, momentum $m$, and variance $v$ in a single memory pass.
-  - **Activations & Epilogues**: Fast vectorized GELU, ReLU, and fused bias addition kernels.
-- **Hardware CUDA Graphs**: Record entire forward + backward + optimizer steps into an executable GPU graph (`CUDAGraph`) to eliminate 100% of CPU dispatch latency across training iterations.
-- **Zero-Allocation Static Arena**: `CUDAScratchpadArena` with `ArenaScope` RAII helper gives $0\text{ ns}$ allocation overhead for intermediate activation buffers, eliminating memory fragmentation and OOM spikes during 100k+ step training runs.
-- **Native Multi-GPU Scaling**: Single-process Peer-to-Peer direct NVLink/PCIe DMA reduction (`DeviceMesh` + `MultiGPURunner`). No Python `torchrun`, no sockets, no process spawning.
+  - **LayerNorm**: Parallel reductions for row mean and variance; fused affine scaling and backward passes.
+  - **AdamW**: Updates parameters, gradients, momentum $m$, and variance $v$ in a single memory pass with Rule-of-5 resource safety.
+  - **Activations & Epilogues**: Fast vectorized GELU, ReLU, fused bias addition, and Rotary Position Embedding (RoPE) kernels.
+  - **Dynamic Stride Contiguity**: Parallel GPU stride unrolling (`k_make_contiguous`) preserving tensor memory layouts under arbitrary transpositions.
+- **Hardware CUDA Graphs**: Record forward, backward, and optimizer steps into an executable GPU graph (`CUDAGraph`) to eliminate CPU dispatch latency across training iterations.
+- **Scratchpad Arena Allocator**: `CUDAScratchpadArena` with `ArenaScope` RAII helper eliminates runtime memory fragmentation and allocation spikes during high-throughput steps.
+- **Native Multi-GPU Scaling**: Single-process Multi-GPU coordination (`DeviceMesh` + `MultiGPURunner`) with synchronized peer gradient aggregation and direct peer-to-peer weight broadcasting.
+- **Apple Silicon Metal & MPS**: Hardware acceleration on macOS via Metal compute shaders and `MPSMatrixMultiplication` engaging Unified Memory (UMA).
 - **CPU SIMD Fallback**: Vectorized kernels for AVX2/FMA on x86_64 and NEON on ARM with optional OpenBLAS/oneMKL integration.
 
 ---
@@ -54,10 +58,25 @@ No Python. No bindings. No GIL. No multi-layer dispatcher overhead. Just raw, fr
 ```bash
 git clone https://github.com/Keplercodes01/dummygrad.git
 cd dummygrad
-mkdir -p build && cd build
-cmake ..
-make -j$(nproc)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
 ```
+
+| CMake option | Default | Effect |
+|---|---|---|
+| `ENABLE_CUDA` | `ON` | Build the CUDA backend when `nvcc` is found (falls back to CPU-only otherwise) |
+| `CMAKE_CUDA_ARCHITECTURES` | `native` (CMake ≥ 3.24) | GPU generations to compile for, e.g. `75` for T4, `80` for A100 |
+| `DUMMYGRAD_BUILD_TESTS` | `ON` | Build the `test_engine` test suite |
+
+### Tests
+```bash
+./build/test_engine          # or: cd build && ctest --output-on-failure
+```
+
+`test_engine` checks every op and layer's gradients against finite differences on CPU, checks the CUDA backend against the CPU (when a GPU is present), stress-tests the multithreaded autograd engine, and trains a small transformer end to end. It exits non-zero on any failure.
+
+### Run on Colab (no local GPU needed)
+Open [`notebooks/dummygrad_colab.ipynb`](notebooks/dummygrad_colab.ipynb) in Colab with the badge above, select a GPU runtime, and **Run all**. It clones the repo, builds with CUDA, runs the test suite and the `train_colab` demo. To test a branch, set `BRANCH` in the clone cell.
 
 ---
 
@@ -75,27 +94,48 @@ int main() {
     int n_heads     = 12;
     int n_layers    = 12;
 
-    // 1. Initialize GPT model on CUDA with FP16/BF16 Tensor Cores
+    int B = 4;  // batch size
+    int T = 64; // sequence length
+
+    // 1. Initialize GPT model and AdamW optimizer
     GPT model(vocab_size, max_seq_len, d_model, n_heads, n_layers);
+#ifdef USE_CUDA
+    model.cuda();
+    Device device = Device::CUDA;
+#else
+    model.cpu();
+    Device device = Device::CPU;
+#endif
+
+    auto params = model.parameters();
     Adam optimizer(1e-4f);
 
-    // 2. Pre-allocate 2GB GPU scratchpad arena for 0-allocation steps
-    CUDAScratchpadArena::get().init(2ULL * 1024 * 1024 * 1024);
+    // 2. Training loop
+    for (int step = 1; step <= 100; ++step) {
+        optimizer.zero_grad(params);
 
-    // 3. Training step loop
-    for (int step = 0; step < 1000; ++step) {
-        {
-            ArenaScope scope; // Activates scratchpad arena; auto-resets in 0 ns at scope exit
-
-            auto logits = model.forward(input_ids, pos_ids);
-            auto loss = fused_cross_entropy(logits, targets);
-
-            optimizer.zero_grad(model.parameters());
-            loss->backward(); // Executes FlashAttention backward & fused LayerNorm backward
-            optimizer.step(model.parameters()); // Fused AdamW GPU / MPS kernel
+        // Generate synthetic training batch
+        auto in_cpu = std::make_shared<Tensor>(std::vector<int64_t>{B, T}, Device::CPU, DType::Float32, false);
+        auto tgt_cpu = std::make_shared<Tensor>(std::vector<int64_t>{B, T}, Device::CPU, DType::Float32, false);
+        for (int i = 0; i < B * T; ++i) {
+            in_cpu->data_ptr<float>()[i]  = static_cast<float>((step + i) % vocab_size);
+            tgt_cpu->data_ptr<float>()[i] = static_cast<float>((step + i + 1) % vocab_size);
         }
 
-        std::cout << "Step " << step << " complete." << std::endl;
+        auto inputs  = (device == Device::CUDA) ? in_cpu->to(Device::CUDA) : in_cpu;
+        auto targets = (device == Device::CUDA) ? tgt_cpu->to(Device::CUDA) : tgt_cpu;
+
+        // Forward pass -> Fused cross entropy loss -> Backward pass -> Step
+        auto logits = model.forward(inputs);
+        auto loss = fused_cross_entropy(logits, targets);
+
+        loss->backward();
+        optimizer.step(params);
+
+        if (step % 10 == 0) {
+            float loss_val = loss->cpu()->data_ptr<float>()[0];
+            std::cout << "Step " << step << " | Loss: " << loss_val << std::endl;
+        }
     }
 
     return 0;
@@ -104,25 +144,33 @@ int main() {
 
 ---
 
-## Example: Multi-GPU Parallel Training (NVLink P2P)
+## Example: Multi-GPU Parallel Training (P2P Mesh)
 
 ```cpp
 #include "dummy_core.h"
 
-int num_gpus = 4;
+int main() {
+    int num_gpus = 4;
 
-// Spin up model replicas across all 4 GPUs in a single C++ process
-MultiGPURunner<GPT> runner(num_gpus, [](int rank) {
-    return GPT(vocab_size, max_seq_len, d_model, n_heads, n_layers);
-});
+    // Spin up model replicas across all GPUs in a single native C++ process
+    MultiGPURunner<ModernTransformer> runner(num_gpus, [](int rank) {
+        return ModernTransformer(32000, 2048, 512, 8, 4, 2);
+    });
 
-// Execute parallel steps with direct NVLink DMA reduction
-runner.parallel_step([](int rank, GPT& model) {
-    auto logits = model.forward(batch_inputs[rank], batch_pos[rank]);
-    auto loss = cross_entropy(logits, batch_targets[rank]);
-    loss->backward();
-    // Gradients are automatically synchronized across all GPUs via direct NVLink DMA!
-});
+    // Execute parallel steps with peer gradient synchronization
+    runner.parallel_step([](int rank, ModernTransformer& model) {
+        // Each worker executes on its designated CUDA device rank
+        auto inputs = std::make_shared<Tensor>(std::vector<int64_t>{2, 32}, Device::CUDA, DType::Float32, false);
+        auto targets = std::make_shared<Tensor>(std::vector<int64_t>{2, 32}, Device::CUDA, DType::Float32, false);
+
+        auto logits = model.forward(inputs);
+        auto loss = fused_cross_entropy(logits, targets);
+        loss->backward();
+        // Gradients are accumulated across all GPUs and broadcast back automatically!
+    });
+
+    return 0;
+}
 ```
 
 ---

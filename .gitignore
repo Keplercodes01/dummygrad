@@ -8,3 +8,6 @@ test
 .DS_Store
 build/
 compile_commands.json
+checkpoints/
+*.safetensors
+build-*/
