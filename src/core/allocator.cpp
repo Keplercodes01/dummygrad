@@ -47,9 +47,11 @@ void CPUCachingAllocator::empty_cache() {
 void* CUDACachingAllocator::allocate(size_t bytes) {
 #ifdef USE_CUDA
     size_t alloc_size = round_up(bytes);
+    int dev = 0;
+    cudaGetDevice(&dev);
     std::lock_guard<std::mutex> lock(mtx);
 
-    auto& blocks = free_blocks[alloc_size];
+    auto& blocks = free_blocks[dev][alloc_size];
     if (!blocks.empty()) {
         void* ptr = blocks.back();
         blocks.pop_back();
@@ -61,6 +63,7 @@ void* CUDACachingAllocator::allocate(size_t bytes) {
     if (err != cudaSuccess || !ptr) {
         throw std::bad_alloc();
     }
+    ptr_device[ptr] = dev;
     return ptr;
 #else
     (void)bytes;
@@ -73,7 +76,16 @@ void CUDACachingAllocator::free(void* ptr, size_t bytes) {
 #ifdef USE_CUDA
     size_t alloc_size = round_up(bytes);
     std::lock_guard<std::mutex> lock(mtx);
-    free_blocks[alloc_size].push_back(ptr);
+    // Return the block to the pool of the GPU it was allocated on, not the caller's current device
+    auto it = ptr_device.find(ptr);
+    int dev = 0;
+    if (it != ptr_device.end()) {
+        dev = it->second;
+    } else {
+        cudaGetDevice(&dev);
+        ptr_device[ptr] = dev;
+    }
+    free_blocks[dev][alloc_size].push_back(ptr);
 #else
     (void)bytes;
 #endif
@@ -82,9 +94,12 @@ void CUDACachingAllocator::free(void* ptr, size_t bytes) {
 void CUDACachingAllocator::empty_cache() {
 #ifdef USE_CUDA
     std::lock_guard<std::mutex> lock(mtx);
-    for (auto& pair : free_blocks) {
-        for (void* ptr : pair.second) {
-            cudaFree(ptr);
+    for (auto& dev_pool : free_blocks) {
+        for (auto& pair : dev_pool.second) {
+            for (void* ptr : pair.second) {
+                cudaFree(ptr);
+                ptr_device.erase(ptr);
+            }
         }
     }
     free_blocks.clear();

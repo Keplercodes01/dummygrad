@@ -11,6 +11,64 @@ namespace cuda {
 // CUDA Kernels
 // -------------------------------------------------------------
 
+// Block Reduction Primitives (Warp Shuffle + Shared Memory)
+// Reduces values across all threads in a block (up to 1024 threads)
+__device__ __forceinline__ float block_reduce_sum(float val) {
+    __shared__ float s_warp_sum[32];
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+
+    unsigned int mask = __activemask();
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(mask, val, offset);
+    }
+
+    if (lane_id == 0) {
+        s_warp_sum[warp_id] = val;
+    }
+    __syncthreads();
+
+    float warp_val = (threadIdx.x < (blockDim.x + 31) / 32) ? s_warp_sum[lane_id] : 0.0f;
+    if (warp_id == 0) {
+        unsigned int mask0 = __activemask();
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            warp_val += __shfl_down_sync(mask0, warp_val, offset);
+        }
+    }
+    __syncthreads();
+    return warp_val;
+}
+
+__device__ __forceinline__ float block_reduce_max(float val) {
+    __shared__ float s_warp_max[32];
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+
+    unsigned int mask = __activemask();
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_down_sync(mask, val, offset));
+    }
+
+    if (lane_id == 0) {
+        s_warp_max[warp_id] = val;
+    }
+    __syncthreads();
+
+    float warp_val = (threadIdx.x < (blockDim.x + 31) / 32) ? s_warp_max[lane_id] : -1e20f;
+    if (warp_id == 0) {
+        unsigned int mask0 = __activemask();
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            warp_val = fmaxf(warp_val, __shfl_down_sync(mask0, warp_val, offset));
+        }
+    }
+    __syncthreads();
+    return warp_val;
+}
+
 __global__ void k_fill(float* data, float val, int64_t size) {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) data[idx] = val;
@@ -196,11 +254,9 @@ __global__ void k_layernorm_forward(const float* __restrict__ x,
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         sum += row_x[i];
     }
-    for (int offset = 16; offset > 0; offset /= 2) {
-        sum += __shfl_down_sync(0xffffffff, sum, offset);
-    }
+    float total_sum = block_reduce_sum(sum);
     __shared__ float s_mean;
-    if (threadIdx.x == 0) s_mean = sum / cols;
+    if (threadIdx.x == 0) s_mean = total_sum / cols;
     __syncthreads();
     float mu = s_mean;
 
@@ -209,12 +265,10 @@ __global__ void k_layernorm_forward(const float* __restrict__ x,
         float diff = row_x[i] - mu;
         var_sum += diff * diff;
     }
-    for (int offset = 16; offset > 0; offset /= 2) {
-        var_sum += __shfl_down_sync(0xffffffff, var_sum, offset);
-    }
+    float total_var = block_reduce_sum(var_sum);
     __shared__ float s_rstd;
     if (threadIdx.x == 0) {
-        s_rstd = rsqrtf(var_sum / cols + eps);
+        s_rstd = rsqrtf(total_var / cols + eps);
         if (mean_out) mean_out[row] = mu;
         if (rstd_out) rstd_out[row] = s_rstd;
     }
@@ -263,15 +317,14 @@ __global__ void k_layernorm_backward(const float* __restrict__ grad_out,
         if (grad_beta) atomicAdd(&grad_beta[i], dy);
     }
 
-    for (int offset = 16; offset > 0; offset /= 2) {
-        sum_dy += __shfl_down_sync(0xffffffff, sum_dy, offset);
-        sum_dy_xhat += __shfl_down_sync(0xffffffff, sum_dy_xhat, offset);
-    }
-    __shared__ float s_sum_dy, s_sum_dy_xhat;
-    if (threadIdx.x == 0) {
-        s_sum_dy = sum_dy;
-        s_sum_dy_xhat = sum_dy_xhat;
-    }
+    float total_sum_dy = block_reduce_sum(sum_dy);
+    __shared__ float s_sum_dy;
+    if (threadIdx.x == 0) s_sum_dy = total_sum_dy;
+    __syncthreads();
+
+    float total_sum_dy_xhat = block_reduce_sum(sum_dy_xhat);
+    __shared__ float s_sum_dy_xhat;
+    if (threadIdx.x == 0) s_sum_dy_xhat = total_sum_dy_xhat;
     __syncthreads();
 
     float f_cols = (float)cols;
@@ -285,6 +338,12 @@ __global__ void k_layernorm_backward(const float* __restrict__ grad_out,
 }
 
 // Frontier Tiled FlashAttention forward kernel (online softmax, O(1) intermediate GPU memory)
+// Each thread owns head-dim indices d = threadIdx.x + s * blockDim.x. Launches use
+// >= FA_MIN_THREADS threads, so a thread needs at most FA_MAX_DK / FA_MIN_THREADS slots.
+constexpr int FA_MAX_DK = 512;
+constexpr int FA_MIN_THREADS = 32;
+constexpr int FA_SLOTS = FA_MAX_DK / FA_MIN_THREADS;
+
 __global__ void k_flash_attention_forward(const float* __restrict__ q,
                                           const float* __restrict__ k,
                                           const float* __restrict__ v,
@@ -310,9 +369,9 @@ __global__ void k_flash_attention_forward(const float* __restrict__ q,
 
     float m_i = -1e20f;
     float l_i = 0.0f;
-    float acc_o[128];
+    float acc_o[FA_SLOTS];
     #pragma unroll
-    for (int d = 0; d < 128; ++d) acc_o[d] = 0.0f;
+    for (int s = 0; s < FA_SLOTS; ++s) acc_o[s] = 0.0f;
 
     int max_j = causal ? (i + 1) : seq_len;
 
@@ -332,16 +391,16 @@ __global__ void k_flash_attention_forward(const float* __restrict__ q,
 
         l_i = l_i * alpha + beta;
 
-        for (int d = threadIdx.x; d < d_k; d += blockDim.x) {
-            acc_o[d] = acc_o[d] * alpha + beta * v_j[d];
+        for (int d = threadIdx.x, s = 0; d < d_k; d += blockDim.x, ++s) {
+            acc_o[s] = acc_o[s] * alpha + beta * v_j[d];
         }
 
         m_i = m_new;
     }
 
     float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
-    for (int d = threadIdx.x; d < d_k; d += blockDim.x) {
-        out_row[d] = acc_o[d] * inv_l;
+    for (int d = threadIdx.x, s = 0; d < d_k; d += blockDim.x, ++s) {
+        out_row[d] = acc_o[s] * inv_l;
     }
 }
 
@@ -410,9 +469,9 @@ __global__ void k_flash_attention_backward(const float* __restrict__ q,
     float l_inv = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
 
     // 3. Compute gradients dQ_i and accumulate dK_j, dV_j
-    float acc_dq[128];
+    float acc_dq[FA_SLOTS];
     #pragma unroll
-    for (int d = 0; d < 128; ++d) acc_dq[d] = 0.0f;
+    for (int s = 0; s < FA_SLOTS; ++s) acc_dq[s] = 0.0f;
 
     for (int j = 0; j < max_j; ++j) {
         const float* k_j = k_head + (int64_t)j * d_k;
@@ -435,15 +494,15 @@ __global__ void k_flash_attention_backward(const float* __restrict__ q,
 
         float ds_ij = p_ij * (dp_ij - d_i) * scale;
 
-        for (int d = threadIdx.x; d < d_k; d += blockDim.x) {
-            acc_dq[d] += ds_ij * k_j[d];
+        for (int d = threadIdx.x, s = 0; d < d_k; d += blockDim.x, ++s) {
+            acc_dq[s] += ds_ij * k_j[d];
             atomicAdd(&dk_j[d], ds_ij * s_q[d]);
             atomicAdd(&dv_j[d], p_ij * s_do[d]);
         }
     }
 
-    for (int d = threadIdx.x; d < d_k; d += blockDim.x) {
-        dq_row[d] = acc_dq[d];
+    for (int d = threadIdx.x, s = 0; d < d_k; d += blockDim.x, ++s) {
+        dq_row[d] = acc_dq[s];
     }
 }
 
@@ -492,12 +551,9 @@ __global__ void k_softmax_forward(const float* in, float* out, int rows, int col
         if (row_in[i] > max_val) max_val = row_in[i];
     }
 
-    // Warp reduction for max
-    for (int offset = 16; offset > 0; offset /= 2) {
-        max_val = fmaxf(max_val, __shfl_down_sync(0xffffffff, max_val, offset));
-    }
+    float total_max = block_reduce_max(max_val);
     __shared__ float s_max;
-    if (threadIdx.x == 0) s_max = max_val;
+    if (threadIdx.x == 0) s_max = total_max;
     __syncthreads();
     max_val = s_max;
 
@@ -508,12 +564,9 @@ __global__ void k_softmax_forward(const float* in, float* out, int rows, int col
         sum_exp += exp_val;
     }
 
-    // Warp reduction for sum
-    for (int offset = 16; offset > 0; offset /= 2) {
-        sum_exp += __shfl_down_sync(0xffffffff, sum_exp, offset);
-    }
+    float total_sum = block_reduce_sum(sum_exp);
     __shared__ float s_sum;
-    if (threadIdx.x == 0) s_sum = sum_exp;
+    if (threadIdx.x == 0) s_sum = total_sum;
     __syncthreads();
 
     float inv_sum = 1.0f / (s_sum + 1e-12f);
@@ -535,11 +588,9 @@ __global__ void k_softmax_backward(const float* out, const float* grad_out, floa
         sum_dot += row_grad[i] * row_out[i];
     }
 
-    for (int offset = 16; offset > 0; offset /= 2) {
-        sum_dot += __shfl_down_sync(0xffffffff, sum_dot, offset);
-    }
+    float total_dot = block_reduce_sum(sum_dot);
     __shared__ float s_dot;
-    if (threadIdx.x == 0) s_dot = sum_dot;
+    if (threadIdx.x == 0) s_dot = total_dot;
     __syncthreads();
 
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
@@ -598,17 +649,153 @@ void copy_from_vector(Tensor& tensor, const std::vector<float>& values) {
                           values.size() * sizeof(float), cudaMemcpyHostToDevice));
 }
 
-void make_contiguous(Tensor& dst, const Tensor& src) {
-    if (src.is_contiguous()) {
-        CUDA_CHECK(cudaMemcpy(dst.data_ptr<float>(), src.data_ptr<float>(),
-                              src.size() * sizeof(float), cudaMemcpyDeviceToDevice));
-    } else {
-        // Fallback for non-contiguous: copy to host, make contiguous, copy back
-        std::vector<float> host_src(src.size());
-        CUDA_CHECK(cudaMemcpy(host_src.data(), src.data_ptr<float>(), src.size() * sizeof(float), cudaMemcpyDeviceToHost));
-        // Direct linear copy to destination
-        CUDA_CHECK(cudaMemcpy(dst.data_ptr<float>(), host_src.data(), dst.size() * sizeof(float), cudaMemcpyHostToDevice));
+struct TensorLayout {
+    int ndim;
+    int64_t shape[8];
+    int64_t strides[8];
+};
+
+// Pure data movement, so T is just an element of the right width (4/2/1 bytes)
+template <typename T>
+__global__ void k_make_contiguous(T* dst, const T* src, TensorLayout layout, int64_t total_elements) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+
+    int64_t temp = idx;
+    int64_t src_offset = 0;
+    for (int d = layout.ndim - 1; d >= 0; --d) {
+        int64_t coord = temp % layout.shape[d];
+        temp /= layout.shape[d];
+        src_offset += coord * layout.strides[d];
     }
+    dst[idx] = src[src_offset];
+}
+
+__global__ void k_rope_forward(const float* in, const float* cos_freqs, const float* sin_freqs,
+                               float* out, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos) {
+    int64_t total = (int64_t)batch_size * seq_len * n_heads * (head_dim / 2);
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int half_dim = head_dim / 2;
+    int j = idx % half_dim;
+    int64_t rem = idx / half_dim;
+    int h = rem % n_heads;
+    rem /= n_heads;
+    int s = rem % seq_len;
+    int b = rem / seq_len;
+
+    int pos = start_pos + s;
+    float c = cos_freqs[pos * half_dim + j];
+    float s_val = sin_freqs[pos * half_dim + j];
+
+    int64_t base = ((int64_t)(b * seq_len + s) * n_heads + h) * head_dim;
+    float x0 = in[base + 2 * j];
+    float x1 = in[base + 2 * j + 1];
+
+    out[base + 2 * j]     = x0 * c - x1 * s_val;
+    out[base + 2 * j + 1] = x0 * s_val + x1 * c;
+}
+
+__global__ void k_rope_backward(const float* grad_out, const float* cos_freqs, const float* sin_freqs,
+                                float* grad_in, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos) {
+    int64_t total = (int64_t)batch_size * seq_len * n_heads * (head_dim / 2);
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int half_dim = head_dim / 2;
+    int j = idx % half_dim;
+    int64_t rem = idx / half_dim;
+    int h = rem % n_heads;
+    rem /= n_heads;
+    int s = rem % seq_len;
+    int b = rem / seq_len;
+
+    int pos = start_pos + s;
+    float c = cos_freqs[pos * half_dim + j];
+    float s_val = sin_freqs[pos * half_dim + j];
+
+    int64_t base = ((int64_t)(b * seq_len + s) * n_heads + h) * head_dim;
+    float d0 = grad_out[base + 2 * j];
+    float d1 = grad_out[base + 2 * j + 1];
+
+    grad_in[base + 2 * j]     = d0 * c + d1 * s_val;
+    grad_in[base + 2 * j + 1] = -d0 * s_val + d1 * c;
+}
+
+template <typename T>
+static void make_contiguous_typed(Tensor& dst, const Tensor& src) {
+    int ndim = src.ndim();
+    int64_t total = src.size();
+    if (ndim <= 8) {
+        TensorLayout layout;
+        layout.ndim = ndim;
+        for (int i = 0; i < ndim; ++i) {
+            layout.shape[i] = src.shape[i];
+            layout.strides[i] = src.strides[i];
+        }
+        int threads = 256;
+        int blocks = (int)((total + threads - 1) / threads);
+        k_make_contiguous<T><<<blocks, threads>>>(dst.data_ptr<T>(), src.data_ptr<T>(), layout, total);
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        // CPU fallback for > 8 dimensions. Strided views can reach anywhere in the storage,
+        // so stage from the view's base offset up to its furthest element.
+        int64_t span = 1;
+        for (int d = 0; d < ndim; d++) span += (src.shape[d] - 1) * src.strides[d];
+        std::vector<T> host_src(span);
+        std::vector<T> host_dst(total);
+        CUDA_CHECK(cudaMemcpy(host_src.data(), src.data_ptr<T>(), span * sizeof(T), cudaMemcpyDeviceToHost));
+        std::vector<int64_t> coords(ndim, 0);
+        for (int64_t i = 0; i < total; i++) {
+            int64_t src_idx = 0;
+            for (int d = 0; d < ndim; d++) src_idx += coords[d] * src.strides[d];
+            host_dst[i] = host_src[src_idx];
+            for (int d = ndim - 1; d >= 0; d--) {
+                coords[d]++;
+                if (coords[d] < src.shape[d]) break;
+                coords[d] = 0;
+            }
+        }
+        CUDA_CHECK(cudaMemcpy(dst.data_ptr<T>(), host_dst.data(), total * sizeof(T), cudaMemcpyHostToDevice));
+    }
+}
+
+void make_contiguous(Tensor& dst, const Tensor& src) {
+    if (dst.dtype != src.dtype) throw std::runtime_error("cuda::make_contiguous requires identical dtypes");
+    if (dst.size() != src.size()) throw std::runtime_error("cuda::make_contiguous requires identical sizes");
+    int64_t total = src.size();
+    if (total == 0) return;
+    size_t elem = dtype_size(src.dtype);
+
+    if (src.is_contiguous()) {
+        CUDA_CHECK(cudaMemcpy(dst.data_ptr<void>(), src.data_ptr<void>(), total * elem, cudaMemcpyDeviceToDevice));
+        return;
+    }
+    switch (elem) {
+        case 4: make_contiguous_typed<uint32_t>(dst, src); break;
+        case 2: make_contiguous_typed<uint16_t>(dst, src); break;
+        case 1: make_contiguous_typed<uint8_t>(dst, src); break;
+        default: throw std::runtime_error("cuda::make_contiguous: unsupported element size");
+    }
+}
+
+void rope_forward(const float* in, const float* cos_freqs, const float* sin_freqs,
+                  float* out, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos) {
+    int64_t total = (int64_t)batch_size * seq_len * n_heads * (head_dim / 2);
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    k_rope_forward<<<blocks, threads>>>(in, cos_freqs, sin_freqs, out, batch_size, seq_len, n_heads, head_dim, start_pos);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void rope_backward(const float* grad_out, const float* cos_freqs, const float* sin_freqs,
+                   float* grad_in, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos) {
+    int64_t total = (int64_t)batch_size * seq_len * n_heads * (head_dim / 2);
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    k_rope_backward<<<blocks, threads>>>(grad_out, cos_freqs, sin_freqs, grad_in, batch_size, seq_len, n_heads, head_dim, start_pos);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void relu_forward(const float* in, float* out, int64_t size) {
@@ -782,9 +969,10 @@ void flash_attention_forward(const float* q, const float* k, const float* v,
                              float* out,
                              int batch_size, int num_heads, int seq_len, int d_k,
                              bool causal, float scale) {
+    if (d_k > FA_MAX_DK) throw std::runtime_error("flash_attention_forward: head dim " + std::to_string(d_k) + " exceeds " + std::to_string(FA_MAX_DK));
     dim3 grid(batch_size * num_heads, seq_len);
     int threads = std::min(128, d_k);
-    if (threads < 32) threads = 32;
+    if (threads < FA_MIN_THREADS) threads = FA_MIN_THREADS;
     size_t smem = d_k * sizeof(float);
     k_flash_attention_forward<<<grid, threads, smem>>>(q, k, v, out,
                                                        batch_size, num_heads, seq_len, d_k,
@@ -797,6 +985,7 @@ void flash_attention_backward(const float* q, const float* k, const float* v,
                               float* grad_q, float* grad_k, float* grad_v,
                               int batch_size, int num_heads, int seq_len, int d_k,
                               bool causal, float scale) {
+    if (d_k > FA_MAX_DK) throw std::runtime_error("flash_attention_backward: head dim " + std::to_string(d_k) + " exceeds " + std::to_string(FA_MAX_DK));
     int64_t head_stride = (int64_t)seq_len * d_k;
     int64_t total_elements = (int64_t)batch_size * num_heads * head_stride;
     CUDA_CHECK(cudaMemset(grad_k, 0, total_elements * sizeof(float)));
@@ -804,7 +993,7 @@ void flash_attention_backward(const float* q, const float* k, const float* v,
 
     dim3 grid(batch_size * num_heads, seq_len);
     int threads = std::min(128, d_k);
-    if (threads < 32) threads = 32;
+    if (threads < FA_MIN_THREADS) threads = FA_MIN_THREADS;
     size_t smem = 2 * d_k * sizeof(float);
     k_flash_attention_backward<<<grid, threads, smem>>>(q, k, v, out, grad_out,
                                                         grad_q, grad_k, grad_v,
@@ -869,6 +1058,9 @@ std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& _a, const std::sha
     int batch_size_a = a->size() / (r1 * c1);
     int batch_size_b = b->size() / (r2 * c2);
     int batch_size = std::max(batch_size_a, batch_size_b);
+    // Strided-batched GEMM can only broadcast a whole operand (batch 1), not individual dims
+    if (batch_size_a != batch_size_b && batch_size_a != 1 && batch_size_b != 1)
+        throw std::runtime_error("cuda::matmul: partial batch broadcasting is not supported");
 
     std::vector<int64_t> out_shape = (batch_size_a >= batch_size_b) ? a->shape : b->shape;
     out_shape[out_shape.size() - 2] = r1;
@@ -970,6 +1162,8 @@ void matmul_backward(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Ten
     int batch_size_a = a_c->size() / (r1 * c1);
     int batch_size_b = b_c->size() / (r2 * c2);
     int batch_size = std::max(batch_size_a, batch_size_b);
+    if (batch_size_a != batch_size_b && batch_size_a != 1 && batch_size_b != 1)
+        throw std::runtime_error("cuda::matmul_backward: partial batch broadcasting is not supported");
 
     grad_a = std::make_shared<Tensor>(a_c->shape, Device::CUDA, a_c->dtype, false);
     grad_a->fill_(0.0f);

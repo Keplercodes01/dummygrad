@@ -134,9 +134,9 @@ inline std::shared_ptr<Tensor> scale_n_shift(const std::shared_ptr<Tensor>& x,
 
     if (req_grad) {
         auto grad_fn = std::make_shared<ScaleAndShiftBackward>(x, gamma, beta, r, c, batch_size, ndim, nout);
-        grad_fn->add_next_edge(get_grad_edge(x).function, 0);
-        grad_fn->add_next_edge(get_grad_edge(gamma).function, 1);
-        grad_fn->add_next_edge(get_grad_edge(beta).function, 2);
+        grad_fn->add_next_edge(get_grad_edge(x).function);
+        grad_fn->add_next_edge(get_grad_edge(gamma).function);
+        grad_fn->add_next_edge(get_grad_edge(beta).function);
         out->grad_fn = grad_fn;
     }
 

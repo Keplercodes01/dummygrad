@@ -189,12 +189,47 @@ public:
             workers.emplace_back([this, rank, &step_fn]() {
                 CUDA_CHECK(cudaSetDevice(rank));
                 step_fn(rank, *replicas[rank]);
-                all_reduce_gradients_p2p(replica_params[rank], replica_params[0], rank, world_size);
+                CUDA_CHECK(cudaDeviceSynchronize());
             });
         }
 
         for (auto& w : workers) {
             if (w.joinable()) w.join();
+        }
+
+        if (world_size <= 1) return;
+
+        // 1. Accumulate peer gradients into Rank 0 once all forward/backward passes complete
+        for (int rank = 1; rank < world_size; ++rank) {
+            auto& root_params = replica_params[0];
+            auto& peer_params = replica_params[rank];
+            for (size_t i = 0; i < root_params.size() && i < peer_params.size(); ++i) {
+                auto& root_p = root_params[i];
+                auto& peer_p = peer_params[i];
+                if (!root_p || !root_p->grad || !peer_p || !peer_p->grad) continue;
+                int64_t size = root_p->grad->size();
+                std::vector<float> h_peer(size);
+                CUDA_CHECK(cudaMemcpy(h_peer.data(), peer_p->grad->data_ptr<float>(), size * sizeof(float), cudaMemcpyDeviceToHost));
+                std::vector<float> h_root(size);
+                CUDA_CHECK(cudaMemcpy(h_root.data(), root_p->grad->data_ptr<float>(), size * sizeof(float), cudaMemcpyDeviceToHost));
+                for (int64_t j = 0; j < size; ++j) {
+                    h_root[j] += h_peer[j];
+                }
+                CUDA_CHECK(cudaMemcpy(root_p->grad->data_ptr<float>(), h_root.data(), size * sizeof(float), cudaMemcpyHostToDevice));
+            }
+        }
+
+        // 2. Broadcast fully accumulated gradients from Rank 0 back to peer replicas
+        for (int rank = 1; rank < world_size; ++rank) {
+            auto& root_params = replica_params[0];
+            auto& target_params = replica_params[rank];
+            CUDA_CHECK(cudaSetDevice(rank));
+            for (size_t i = 0; i < root_params.size() && i < target_params.size(); ++i) {
+                if (!root_params[i] || !root_params[i]->grad || !target_params[i] || !target_params[i]->grad) continue;
+                CUDA_CHECK(cudaMemcpy(target_params[i]->grad->data_ptr<float>(), root_params[i]->grad->data_ptr<float>(),
+                                      root_params[i]->grad->size() * sizeof(float), cudaMemcpyDeviceToDevice));
+            }
+            CUDA_CHECK(cudaDeviceSynchronize());
         }
     }
 };

@@ -90,7 +90,7 @@ inline std::shared_ptr<Tensor> sliding_window_mask(const std::shared_ptr<Tensor>
         cuda::sliding_window_mask(scores->data_ptr<float>(), out->data_ptr<float>(), batch_size, r, window_size);
         if (req_grad) {
             auto grad_fn = std::make_shared<SlidingWindowMaskBackward>(r, c, batch_size, window_size);
-            grad_fn->add_next_edge(get_grad_edge(scores).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(scores).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -101,7 +101,7 @@ inline std::shared_ptr<Tensor> sliding_window_mask(const std::shared_ptr<Tensor>
                                                 batch_size, r, window_size);
         if (req_grad) {
             auto grad_fn = std::make_shared<SlidingWindowMaskBackward>(r, c, batch_size, window_size);
-            grad_fn->add_next_edge(get_grad_edge(scores).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(scores).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -122,7 +122,7 @@ inline std::shared_ptr<Tensor> sliding_window_mask(const std::shared_ptr<Tensor>
 
     if (req_grad) {
         auto grad_fn = std::make_shared<SlidingWindowMaskBackward>(r, c, batch_size, window_size);
-        grad_fn->add_next_edge(get_grad_edge(scores).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(scores).function);
         out->grad_fn = grad_fn;
     }
 
@@ -187,7 +187,7 @@ inline std::shared_ptr<Tensor> prefix_causal_mask(const std::shared_ptr<Tensor>&
         cuda::prefix_causal_mask(scores->data_ptr<float>(), out->data_ptr<float>(), batch_size, r, prefix_len);
         if (req_grad) {
             auto grad_fn = std::make_shared<PrefixCausalMaskBackward>(r, c, batch_size, prefix_len);
-            grad_fn->add_next_edge(get_grad_edge(scores).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(scores).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -209,7 +209,7 @@ inline std::shared_ptr<Tensor> prefix_causal_mask(const std::shared_ptr<Tensor>&
 
     if (req_grad) {
         auto grad_fn = std::make_shared<PrefixCausalMaskBackward>(r, c, batch_size, prefix_len);
-        grad_fn->add_next_edge(get_grad_edge(scores).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(scores).function);
         out->grad_fn = grad_fn;
     }
 

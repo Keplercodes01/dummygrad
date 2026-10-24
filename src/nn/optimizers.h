@@ -53,6 +53,11 @@ public:
     Adam(float lr = 0.001f, float b1 = 0.9f, float b2 = 0.999f, float E = 1e-8f, float weight_decay = 0.01f)
         : lr(lr), b1(b1), b2(b2), E(E), weight_decay(weight_decay) {}
 
+    Adam(const Adam&) = delete;
+    Adam& operator=(const Adam&) = delete;
+    Adam(Adam&&) noexcept = default;
+    Adam& operator=(Adam&&) noexcept = default;
+
     ~Adam() {
 #ifdef USE_CUDA
         for (auto& pair : state) {

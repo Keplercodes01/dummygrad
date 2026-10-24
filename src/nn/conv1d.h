@@ -17,7 +17,7 @@ inline std::shared_ptr<Tensor> conv1d(const std::shared_ptr<Tensor>& x, const st
     auto w_2d = weight->reshape({weight->shape[0], weight->shape[1], 1, weight->shape[2]});
     
     // out_2d: [B, C_out, 1, L_out]
-    auto out_2d = conv2d(x_2d, w_2d, stride, padding); 
+    auto out_2d = conv2d(x_2d, w_2d, 1, stride, 0, padding); 
     
     return out_2d->reshape({out_2d->shape[0], out_2d->shape[1], out_2d->shape[3]});
 }

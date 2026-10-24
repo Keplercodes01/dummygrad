@@ -110,28 +110,31 @@ public:
         }
         int r = (ndim >= 2) ? x->shape[ndim - 2] : 1;
         int batch_size = x->size() / (r * c);
+        bool req_grad = (x && x->requires_grad) || (gamma && gamma->requires_grad);
 
         if (x->device != Device::CPU) {
             auto x_cpu = x->to(Device::CPU);
             auto gamma_cpu = gamma->to(Device::CPU);
+            x_cpu->requires_grad = x->requires_grad;
+            gamma_cpu->requires_grad = gamma->requires_grad;
             RMSNorm norm_cpu(gamma->shape[0], eps);
             norm_cpu.gamma = gamma_cpu;
             auto out_cpu = norm_cpu.forward(x_cpu);
             auto out_res = out_cpu->to(x->device);
-            if (x->requires_grad) {
+            if (req_grad && out_cpu->grad_fn) {
                 auto grad_fn = std::make_shared<RMSNormBackward>(
                     x, gamma,
                     std::static_pointer_cast<RMSNormBackward>(out_cpu->grad_fn)->inv_rms->to(x->device),
                     r, c, batch_size
                 );
-                grad_fn->add_next_edge(get_grad_edge(x).function, 0);
-                grad_fn->add_next_edge(get_grad_edge(gamma).function, 1);
+                grad_fn->add_next_edge(get_grad_edge(x).function);
+                grad_fn->add_next_edge(get_grad_edge(gamma).function);
                 out_res->grad_fn = grad_fn;
             }
             return out_res;
         }
 
-        auto out = std::make_shared<Tensor>(x->shape, x->device, x->dtype, x->requires_grad);
+        auto out = std::make_shared<Tensor>(x->shape, x->device, x->dtype, req_grad);
         auto inv_rms = std::make_shared<Tensor>(std::vector<int64_t>{batch_size * r}, x->device, x->dtype, false);
 
         const float* x_ptr = x->data_ptr<float>();
@@ -157,10 +160,10 @@ public:
             }
         }
 
-        if (x->requires_grad) {
+        if (req_grad) {
             auto grad_fn = std::make_shared<RMSNormBackward>(x, gamma, inv_rms, r, c, batch_size);
-            grad_fn->add_next_edge(get_grad_edge(x).function, 0);
-            grad_fn->add_next_edge(get_grad_edge(gamma).function, 1);
+            grad_fn->add_next_edge(get_grad_edge(x).function);
+            grad_fn->add_next_edge(get_grad_edge(gamma).function);
             out->grad_fn = grad_fn;
         }
 
@@ -230,6 +233,16 @@ struct RoPEBackward : public Node {
         if (grads.empty() || !grads[0] || !x || !cos_freqs || !sin_freqs) return {nullptr};
         auto dout = grads[0];
 
+#ifdef USE_CUDA
+        if (x->device == Device::CUDA && cos_freqs->device == Device::CUDA && sin_freqs->device == Device::CUDA) {
+            auto dout_c = make_contiguous(dout);
+            auto dx = std::make_shared<Tensor>(x->shape, Device::CUDA, x->dtype, false);
+            cuda::rope_backward(dout_c->data_ptr<float>(), cos_freqs->data_ptr<float>(), sin_freqs->data_ptr<float>(),
+                                dx->data_ptr<float>(), batch_size, seq_len, n_heads, head_dim, start_pos);
+            return {dx};
+        }
+#endif
+
         if (x->device != Device::CPU) {
             auto dout_cpu = dout->to(Device::CPU);
             auto x_cpu = x->to(Device::CPU);
@@ -298,6 +311,22 @@ inline std::shared_ptr<Tensor> apply_rotary_emb(
         throw std::invalid_argument("RoPE head dimension must be even, got: " + std::to_string(head_dim));
     }
 
+#ifdef USE_CUDA
+    if (x->device == Device::CUDA && cos_freqs->device == Device::CUDA && sin_freqs->device == Device::CUDA) {
+        auto xc = make_contiguous(x);
+        auto out = std::make_shared<Tensor>(x->shape, Device::CUDA, x->dtype, x->requires_grad);
+        cuda::rope_forward(xc->data_ptr<float>(), cos_freqs->data_ptr<float>(), sin_freqs->data_ptr<float>(),
+                           out->data_ptr<float>(), batch_size, seq_len, n_heads, head_dim, start_pos);
+        if (x->requires_grad) {
+            auto grad_fn = std::make_shared<RoPEBackward>(xc, cos_freqs, sin_freqs, start_pos,
+                                                          batch_size, seq_len, n_heads, head_dim);
+            grad_fn->add_next_edge(get_grad_edge(x).function);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
+#endif
+
     if (x->device != Device::CPU) {
         auto x_cpu = x->to(Device::CPU);
         auto cos_cpu = cos_freqs->to(Device::CPU);
@@ -307,7 +336,7 @@ inline std::shared_ptr<Tensor> apply_rotary_emb(
         if (x->requires_grad) {
             auto grad_fn = std::make_shared<RoPEBackward>(x, cos_freqs, sin_freqs, start_pos,
                                                           batch_size, seq_len, n_heads, head_dim);
-            grad_fn->add_next_edge(get_grad_edge(x).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(x).function);
             out_res->grad_fn = grad_fn;
         }
         return out_res;
@@ -347,7 +376,7 @@ inline std::shared_ptr<Tensor> apply_rotary_emb(
     if (x->requires_grad) {
         auto grad_fn = std::make_shared<RoPEBackward>(x, cos_freqs, sin_freqs, start_pos,
                                                       batch_size, seq_len, n_heads, head_dim);
-        grad_fn->add_next_edge(get_grad_edge(x).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(x).function);
         out->grad_fn = grad_fn;
     }
 
