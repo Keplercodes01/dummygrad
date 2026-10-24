@@ -2,6 +2,15 @@
 
 All notable changes to dummygrad are documented here. Versions follow [Semantic Versioning](https://semver.org/); while the major version is 0, minor releases may change behavior.
 
+## [Unreleased]
+
+### Added
+- **`dummygrad::gradcheck`** (`testing.h`, included by `dummy_core.h`): checks the gradients of any function of tensors — a custom op, a layer, a whole block — against finite differences and reports the first mismatch. `test_engine` now runs its CPU gradient checks through it.
+- **`NoGradGuard`** / `set_grad_enabled`: no autograd graph is recorded inside the scope, for evaluation and inference. Outputs don't require grad and hold no references to their inputs. Thread-local, like PyTorch's `no_grad`.
+- **`DetectAnomalyGuard`** / `set_detect_anomaly`: backward throws at the first NaN/Inf gradient and names the backward function that produced it.
+- **`examples/custom_op.cpp`** and a README guide to writing your own ops: forward, backward `Node`, graph edges, and verification with `gradcheck`. Built and run by CTest.
+- `needs_grad(t)`: whether an op should record a graph edge for `t` (false inside `NoGradGuard`).
+
 ## [0.3.0] - 2026-10-24
 
 The trust release: results no longer go silently wrong for strided tensors, every op is covered by gradient checks, and CI tests every change on Linux and macOS.

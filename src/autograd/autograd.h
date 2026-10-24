@@ -10,6 +10,21 @@
 #include <atomic>
 #include <functional>
 
+// Anomaly detection: when enabled, backward checks every gradient as it is produced and throws
+// at the first NaN/Inf, naming the backward function that produced it. Costs a scan per
+// gradient (and a device-to-host copy for GPU tensors), so enable it only while debugging.
+// Global rather than thread-local because the checks run on the engine's worker threads.
+void set_detect_anomaly(bool enabled);
+bool detect_anomaly_enabled();
+
+struct DetectAnomalyGuard {
+    bool previous;
+    DetectAnomalyGuard() : previous(detect_anomaly_enabled()) { set_detect_anomaly(true); }
+    ~DetectAnomalyGuard() { set_detect_anomaly(previous); }
+    DetectAnomalyGuard(const DetectAnomalyGuard&) = delete;
+    DetectAnomalyGuard& operator=(const DetectAnomalyGuard&) = delete;
+};
+
 class AutogradEngine {
 private:
     std::vector<std::thread> workers;

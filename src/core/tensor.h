@@ -2,6 +2,7 @@
 #include "types.h"
 #include "storage.h"
 #include "node.h"
+#include "grad_mode.h"
 #include "utils.h"
 #include <vector>
 #include <memory>

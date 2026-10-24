@@ -129,7 +129,7 @@ CMake prints whether it found CUDA (`Building with GPU support`) or is building 
 | `ENABLE_CUDA` | `ON` | Build the CUDA backend when `nvcc` is found; set `OFF` to force CPU-only |
 | `CMAKE_CUDA_ARCHITECTURES` | `native` (CMake ≥ 3.24) | GPU generations to compile for, e.g. `75` for T4, `80` for A100, `89` for RTX 40xx |
 | `DUMMYGRAD_BUILD_TESTS` | `ON`* | Build the `test_engine` test suite |
-| `DUMMYGRAD_BUILD_EXAMPLES` | `ON`* | Build `quickstart` and `train_colab` |
+| `DUMMYGRAD_BUILD_EXAMPLES` | `ON`* | Build the examples: `quickstart`, `custom_op`, `train_colab` |
 
 \* Only when dummygrad is the top-level project; off when used inside your own project.
 
@@ -202,6 +202,62 @@ target_link_libraries(my_app PRIVATE dummygrad::dummygrad)
 Then `#include "dummy_core.h"` in `main.cpp` and build with the usual `cmake -S . -B build && cmake --build build`. CUDA is enabled automatically when `nvcc` is found, and the `ENABLE_CUDA` / `CMAKE_CUDA_ARCHITECTURES` options above work from your project too.
 
 Prefer vendoring? Add the repository as a git submodule and replace the `FetchContent` lines with `add_subdirectory(external/dummygrad)`.
+
+### Writing your own ops
+
+A new op is a forward function plus a backward `Node`. [`examples/custom_op.cpp`](examples/custom_op.cpp) is a complete, compiled example (squared ReLU). The shape of it:
+
+```cpp
+struct SquaredReluBackward : public Node {
+    std::shared_ptr<Tensor> x;                              // what backward needs
+    explicit SquaredReluBackward(std::shared_ptr<Tensor> x) : x(std::move(x)) {}
+    void release_variables() override { x.reset(); }        // free saved tensors after backward
+    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        // grads[0] is dL/dy (always dense); return dL/dx, one entry per input
+    }
+};
+
+std::shared_ptr<Tensor> squared_relu(const std::shared_ptr<Tensor>& x_in) {
+    auto x = contiguous(x_in);                 // kernels that index raw memory need dense inputs
+    auto out = /* compute y = relu(x)^2 */;
+    out->requires_grad = needs_grad(x);        // false inside NoGradGuard
+    if (needs_grad(x)) {
+        auto grad_fn = std::make_shared<SquaredReluBackward>(x);
+        grad_fn->add_next_edge(get_grad_edge(x).function);   // one edge per input, same order as apply()
+        out->grad_fn = grad_fn;
+    }
+    return out;
+}
+```
+
+Then check the backward pass against finite differences before trusting it in a model:
+
+```cpp
+std::string err = dummygrad::gradcheck(
+    [](const std::vector<std::shared_ptr<Tensor>>& in) { return squared_relu(in[0]); },
+    {randn({4, 5})});
+if (!err.empty()) std::cerr << err << "\n";   // e.g. "input 0 element 3: analytic 0.12 vs numeric 0.48"
+```
+
+`gradcheck` works for any function of tensors — a single op, a layer, or a whole block. Use CPU inputs (TF32 GPU matmuls are too imprecise for finite differences) and keep inputs away from kinks such as `relu` at 0.
+
+### Evaluation and debugging
+
+```cpp
+// No graph is recorded inside the scope: less memory and time for evaluation and inference
+{
+    NoGradGuard no_grad;
+    auto val_logits = model.forward(val_inputs);
+}
+
+// Stop at the first NaN/Inf gradient and name the op that produced it
+{
+    DetectAnomalyGuard detect;
+    loss->backward();   // throws e.g. "detect_anomaly: RdivScalarBackward produced Inf in the gradient for its input 0"
+}
+```
+
+Anomaly detection scans every gradient (and copies GPU gradients to the host), so enable it only while hunting a problem.
 
 ### Troubleshooting
 

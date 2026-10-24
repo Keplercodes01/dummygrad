@@ -126,7 +126,7 @@ public:
         }
         int r = (ndim >= 2) ? x->shape[ndim - 2] : 1;
         int batch_size = x->size() / (r * c);
-        bool req_grad = (x && x->requires_grad) || (gamma && gamma->requires_grad) || (beta && beta->requires_grad);
+        bool req_grad = grad_enabled() && ((x && x->requires_grad) || (gamma && gamma->requires_grad) || (beta && beta->requires_grad));
 
 #ifdef USE_CUDA
         if (x->device == Device::CUDA) {
@@ -157,9 +157,9 @@ public:
             auto x_cpu = x->to(Device::CPU);
             auto gamma_cpu = gamma->to(Device::CPU);
             auto beta_cpu = beta->to(Device::CPU);
-            x_cpu->requires_grad = x->requires_grad;
-            gamma_cpu->requires_grad = gamma->requires_grad;
-            beta_cpu->requires_grad = beta->requires_grad;
+            x_cpu->requires_grad = needs_grad(x);
+            gamma_cpu->requires_grad = needs_grad(gamma);
+            beta_cpu->requires_grad = needs_grad(beta);
             LayerNorm ln_cpu(gamma->shape[0], eps);
             ln_cpu.gamma = gamma_cpu;
             ln_cpu.beta = beta_cpu;

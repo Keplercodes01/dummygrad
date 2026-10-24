@@ -1,9 +1,54 @@
 #include "autograd.h"
 #include "ops.h"
 #include <unordered_map>
+#include <cmath>
+#include <stdexcept>
+#include <string>
+#include <typeinfo>
+#if defined(__GNUC__) || defined(__clang__)
+#include <cxxabi.h>
+#include <cstdlib>
+#endif
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
 #endif
+
+static std::atomic<bool> g_detect_anomaly{false};
+
+void set_detect_anomaly(bool enabled) { g_detect_anomaly = enabled; }
+bool detect_anomaly_enabled() { return g_detect_anomaly; }
+
+static std::string node_name(const Node& node) {
+    const char* mangled = typeid(node).name();
+#if defined(__GNUC__) || defined(__clang__)
+    int status = 0;
+    char* demangled = abi::__cxa_demangle(mangled, nullptr, nullptr, &status);
+    if (status == 0 && demangled) {
+        std::string name(demangled);
+        std::free(demangled);
+        return name;
+    }
+#endif
+    return mangled;
+}
+
+// Throws if any float gradient a node produced contains NaN or Inf.
+static void check_finite_grads(const Node& node, const std::vector<std::shared_ptr<Tensor>>& grads) {
+    for (size_t i = 0; i < grads.size(); ++i) {
+        const auto& g = grads[i];
+        if (!g || g->dtype != DType::Float32) continue;
+        auto host = make_contiguous(g);
+        if (host->device != Device::CPU) host = host->to(Device::CPU);
+        const float* p = host->data_ptr<float>();
+        for (int64_t k = 0; k < host->size(); ++k) {
+            if (!std::isfinite(p[k])) {
+                throw std::runtime_error("detect_anomaly: " + node_name(node) + " produced " +
+                                         (std::isnan(p[k]) ? "NaN" : "Inf") + " in the gradient for its input " +
+                                         std::to_string(i) + " (element " + std::to_string(k) + ")");
+            }
+        }
+    }
+}
 
 AutogradEngine::AutogradEngine() {
     int num_threads = std::thread::hardware_concurrency();
@@ -115,6 +160,7 @@ void AutogradEngine::execute(std::shared_ptr<Node> root, const std::vector<int64
             outgoing = curr->apply(incoming);
         }
         incoming.clear();
+        if (detect_anomaly_enabled()) check_finite_grads(*curr, outgoing);
 
         for (size_t i = 0; i < curr->next_edges.size(); ++i) {
             if (failed) return;

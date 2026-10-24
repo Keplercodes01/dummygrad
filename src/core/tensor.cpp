@@ -179,7 +179,7 @@ void tensor_add_inplace(std::shared_ptr<Tensor>& dst, const std::shared_ptr<Tens
 }
 
 Edge get_grad_edge(const std::shared_ptr<Tensor>& t) {
-    if (!t || !t->requires_grad) return {nullptr, 0};
+    if (!t || !t->requires_grad || !grad_enabled()) return {nullptr, 0};
     if (t->grad_fn) return {t->grad_fn, 0};
     if (!t->grad_accumulator) {
         t->grad_accumulator = std::make_shared<AccumulateGrad>(t);
