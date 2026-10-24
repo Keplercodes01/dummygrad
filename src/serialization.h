@@ -142,8 +142,6 @@ inline void save_safetensors(
     }
 
     out.close();
-    std::cout << "[dummygrad SafeTensors] Saved " << ordered_tensors.size() 
-              << " tensor(s) (" << current_offset / (1024.0 * 1024.0) << " MB) to " << filepath << "\n";
 }
 
 // Minimal, zero-dependency parser for SafeTensors JSON header
@@ -384,8 +382,6 @@ inline std::unordered_map<std::string, std::shared_ptr<Tensor>> load_safetensors
     in.close();
 #endif
 
-    std::cout << "[dummygrad SafeTensors] Successfully loaded " << result.size() 
-              << " tensor(s) from " << filepath << "\n";
     return result;
 }
 

@@ -2,7 +2,18 @@
 
 All notable changes to dummygrad are documented here. Versions follow [Semantic Versioning](https://semver.org/); while the major version is 0, minor releases may change behavior.
 
-## [Unreleased]
+## [0.5.0] - 2026-10-24
+
+The speed release. A training step no longer moves data between GPU and CPU, attention runs on tiled kernels, and the new kernels reduce in a fixed order (no atomics), so ModernTransformer training is reproducible on the GPU. On a T4, a ModernTransformer training step is 2.6x faster than eager PyTorch at 0.4M parameters, 15% faster at 3.9M, and within 4% at 23M (it was 11x slower at the start of this release).
+
+| config | 0.4.0 | 0.5.0 | PyTorch 2.11 (eager) |
+|---|---|---|---|
+| tiny (0.4M params) | 24.1 ms | 3.5 ms | 9.2 ms |
+| small (3.9M) | 318.9 ms | 23.6 ms | 27.1 ms |
+| medium (23.1M) | 1190.2 ms | 112.6 ms | 108.6 ms |
+
+### Fixed
+- Library code no longer prints to stdout when saving or loading SafeTensors files.
 
 ### Added
 - **Benchmark** (`bench/bench.cpp`, target `dg_bench`): full ModernTransformer training steps at three sizes, timed as forward / backward / optimizer, with host-device traffic per step. `bench/bench_torch.py` runs the same architecture in PyTorch; the Colab notebook runs both.
