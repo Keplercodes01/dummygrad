@@ -83,7 +83,7 @@ inline std::shared_ptr<Tensor> sliding_window_mask(const std::shared_ptr<Tensor>
     int batch_size = 1;
     for (int i = 0; i < ndim - 2; i++) { batch_size *= scores->shape[i]; }
 
-    bool req_grad = scores->requires_grad;
+    bool req_grad = grad_enabled() && (scores->requires_grad);
     auto out = std::make_shared<Tensor>(scores->shape, scores->device, scores->dtype, req_grad);
 
 #ifdef USE_CUDA
@@ -181,7 +181,7 @@ inline std::shared_ptr<Tensor> prefix_causal_mask(const std::shared_ptr<Tensor>&
     int batch_size = 1;
     for (int i = 0; i < ndim - 2; i++) { batch_size *= scores->shape[i]; }
 
-    bool req_grad = scores->requires_grad;
+    bool req_grad = grad_enabled() && (scores->requires_grad);
     auto out = std::make_shared<Tensor>(scores->shape, scores->device, scores->dtype, req_grad);
 
 #ifdef USE_CUDA

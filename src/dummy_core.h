@@ -44,3 +44,6 @@
 // Multi-GPU Distributed Engine & Checkpoint Serialization
 #include "multi_gpu.h"
 #include "serialization.h"
+
+// Gradient checking for custom ops and layers
+#include "testing.h"

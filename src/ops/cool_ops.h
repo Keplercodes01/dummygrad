@@ -98,7 +98,7 @@ inline std::shared_ptr<Tensor> scale_n_shift(const std::shared_ptr<Tensor>& x_in
     auto g = make_contiguous((gamma->device == Device::CPU) ? gamma : gamma->cpu());
     auto be = make_contiguous((beta->device == Device::CPU) ? beta : beta->cpu());
 
-    bool req_grad = x->requires_grad || gamma->requires_grad || beta->requires_grad;
+    bool req_grad = grad_enabled() && (x->requires_grad || gamma->requires_grad || beta->requires_grad);
     auto out_cpu = std::make_shared<Tensor>(x_cpu->shape, Device::CPU, dt, false);
     int nout = out_cpu->ndim();
 

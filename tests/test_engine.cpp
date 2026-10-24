@@ -165,48 +165,12 @@ static std::vector<float> make_probe(const GradTest& t) {
     return random_values(t.fn(leaves, Device::CPU)->size(), -1.0f, 1.0f);
 }
 
-// Returns an empty string on success, otherwise a description of the first mismatch.
-static std::string gradcheck_cpu(const GradTest& t, const std::vector<float>& probe) {
-    const float h = 1e-2f;
-    const int max_checks = 24;  // sampled elements per leaf keeps big layers fast
-
-    auto analytic = evaluate(t, t.leaves, probe, Device::CPU, true);
-
-    for (size_t i = 0; i < t.leaves.size(); ++i) {
-        int64_t n = (int64_t)t.leaves[i].data.size();
-        std::vector<int64_t> idx(n);
-        for (int64_t k = 0; k < n; ++k) idx[k] = k;
-        if (n > max_checks) {
-            std::mt19937 pick(77 + (unsigned)i);
-            std::shuffle(idx.begin(), idx.end(), pick);
-            idx.resize(max_checks);
-        }
-
-        float max_numeric = 0.0f;
-        for (int64_t k : idx) {
-            auto plus = t.leaves;
-            auto minus = t.leaves;
-            plus[i].data[k] += h;
-            minus[i].data[k] -= h;
-            float f_plus = evaluate(t, plus, probe, Device::CPU, false).loss;
-            float f_minus = evaluate(t, minus, probe, Device::CPU, false).loss;
-            float num = (f_plus - f_minus) / (2.0f * h);
-            float ana = analytic.grads[i][k];
-            max_numeric = std::max(max_numeric, std::fabs(num));
-
-            float tol = 5e-3f + 2e-2f * std::max(std::fabs(num), std::fabs(ana));
-            if (std::fabs(num - ana) > tol) {
-                std::ostringstream os;
-                os << "leaf " << i << " element " << k << ": analytic " << ana << " vs numeric " << num;
-                if (!analytic.has_grad[i]) os << " (no gradient reached this leaf)";
-                return os.str();
-            }
-        }
-        if (!analytic.has_grad[i] && max_numeric > 1e-3f) {
-            return "leaf " + std::to_string(i) + " received no gradient";
-        }
-    }
-    return "";
+// CPU gradient check through the public dummygrad::gradcheck (src/testing.h), so the suite
+// also tests the tool users rely on for their own ops.
+static std::string gradcheck_cpu(const GradTest& t) {
+    Leaves inputs;
+    for (const auto& s : t.leaves) inputs.push_back(upload(s.data, s.shape, Device::CPU, false));
+    return dummygrad::gradcheck([&t](const Leaves& L) { return t.fn(L, Device::CPU); }, inputs);
 }
 
 static std::string compare(const std::vector<float>& ref, const std::vector<float>& got, float rtol) {
@@ -592,6 +556,84 @@ static std::string strided_forward_matches_dense() {
     return err.empty() ? "" : "relu of slice: " + err;
 }
 
+static std::string engine_no_grad() {
+    auto w = upload({0.5f, -1.0f, 2.0f, 0.25f}, {2, 2}, Device::CPU, true);
+    auto x = upload({1.0f, 2.0f, -3.0f, 4.0f}, {2, 2}, Device::CPU, false);
+    {
+        NoGradGuard no_grad;
+        auto y = relu(matmul(x, w));
+        auto views = {transpose(w, 0, 1), slice(w, 1, 0, 1), reshape(w, {4}), contiguous(transpose(w, 0, 1))};
+        if (y->requires_grad || y->grad_fn) return std::string("ops under NoGradGuard recorded a graph");
+        for (const auto& v : views) {
+            if (v->requires_grad || v->grad_fn) return std::string("a view op under NoGradGuard recorded a graph");
+        }
+        ModernTransformer model(16, 8, 16, 2, 1, 1);
+        auto logits = model.forward(upload({1, 2, 3, 4}, {1, 4}, Device::CPU, false));
+        if (logits->requires_grad || logits->grad_fn) return std::string("model forward under NoGradGuard recorded a graph");
+        {
+            NoGradGuard nested;
+        }
+        if (grad_enabled()) return std::string("a nested NoGradGuard re-enabled grad mode on exit");
+    }
+    if (!grad_enabled()) return "NoGradGuard did not restore grad mode";
+    auto z = relu(matmul(x, w));
+    if (!z->requires_grad || !z->grad_fn) return "graph not recorded after the guard ended";
+    scalar_sum(z)->backward();
+    return w->grad ? "" : "no gradient after the guard ended";
+}
+
+static std::string engine_detect_anomaly() {
+    {
+        DetectAnomalyGuard detect;
+        // d/dx (1/x) = -1/x^2 is infinite at x = 0
+        auto x = upload({0.0f, 1.0f, 2.0f, 4.0f}, {2, 2}, Device::CPU, true);
+        std::string msg;
+        try {
+            scalar_sum(rdiv_scalar(1.0f, x))->backward();
+        } catch (const std::runtime_error& e) {
+            msg = e.what();
+        }
+        if (msg.empty()) return "a non-finite gradient was not detected";
+        if (msg.find("RdivScalarBackward") == std::string::npos) return "anomaly message does not name the op: " + msg;
+    }
+    if (detect_anomaly_enabled()) return "DetectAnomalyGuard did not restore the previous setting";
+    auto y = upload({0.0f, 1.0f, 2.0f, 4.0f}, {2, 2}, Device::CPU, true);
+    scalar_sum(rdiv_scalar(1.0f, y))->backward();  // must not throw with detection off
+    return "";
+}
+
+// A custom op whose backward drops the factor 2 of d(x^2)/dx; gradcheck must reject it.
+struct WrongSquareBackward : public Node {
+    std::shared_ptr<Tensor> x;
+    explicit WrongSquareBackward(std::shared_ptr<Tensor> x) : x(std::move(x)) {}
+    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        NoGradGuard no_grad;
+        return {mul(grads[0], x)};
+    }
+};
+
+static TensorPtr wrong_square(const TensorPtr& x) {
+    TensorPtr out;
+    {
+        NoGradGuard no_grad;
+        out = mul(x, x);
+    }
+    out->requires_grad = needs_grad(x);
+    if (needs_grad(x)) {
+        auto grad_fn = std::make_shared<WrongSquareBackward>(x);
+        grad_fn->add_next_edge(get_grad_edge(x).function);
+        out->grad_fn = grad_fn;
+    }
+    return out;
+}
+
+static std::string gradcheck_rejects_wrong_backward() {
+    auto err = dummygrad::gradcheck([](const Leaves& L) { return wrong_square(L[0]); }, {randn({3, 4})});
+    if (err.empty()) return "gradcheck accepted a backward pass that is off by a factor of 2";
+    auto ok = dummygrad::gradcheck([](const Leaves& L) { return mul(L[0], L[0]); }, {randn({3, 4})});
+    return ok.empty() ? "" : "gradcheck rejected a correct op: " + ok;
+}
+
 static std::string engine_retain_graph() {
     auto x = upload({1, 2, 3, 4}, {2, 2}, Device::CPU, true);
     auto y = scalar_sum(mul_scalar(x, 3.0f));
@@ -750,7 +792,7 @@ int main() {
 
     std::cout << "-- gradient checks (cpu, finite differences)\n";
     for (size_t i = 0; i < tests.size(); ++i) {
-        run_case(r, "grad/" + tests[i].name, [&] { return gradcheck_cpu(tests[i], probes[i]); });
+        run_case(r, "grad/" + tests[i].name, [&] { return gradcheck_cpu(tests[i]); });
     }
 
     if (has_cuda) {
@@ -762,6 +804,9 @@ int main() {
 
     std::cout << "\n-- autograd engine\n";
     run_case(r, "engine/strided_forward_matches_dense", strided_forward_matches_dense);
+    run_case(r, "engine/no_grad", engine_no_grad);
+    run_case(r, "engine/detect_anomaly", engine_detect_anomaly);
+    run_case(r, "engine/gradcheck_rejects_wrong_backward", gradcheck_rejects_wrong_backward);
     run_case(r, "engine/retain_graph", engine_retain_graph);
     run_case(r, "engine/exception_propagates", engine_exception_propagates);
     run_case(r, "engine/concurrent_fanin", engine_concurrent_fanin);
