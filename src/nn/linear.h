@@ -1,10 +1,11 @@
 #pragma once 
 #include "tensor.h"
 #include "functional.h"
+#include "module.h"
 #include "init.h"
 
 // Linear / Fully-Connected Layer
-class Linear {
+class Linear : public Module {
 public:    
     std::shared_ptr<Tensor> W;
     std::shared_ptr<Tensor> b;
@@ -20,14 +21,8 @@ public:
         return cast_n_add(matmul(x, W), b);
     }
 
-    std::vector<std::shared_ptr<Tensor>> parameters() const {
-        return {W, b};
-    }
-
-    void to(Device device, DType dtype = DType::Float32) {
-        W = W->to(device, dtype);
-        b = b->to(device, dtype);
-        W->requires_grad = true;
-        b->requires_grad = true;
+    void visit(ModuleVisitor& v) override {
+        v.parameter("weight", W);
+        v.parameter("bias", b);
     }
 };

@@ -1,6 +1,7 @@
 #pragma once
 #include "tensor.h"
 #include "functional.h"
+#include "module.h"
 #include "linear.h"
 #include "ops.h"
 #include <cmath>
@@ -88,7 +89,7 @@ struct RMSNormBackward : public Node {
     }
 };
 
-class RMSNorm {
+class RMSNorm : public Module {
 public:
     std::shared_ptr<Tensor> gamma;
     float eps;
@@ -171,14 +172,7 @@ public:
         return out;
     }
 
-    std::vector<std::shared_ptr<Tensor>> parameters() const {
-        return {gamma};
-    }
-
-    void to(Device device, DType dtype = DType::Float32) {
-        gamma = gamma->to(device, dtype);
-        gamma->requires_grad = true;
-    }
+    void visit(ModuleVisitor& v) override { v.parameter("gamma", gamma); }
 };
 
 // ============================================================================
@@ -393,7 +387,7 @@ inline std::shared_ptr<Tensor> apply_rotary_emb(
 //    SwiGLU(x) = (SiLU(x * W_gate) * (x * W_up)) * W_down
 // ============================================================================
 
-class SwiGLU {
+class SwiGLU : public Module {
 public:
     Linear w_gate;
     Linear w_up;
@@ -416,19 +410,10 @@ public:
         return w_down.forward(h);
     }
 
-    std::vector<std::shared_ptr<Tensor>> parameters() const {
-        auto p = w_gate.parameters();
-        auto p_up = w_up.parameters();
-        auto p_down = w_down.parameters();
-        p.insert(p.end(), p_up.begin(), p_up.end());
-        p.insert(p.end(), p_down.begin(), p_down.end());
-        return p;
-    }
-
-    void to(Device device, DType dtype = DType::Float32) {
-        w_gate.to(device, dtype);
-        w_up.to(device, dtype);
-        w_down.to(device, dtype);
+    void visit(ModuleVisitor& v) override {
+        v.module("w_gate", w_gate);
+        v.module("w_up", w_up);
+        v.module("w_down", w_down);
     }
 };
 

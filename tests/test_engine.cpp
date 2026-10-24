@@ -14,6 +14,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdio>
 #include <chrono>
 #include <cmath>
 #include <functional>
@@ -693,6 +694,168 @@ static std::string engine_deep_chain() {
 }
 
 // ---------------------------------------------------------------------------
+// Module
+// ---------------------------------------------------------------------------
+
+static std::string expect_names(Module& m, const std::vector<std::string>& required, size_t expected_count) {
+    auto named = m.named_parameters();
+    if (named.size() != expected_count) {
+        return "expected " + std::to_string(expected_count) + " parameters, got " + std::to_string(named.size());
+    }
+    for (const auto& want : required) {
+        bool found = false;
+        for (const auto& [name, t] : named) found |= (name == want);
+        if (!found) return "missing parameter name " + want;
+    }
+    int64_t total = 0;
+    for (const auto& [name, t] : named) total += t->size();
+    return total == m.num_parameters() ? "" : "num_parameters() disagrees with named_parameters()";
+}
+
+// Checkpoint names must stay exactly as earlier releases wrote them
+static std::string module_checkpoint_names() {
+    ModernTransformer modern(16, 8, 16, 2, 2, 1);
+    auto err = expect_names(modern, {"token_emb.weight", "blocks.0.rms1.gamma", "blocks.0.attn.W_q.weight",
+                                     "blocks.1.attn.W_k.bias", "blocks.1.ffn.w_down.bias", "rms_f.gamma"},
+                            1 + 2 * 16 + 1);
+    if (!err.empty()) return "ModernTransformer: " + err;
+    GPT gpt(16, 8, 16, 2, 2);
+    err = expect_names(gpt, {"token_emb.weight", "pos_emb.weight", "blocks.0.ln1.beta", "blocks.0.attn.W_o.weight",
+                             "blocks.1.ffn.fc2.bias", "ln_f.gamma"},
+                       2 + 2 * 16 + 2);
+    if (!err.empty()) return "GPT: " + err;
+    // Non-persistent buffers move with the model but are not saved
+    for (const auto& [name, t] : modern.state_dict()) {
+        if (name.find("freqs") != std::string::npos) return "RoPE table " + name + " ended up in the state dict";
+    }
+    return modern.named_buffers().size() == 2 ? "" : "expected the two RoPE buffers";
+}
+
+// Changing only the last token must not change the logits at earlier positions
+template <typename Model>
+static std::string expect_causal(Model& model, int vocab, const std::string& what) {
+    NoGradGuard no_grad;
+    std::vector<float> a = {1, 5, 2, 7, 3}, b = a;
+    b.back() = (float)(((int)b.back() + 4) % vocab);
+    auto la = download(model.forward(upload(a, {1, 5}, Device::CPU, false)));
+    auto lb = download(model.forward(upload(b, {1, 5}, Device::CPU, false)));
+    for (int pos = 0; pos < 4; ++pos) {
+        for (int v = 0; v < vocab; ++v) {
+            int k = pos * vocab + v;
+            if (std::fabs(la[k] - lb[k]) > 1e-5f) {
+                return what + ": logits at position " + std::to_string(pos) + " depend on a later token";
+            }
+        }
+    }
+    return "";
+}
+
+static std::string module_causality() {
+    GPT gpt(12, 8, 16, 2, 2);
+    auto err = expect_causal(gpt, 12, "GPT");
+    if (!err.empty()) return err;
+    ModernTransformer modern(12, 8, 16, 2, 2, 1);
+    return expect_causal(modern, 12, "ModernTransformer");
+}
+
+static std::string module_save_load_roundtrip() {
+    manual_seed(7);
+    ModernTransformer a(16, 8, 16, 2, 1, 1);
+    manual_seed(8);
+    ModernTransformer b(16, 8, 16, 2, 1, 1);
+    auto input = upload({1, 2, 3, 4}, {1, 4}, Device::CPU, false);
+    const std::string path = "test_module_roundtrip.safetensors";
+    a.save_safetensors(path);
+
+    auto params_before = b.parameters();
+    b.load_safetensors(path);
+    std::remove(path.c_str());
+
+    auto params_after = b.parameters();
+    for (size_t i = 0; i < params_before.size(); ++i) {
+        if (params_before[i].get() != params_after[i].get()) return "loading replaced parameter tensors (optimizer state would detach)";
+    }
+    NoGradGuard no_grad;
+    auto err = compare(download(a.forward(input)), download(b.forward(input)), 0.0f);
+    return err.empty() ? "" : "reloaded model gives different outputs: " + err;
+}
+
+static std::string module_strict_loading() {
+    ModernTransformer modern(16, 8, 16, 2, 1, 1);
+    const std::string path = "test_module_strict.safetensors";
+    modern.save_safetensors(path);
+
+    std::string msg;
+    GPT gpt(16, 8, 16, 2, 1);
+    try { gpt.load_safetensors(path); } catch (const std::runtime_error& e) { msg = e.what(); }
+    if (msg.find("missing from checkpoint") == std::string::npos || msg.find("unexpected in checkpoint") == std::string::npos) {
+        std::remove(path.c_str());
+        return "strict load of a mismatched checkpoint did not report missing and unexpected names: " + msg;
+    }
+
+    msg.clear();
+    ModernTransformer wider(16, 8, 32, 2, 1, 1);
+    try { wider.load_safetensors(path, /*strict=*/false); } catch (const std::runtime_error& e) { msg = e.what(); }
+    if (msg.find("shape mismatch") == std::string::npos) {
+        std::remove(path.c_str());
+        return "a shape mismatch was not reported even with strict=false";
+    }
+
+    // Non-strict loading copies the overlapping subset: the token embedding and attention
+    // projections share names and (with full multi-head attention) shapes
+    GPT donor(16, 8, 16, 2, 1);
+    const std::string gpt_path = "test_module_partial.safetensors";
+    donor.save_safetensors(gpt_path);
+    ModernTransformer partial(16, 8, 16, 2, 1, /*n_kv_heads=*/0);
+    partial.load_safetensors(gpt_path, /*strict=*/false);
+    std::remove(path.c_str());
+    std::remove(gpt_path.c_str());
+    auto err = compare(download(donor.token_emb.weight), download(partial.token_emb.weight), 0.0f);
+    if (err.empty()) err = compare(download(donor.blocks[0]->attn.W_k.W), download(partial.blocks[0]->attn.W_k.W), 0.0f);
+    return err.empty() ? "" : "non-strict load did not copy the overlapping tensors";
+}
+
+struct TiedPair : public Module {
+    std::shared_ptr<Tensor> shared = randn({2, 3});
+    std::shared_ptr<Tensor> alias = shared;
+    Linear frozen{3, 2};
+    void visit(ModuleVisitor& v) override {
+        v.parameter("shared", shared);
+        v.parameter("alias", alias);
+        v.module("frozen", frozen);
+    }
+};
+
+static std::string module_to_tied_and_frozen() {
+    TiedPair m;
+    if (m.parameters().size() != 3) return "a tied tensor was listed twice";
+    m.frozen.requires_grad_(false);
+    m.to(Device::CPU, DType::Float16);
+    if (m.shared.get() != m.alias.get()) return "to() split a tied tensor into two copies";
+    if (m.shared->dtype != DType::Float16 || m.frozen.W->dtype != DType::Float16) return "to() did not convert every tensor";
+    if (m.frozen.W->requires_grad || m.frozen.b->requires_grad) return "to() unfroze frozen parameters";
+    if (!m.shared->requires_grad) return "to() dropped requires_grad from a trainable parameter";
+    m.to(Device::CPU, DType::Float32);
+    return m.shared.get() == m.alias.get() ? "" : "tied tensor split on the way back";
+}
+
+static std::string module_modes_and_zero_grad() {
+    ModernTransformer model(16, 8, 16, 2, 1, 1);
+    model.eval();
+    if (model.is_training() || model.blocks[0]->attn.W_q.is_training()) return "eval() did not reach submodules";
+    model.train();
+    if (!model.blocks[0]->ffn.w_up.is_training()) return "train() did not reach submodules";
+    auto loss = fused_cross_entropy(model.forward(upload({1, 2, 3, 4}, {1, 4}, Device::CPU, false)),
+                                    upload({2, 3, 4, 5}, {1, 4}, Device::CPU, false));
+    loss->backward();
+    model.zero_grad();
+    for (auto& p : model.parameters()) {
+        if (p->grad) return "zero_grad() left a gradient";
+    }
+    return "";
+}
+
+// ---------------------------------------------------------------------------
 // End-to-end training
 // ---------------------------------------------------------------------------
 
@@ -811,6 +974,14 @@ int main() {
     run_case(r, "engine/exception_propagates", engine_exception_propagates);
     run_case(r, "engine/concurrent_fanin", engine_concurrent_fanin);
     run_case(r, "engine/deep_chain", engine_deep_chain);
+
+    std::cout << "\n-- modules\n";
+    run_case(r, "module/checkpoint_names", module_checkpoint_names);
+    run_case(r, "module/causality", module_causality);
+    run_case(r, "module/save_load_roundtrip", module_save_load_roundtrip);
+    run_case(r, "module/strict_loading", module_strict_loading);
+    run_case(r, "module/to_tied_and_frozen", module_to_tied_and_frozen);
+    run_case(r, "module/modes_and_zero_grad", module_modes_and_zero_grad);
 
     std::cout << "\n-- end-to-end training\n";
     run_case(r, "train/tiny_transformer_cpu", [] { return train_tiny_transformer(Device::CPU); });

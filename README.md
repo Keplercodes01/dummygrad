@@ -203,6 +203,42 @@ Then `#include "dummy_core.h"` in `main.cpp` and build with the usual `cmake -S 
 
 Prefer vendoring? Add the repository as a git submodule and replace the `FetchContent` lines with `add_subdirectory(external/dummygrad)`.
 
+### Building models with Module
+
+Every layer and model is a `Module`. Declare a module's parameters and children once in `visit()`, and parameter collection, device moves, train/eval mode, and checkpointing come with it:
+
+```cpp
+struct MyBlock : Module {
+    Linear proj{64, 64};
+    RMSNorm norm{64};
+    std::shared_ptr<Tensor> scale = ones({1, 64}, Device::CPU, DType::Float32, true);
+
+    void visit(ModuleVisitor& v) override {
+        v.module("proj", proj);           // children: their parameters are named "proj.weight", ...
+        v.module("norm", norm);
+        v.parameter("scale", scale);      // your own trainable tensors
+    }
+
+    std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x) {
+        return mul(proj.forward(norm.forward(x)), scale);
+    }
+};
+
+MyBlock block;
+Adam optimizer(1e-3f);
+optimizer.step(block.parameters());       // all parameters, recursively, each listed once
+block.to(Device::CUDA);                   // parameters and buffers
+block.eval();                             // train/eval mode, propagated to children
+block.num_parameters();
+block.save_safetensors("block.safetensors");
+block.load_safetensors("block.safetensors");   // strict: mismatched names or shapes throw
+```
+
+- For a list of children, use indexed names: `v.module("blocks." + std::to_string(i), *blocks[i])`.
+- Non-trainable state that should move with the module goes in `v.buffer(name, tensor)`; pass `/*persistent=*/false` for state you recompute (like RoPE tables) so it isn't saved.
+- `load_safetensors(path, /*strict=*/false)` loads the matching subset of a checkpoint, e.g. to initialize part of a new model. Shape mismatches still throw.
+- `requires_grad_(false)` freezes a module's parameters; `.to()` keeps them frozen.
+
 ### Writing your own ops
 
 A new op is a forward function plus a backward `Node`. [`examples/custom_op.cpp`](examples/custom_op.cpp) is a complete, compiled example (squared ReLU). The shape of it:

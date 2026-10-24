@@ -10,7 +10,7 @@
 #include "serialization.h"
 
 // Transformer Feed-Forward Network (MLP Block)
-class FeedForward {
+class FeedForward : public Module {
 public:
     Linear fc1;
     Linear fc2;
@@ -24,21 +24,14 @@ public:
         return fc2.forward(h);
     }
 
-    std::vector<std::shared_ptr<Tensor>> parameters() const {
-        auto p = fc1.parameters();
-        auto p2 = fc2.parameters();
-        p.insert(p.end(), p2.begin(), p2.end());
-        return p;
-    }
-
-    void to(Device device, DType dtype = DType::Float32) {
-        fc1.to(device, dtype);
-        fc2.to(device, dtype);
+    void visit(ModuleVisitor& v) override {
+        v.module("fc1", fc1);
+        v.module("fc2", fc2);
     }
 };
 
 // Single Transformer Decoder Block (Pre-LayerNorm)
-class TransformerBlock {
+class TransformerBlock : public Module {
 public:
     LayerNorm ln1;
     MultiHeadAttention attn;
@@ -46,7 +39,7 @@ public:
     FeedForward ffn;
 
     TransformerBlock(int d_model, int n_heads, bool causal = true, int d_ff = 0)
-        : ln1(d_model), attn(d_model, n_heads, causal), ln2(d_model), ffn(d_model, d_ff) {}
+        : ln1(d_model), attn(d_model, n_heads, /*n_kv_heads=*/0, causal), ln2(d_model), ffn(d_model, d_ff) {}
 
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x,
                                     const std::shared_ptr<Tensor>& mask = nullptr) {
@@ -61,27 +54,16 @@ public:
         return add(x1, ffn_out);
     }
 
-    std::vector<std::shared_ptr<Tensor>> parameters() const {
-        auto p = ln1.parameters();
-        auto pa = attn.parameters();
-        auto pl = ln2.parameters();
-        auto pf = ffn.parameters();
-        p.insert(p.end(), pa.begin(), pa.end());
-        p.insert(p.end(), pl.begin(), pl.end());
-        p.insert(p.end(), pf.begin(), pf.end());
-        return p;
-    }
-
-    void to(Device device, DType dtype = DType::Float32) {
-        ln1.to(device, dtype);
-        attn.to(device, dtype);
-        ln2.to(device, dtype);
-        ffn.to(device, dtype);
+    void visit(ModuleVisitor& v) override {
+        v.module("ln1", ln1);
+        v.module("attn", attn);
+        v.module("ln2", ln2);
+        v.module("ffn", ffn);
     }
 };
 
 // GPT Language Model (Decoder-only Transformer)
-class GPT {
+class GPT : public Module {
 public:
     Embedding token_emb;
     Embedding pos_emb;
@@ -166,91 +148,19 @@ public:
         return matmul(x_norm, tied_weights);
     }
 
-    std::vector<std::shared_ptr<Tensor>> parameters() const {
-        auto p = token_emb.parameters();
-        auto pp = pos_emb.parameters();
-        p.insert(p.end(), pp.begin(), pp.end());
-
-        for (auto& block : blocks) {
-            auto pb = block->parameters();
-            p.insert(p.end(), pb.begin(), pb.end());
-        }
-
-        auto pln = ln_f.parameters();
-        p.insert(p.end(), pln.begin(), pln.end());
-        
-        return p;
+    void visit(ModuleVisitor& v) override {
+        v.module("token_emb", token_emb);
+        v.module("pos_emb", pos_emb);
+        for (size_t i = 0; i < blocks.size(); ++i) v.module("blocks." + std::to_string(i), *blocks[i]);
+        v.module("ln_f", ln_f);
     }
-
-    std::unordered_map<std::string, std::shared_ptr<Tensor>> named_parameters() const {
-        std::unordered_map<std::string, std::shared_ptr<Tensor>> named;
-        named["token_emb.weight"] = token_emb.weight;
-        named["pos_emb.weight"] = pos_emb.weight;
-        for (size_t i = 0; i < blocks.size(); i++) {
-            std::string prefix = "blocks." + std::to_string(i) + ".";
-            named[prefix + "ln1.gamma"] = blocks[i]->ln1.gamma;
-            named[prefix + "ln1.beta"] = blocks[i]->ln1.beta;
-            named[prefix + "attn.W_q.weight"] = blocks[i]->attn.W_q.W;
-            named[prefix + "attn.W_q.bias"] = blocks[i]->attn.W_q.b;
-            named[prefix + "attn.W_k.weight"] = blocks[i]->attn.W_k.W;
-            named[prefix + "attn.W_k.bias"] = blocks[i]->attn.W_k.b;
-            named[prefix + "attn.W_v.weight"] = blocks[i]->attn.W_v.W;
-            named[prefix + "attn.W_v.bias"] = blocks[i]->attn.W_v.b;
-            named[prefix + "attn.W_o.weight"] = blocks[i]->attn.W_o.W;
-            named[prefix + "attn.W_o.bias"] = blocks[i]->attn.W_o.b;
-            named[prefix + "ln2.gamma"] = blocks[i]->ln2.gamma;
-            named[prefix + "ln2.beta"] = blocks[i]->ln2.beta;
-            named[prefix + "ffn.fc1.weight"] = blocks[i]->ffn.fc1.W;
-            named[prefix + "ffn.fc1.bias"] = blocks[i]->ffn.fc1.b;
-            named[prefix + "ffn.fc2.weight"] = blocks[i]->ffn.fc2.W;
-            named[prefix + "ffn.fc2.bias"] = blocks[i]->ffn.fc2.b;
-        }
-        named["ln_f.gamma"] = ln_f.gamma;
-        named["ln_f.beta"] = ln_f.beta;
-        return named;
-    }
-
-    void save_safetensors(const std::string& filepath) const {
-        io::save_safetensors(filepath, named_parameters());
-    }
-
-    void load_safetensors(const std::string& filepath) {
-        auto loaded = io::load_safetensors(filepath, token_emb.weight->device);
-        auto named = named_parameters();
-        for (const auto& [name, src_tensor] : loaded) {
-            auto it = named.find(name);
-            if (it != named.end() && it->second && src_tensor) {
-                auto dst = it->second;
-                if (dst->size() == src_tensor->size()) {
-                    auto converted = (src_tensor->device != dst->device || src_tensor->dtype != dst->dtype)
-                                     ? src_tensor->to(dst->device, dst->dtype) : src_tensor;
-                    dst->storage = converted->storage;
-                    dst->strides = converted->strides;
-                    dst->global_offset = converted->global_offset;
-                }
-            }
-        }
-    }
-
-    void to(Device device, DType dtype = DType::Float32) {
-        token_emb.to(device, dtype);
-        pos_emb.to(device, dtype);
-        for (auto& block : blocks) {
-            block->to(device, dtype);
-        }
-        ln_f.to(device, dtype);
-    }
-
-    void cuda() { to(Device::CUDA); }
-    void mps()  { to(Device::MPS); }
-    void cpu()  { to(Device::CPU); }
 };
 
 // ============================================================================
 // Modern Transformer Block (RMSNorm + Attention/RoPE + SwiGLU)
 // Architecture standard across LLaMA 3, Mistral, Gemma 2, Qwen 2, and DeepSeek
 // ============================================================================
-class ModernTransformerBlock {
+class ModernTransformerBlock : public Module {
 public:
     RMSNorm rms1;
     MultiHeadAttention attn;
@@ -279,22 +189,11 @@ public:
         return add(x1, ffn_out);
     }
 
-    std::vector<std::shared_ptr<Tensor>> parameters() const {
-        auto p = rms1.parameters();
-        auto pa = attn.parameters();
-        auto p2 = rms2.parameters();
-        auto pf = ffn.parameters();
-        p.insert(p.end(), pa.begin(), pa.end());
-        p.insert(p.end(), p2.begin(), p2.end());
-        p.insert(p.end(), pf.begin(), pf.end());
-        return p;
-    }
-
-    void to(Device device, DType dtype = DType::Float32) {
-        rms1.to(device, dtype);
-        attn.to(device, dtype);
-        rms2.to(device, dtype);
-        ffn.to(device, dtype);
+    void visit(ModuleVisitor& v) override {
+        v.module("rms1", rms1);
+        v.module("attn", attn);
+        v.module("rms2", rms2);
+        v.module("ffn", ffn);
     }
 };
 
@@ -306,7 +205,7 @@ public:
 // - SwiGLU gated activations
 // - Tied input/output embeddings
 // ============================================================================
-class ModernTransformer {
+class ModernTransformer : public Module {
 public:
     Embedding token_emb;
     std::vector<std::shared_ptr<ModernTransformerBlock>> blocks;
@@ -380,80 +279,12 @@ public:
         return matmul(x_norm, tied_weights);
     }
 
-    std::vector<std::shared_ptr<Tensor>> parameters() const {
-        auto p = token_emb.parameters();
-        for (auto& block : blocks) {
-            auto pb = block->parameters();
-            p.insert(p.end(), pb.begin(), pb.end());
-        }
-        auto pr = rms_f.parameters();
-        p.insert(p.end(), pr.begin(), pr.end());
-        return p;
+    void visit(ModuleVisitor& v) override {
+        v.module("token_emb", token_emb);
+        for (size_t i = 0; i < blocks.size(); ++i) v.module("blocks." + std::to_string(i), *blocks[i]);
+        v.module("rms_f", rms_f);
+        // RoPE tables are recomputed at construction, so they move with the model but aren't saved
+        v.buffer("cos_freqs", cos_freqs, /*persistent=*/false);
+        v.buffer("sin_freqs", sin_freqs, /*persistent=*/false);
     }
-
-    std::unordered_map<std::string, std::shared_ptr<Tensor>> named_parameters() const {
-        std::unordered_map<std::string, std::shared_ptr<Tensor>> named;
-        named["token_emb.weight"] = token_emb.weight;
-        for (size_t i = 0; i < blocks.size(); i++) {
-            std::string prefix = "blocks." + std::to_string(i) + ".";
-            named[prefix + "rms1.gamma"] = blocks[i]->rms1.gamma;
-            named[prefix + "attn.W_q.weight"] = blocks[i]->attn.W_q.W;
-            named[prefix + "attn.W_q.bias"] = blocks[i]->attn.W_q.b;
-            named[prefix + "attn.W_k.weight"] = blocks[i]->attn.W_k.W;
-            named[prefix + "attn.W_k.bias"] = blocks[i]->attn.W_k.b;
-            named[prefix + "attn.W_v.weight"] = blocks[i]->attn.W_v.W;
-            named[prefix + "attn.W_v.bias"] = blocks[i]->attn.W_v.b;
-            named[prefix + "attn.W_o.weight"] = blocks[i]->attn.W_o.W;
-            named[prefix + "attn.W_o.bias"] = blocks[i]->attn.W_o.b;
-            named[prefix + "rms2.gamma"] = blocks[i]->rms2.gamma;
-            named[prefix + "ffn.w_gate.weight"] = blocks[i]->ffn.w_gate.W;
-            named[prefix + "ffn.w_gate.bias"] = blocks[i]->ffn.w_gate.b;
-            named[prefix + "ffn.w_up.weight"] = blocks[i]->ffn.w_up.W;
-            named[prefix + "ffn.w_up.bias"] = blocks[i]->ffn.w_up.b;
-            named[prefix + "ffn.w_down.weight"] = blocks[i]->ffn.w_down.W;
-            named[prefix + "ffn.w_down.bias"] = blocks[i]->ffn.w_down.b;
-        }
-        named["rms_f.gamma"] = rms_f.gamma;
-        return named;
-    }
-
-    void save_safetensors(const std::string& filepath) const {
-        io::save_safetensors(filepath, named_parameters());
-    }
-
-    void load_safetensors(const std::string& filepath) {
-        auto loaded = io::load_safetensors(filepath, token_emb.weight->device);
-        auto named = named_parameters();
-        for (const auto& [name, src_tensor] : loaded) {
-            auto it = named.find(name);
-            if (it != named.end() && it->second && src_tensor) {
-                auto dst = it->second;
-                if (dst->size() == src_tensor->size()) {
-                    auto converted = (src_tensor->device != dst->device || src_tensor->dtype != dst->dtype)
-                                     ? src_tensor->to(dst->device, dst->dtype) : src_tensor;
-                    dst->storage = converted->storage;
-                    dst->strides = converted->strides;
-                    dst->global_offset = converted->global_offset;
-                }
-            }
-        }
-    }
-
-    void to(Device device, DType dtype = DType::Float32) {
-        token_emb.to(device, dtype);
-        for (auto& block : blocks) {
-            block->to(device, dtype);
-        }
-        rms_f.to(device, dtype);
-        if (cos_freqs && cos_freqs->device != device) {
-            cos_freqs = cos_freqs->to(device, dtype);
-        }
-        if (sin_freqs && sin_freqs->device != device) {
-            sin_freqs = sin_freqs->to(device, dtype);
-        }
-    }
-
-    void cuda() { to(Device::CUDA); }
-    void mps()  { to(Device::MPS); }
-    void cpu()  { to(Device::CPU); }
 };
