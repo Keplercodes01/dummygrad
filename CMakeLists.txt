@@ -73,7 +73,13 @@ target_link_libraries(dummygrad_engine PRIVATE ${CMAKE_DL_LIBS})
 target_compile_definitions(dummygrad_engine PUBLIC DUMMYGRAD_VERSION="${PROJECT_VERSION}")
 
 # The autograd engine runs backward on a worker thread pool
-find_package(Threads REQUIRED)
+# Imported targets from find_package are only visible in the directory that created them.
+# These are part of dummygrad_engine's public link interface, so when dummygrad is pulled in
+# with add_subdirectory / FetchContent they must be global or consumers can't resolve them.
+if(NOT TARGET Threads::Threads)
+    find_package(Threads REQUIRED)
+    set_target_properties(Threads::Threads PROPERTIES IMPORTED_GLOBAL TRUE)
+endif()
 target_link_libraries(dummygrad_engine PUBLIC Threads::Threads)
 
 # Optional BLAS (OpenBLAS / oneMKL / MKL / Netlib) for fast CPU linear algebra
@@ -87,7 +93,10 @@ endif()
 # Link CUDA libraries when CUDA is enabled. PUBLIC because the public headers
 # (optimizers.h, multi_gpu.h, ...) call the CUDA runtime when USE_CUDA is defined.
 if(ENABLE_CUDA AND CMAKE_CUDA_COMPILER)
-    find_package(CUDAToolkit REQUIRED)
+    if(NOT TARGET CUDA::cudart)
+        find_package(CUDAToolkit REQUIRED)
+        set_target_properties(CUDA::cudart CUDA::cublas PROPERTIES IMPORTED_GLOBAL TRUE)
+    endif()
     target_link_libraries(dummygrad_engine PUBLIC CUDA::cudart CUDA::cublas)
     target_compile_definitions(dummygrad_engine PUBLIC USE_CUDA=1)
 endif()
