@@ -3,6 +3,8 @@
 #include <vector>
 
 #ifdef USE_CUDA
+// Headers that dispatch to these ops also call the runtime API directly (cudaMemcpy, cudaMemset)
+#include <cuda_runtime.h>
 
 namespace cuda {
     // Primitive tensor ops
