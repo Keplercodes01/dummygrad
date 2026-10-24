@@ -72,7 +72,8 @@ inline std::shared_ptr<Tensor> kaiming(std::vector<int64_t> shape, Device device
 // one_hot
 inline std::shared_ptr<Tensor> one_hot(const std::shared_ptr<Tensor>& indices, int num_classes) {
     int64_t n = indices->size();
-    auto idx_cpu = (indices->device == Device::CPU && indices->is_contiguous()) ? indices : indices->cpu();
+    // cpu() returns a CPU tensor unchanged, so densify explicitly for strided views
+    auto idx_cpu = make_contiguous(indices->cpu());
     auto out = std::make_shared<Tensor>(std::vector<int64_t>{n, num_classes}, Device::CPU, DType::Float32, false);
     out->fill_(0.0f);
     const float* idx_ptr = idx_cpu->data_ptr<float>();

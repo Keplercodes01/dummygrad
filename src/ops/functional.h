@@ -30,6 +30,32 @@ extern "C" {
 #endif
 
 // ========================================
+// Contiguity
+// ========================================
+// --- CONTIGUOUS BACKWARD NODE ---
+struct ContiguousBackward : public Node {
+    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0]) return {nullptr};
+        return {grads[0]};
+    }
+};
+
+// Dense copy of a strided view (transpose, slice) that stays connected to the autograd graph.
+// Ops whose kernels index raw memory call this on every tensor input; it returns the input
+// itself when it is already contiguous, so the common case costs nothing.
+inline std::shared_ptr<Tensor> contiguous(const std::shared_ptr<Tensor>& a) {
+    if (!a || a->is_contiguous()) return a;
+    auto out = make_contiguous(a);
+    out->requires_grad = a->requires_grad;
+    if (a->requires_grad) {
+        auto grad_fn = std::make_shared<ContiguousBackward>();
+        grad_fn->add_next_edge(get_grad_edge(a).function);
+        out->grad_fn = grad_fn;
+    }
+    return out;
+}
+
+// ========================================
 // From activations.h
 // ========================================
 // --- RELU BACKWARD NODE ---
@@ -65,7 +91,8 @@ struct ReluBackward : public Node {
 };
 
 // relu
-inline std::shared_ptr<Tensor> relu(const std::shared_ptr<Tensor>& a) {
+inline std::shared_ptr<Tensor> relu(const std::shared_ptr<Tensor>& a_in) {
+    auto a = contiguous(a_in);
     bool req_grad = a->requires_grad;
     auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
 #ifdef USE_CUDA
@@ -134,7 +161,8 @@ struct TanhBackward : public Node {
 };
 
 // tanh
-inline std::shared_ptr<Tensor> tanh(const std::shared_ptr<Tensor>& a) {
+inline std::shared_ptr<Tensor> tanh(const std::shared_ptr<Tensor>& a_in) {
+    auto a = contiguous(a_in);
     bool req_grad = a->requires_grad;
 #ifdef USE_CUDA
     if (a->device == Device::CUDA) {
@@ -213,7 +241,8 @@ struct GeluBackward : public Node {
 };
 
 // gelu
-inline std::shared_ptr<Tensor> gelu(const std::shared_ptr<Tensor>& a) {
+inline std::shared_ptr<Tensor> gelu(const std::shared_ptr<Tensor>& a_in) {
+    auto a = contiguous(a_in);
     const float sqrt_2_over_pi = 0.7978845608f;
     const float coeff = 0.044715f;
 
@@ -288,7 +317,8 @@ struct SigmoidBackward : public Node {
 };
 
 // sigmoid
-inline std::shared_ptr<Tensor> sigmoid(const std::shared_ptr<Tensor>& a) {
+inline std::shared_ptr<Tensor> sigmoid(const std::shared_ptr<Tensor>& a_in) {
+    auto a = contiguous(a_in);
     bool req_grad = a->requires_grad;
     auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
 #ifdef USE_CUDA
@@ -376,7 +406,8 @@ struct SiluBackward : public Node {
 };
 
 // silu (Swish)
-inline std::shared_ptr<Tensor> silu(const std::shared_ptr<Tensor>& a) {
+inline std::shared_ptr<Tensor> silu(const std::shared_ptr<Tensor>& a_in) {
+    auto a = contiguous(a_in);
     bool req_grad = a->requires_grad;
     auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
 #ifdef USE_CUDA
@@ -469,7 +500,8 @@ struct LeakyReluBackward : public Node {
 };
 
 // leaky_relu
-inline std::shared_ptr<Tensor> leaky_relu(const std::shared_ptr<Tensor>& a, float negative_slope = 0.01f) {
+inline std::shared_ptr<Tensor> leaky_relu(const std::shared_ptr<Tensor>& a_in, float negative_slope = 0.01f) {
+    auto a = contiguous(a_in);
     bool req_grad = a->requires_grad;
     auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
 #ifdef USE_CUDA
@@ -562,7 +594,8 @@ struct BroadcastBackward : public Node {
 };
 
 // broadcast
-inline std::shared_ptr<Tensor> broadcast(const std::shared_ptr<Tensor>& a, int axis, int n) {
+inline std::shared_ptr<Tensor> broadcast(const std::shared_ptr<Tensor>& a_in, int axis, int n) {
+    auto a = contiguous(a_in);
     int ndim = a->shape.size();
     if (ndim < 2) {
         throw std::invalid_argument("broadcast requires tensor with ndim >= 2");
@@ -683,8 +716,10 @@ struct CastAddBackward : public Node {
 };
 
 // broadcast and add
-inline std::shared_ptr<Tensor> cast_n_add(const std::shared_ptr<Tensor>& x,
-                                          const std::shared_ptr<Tensor>& y) {
+inline std::shared_ptr<Tensor> cast_n_add(const std::shared_ptr<Tensor>& x_in,
+                                          const std::shared_ptr<Tensor>& y_in) {
+    auto x = contiguous(x_in);
+    auto y = contiguous(y_in);
     int ndim = x->shape.size();
     int r = (ndim >= 2) ? x->shape[ndim - 2] : 1;
     int c = x->shape[ndim - 1];
@@ -858,8 +893,10 @@ struct CastSubBackward : public Node {
 };
 
 // broadcast and subtract
-inline std::shared_ptr<Tensor> cast_n_sub(const std::shared_ptr<Tensor>& x,
-                                          const std::shared_ptr<Tensor>& y) {
+inline std::shared_ptr<Tensor> cast_n_sub(const std::shared_ptr<Tensor>& x_in,
+                                          const std::shared_ptr<Tensor>& y_in) {
+    auto x = contiguous(x_in);
+    auto y = contiguous(y_in);
     int ndim = x->shape.size();
     if (ndim < 2) throw std::invalid_argument("cast_n_sub requires tensor with ndim >= 2");
     int r = x->shape[ndim - 2];
@@ -967,8 +1004,10 @@ struct CastMulBackward : public Node {
 };
 
 // broadcast and multiply
-inline std::shared_ptr<Tensor> cast_n_mul(const std::shared_ptr<Tensor>& x,
-                                          const std::shared_ptr<Tensor>& y) {
+inline std::shared_ptr<Tensor> cast_n_mul(const std::shared_ptr<Tensor>& x_in,
+                                          const std::shared_ptr<Tensor>& y_in) {
+    auto x = contiguous(x_in);
+    auto y = contiguous(y_in);
     int ndim = x->shape.size();
     if (ndim < 2) throw std::invalid_argument("cast_n_mul requires tensor with ndim >= 2");
     int r = x->shape[ndim - 2];
@@ -1083,8 +1122,10 @@ struct CastDivBackward : public Node {
 };
 
 // broadcast and divide
-inline std::shared_ptr<Tensor> cast_n_div(const std::shared_ptr<Tensor>& x,
-                                          const std::shared_ptr<Tensor>& y) {
+inline std::shared_ptr<Tensor> cast_n_div(const std::shared_ptr<Tensor>& x_in,
+                                          const std::shared_ptr<Tensor>& y_in) {
+    auto x = contiguous(x_in);
+    auto y = contiguous(y_in);
     int ndim = x->shape.size();
     if (ndim < 2) throw std::invalid_argument("cast_n_div requires tensor with ndim >= 2");
     int r = x->shape[ndim - 2];
@@ -1195,8 +1236,10 @@ struct ConcatBackward : public Node {
 };
 
 // concatenation
-inline std::shared_ptr<Tensor> concat(const std::shared_ptr<Tensor>& a,
-                                       const std::shared_ptr<Tensor>& b, int axis) {
+inline std::shared_ptr<Tensor> concat(const std::shared_ptr<Tensor>& a_in,
+                                       const std::shared_ptr<Tensor>& b_in, int axis) {
+    auto a = contiguous(a_in);
+    auto b = contiguous(b_in);
     if (!a || !b) {
         throw std::invalid_argument("concat: input tensors cannot be null");
     }
@@ -1325,7 +1368,9 @@ struct CrossEntropyBackward : public Node {
 };
 
 // cross_entropy
-inline std::shared_ptr<Tensor> cross_entropy(const std::shared_ptr<Tensor>& pred, const std::shared_ptr<Tensor>& target) {
+inline std::shared_ptr<Tensor> cross_entropy(const std::shared_ptr<Tensor>& pred_in, const std::shared_ptr<Tensor>& target_in) {
+    auto pred = contiguous(pred_in);
+    auto target = contiguous(target_in);
     if (pred->shape != target->shape) {
         throw std::runtime_error("The shape of your prediction and target doesn't match man..");
     }
@@ -1422,10 +1467,12 @@ struct FusedCrossEntropyBackward : public Node {
 // targets: [...] (integer token/class IDs, e.g. [batch, seq_len] or [N])
 // ignore_index: tokens with this target ID are ignored in loss computation (default: -100)
 inline std::shared_ptr<Tensor> fused_cross_entropy(
-    const std::shared_ptr<Tensor>& logits,
-    const std::shared_ptr<Tensor>& targets,
+    const std::shared_ptr<Tensor>& logits_in,
+    const std::shared_ptr<Tensor>& targets_in,
     int ignore_index = -100
 ) {
+    auto logits = contiguous(logits_in);
+    auto targets = contiguous(targets_in);
     int ndim = logits->ndim();
     int V = logits->shape[ndim - 1];
     int N = logits->size() / V;
@@ -1552,7 +1599,9 @@ struct MseBackward : public Node {
 };
 
 // mse
-inline std::shared_ptr<Tensor> mse(const std::shared_ptr<Tensor>& pred, const std::shared_ptr<Tensor>& target) {
+inline std::shared_ptr<Tensor> mse(const std::shared_ptr<Tensor>& pred_in, const std::shared_ptr<Tensor>& target_in) {
+    auto pred = contiguous(pred_in);
+    auto target = contiguous(target_in);
     if (pred->shape != target->shape) {
         throw std::runtime_error("The shape of your prediction and target doesn't match man..");
     }
@@ -1644,7 +1693,9 @@ struct L1LossBackward : public Node {
 };
 
 // l1_loss (MAE - Mean Absolute Error)
-inline std::shared_ptr<Tensor> l1_loss(const std::shared_ptr<Tensor>& pred, const std::shared_ptr<Tensor>& target) {
+inline std::shared_ptr<Tensor> l1_loss(const std::shared_ptr<Tensor>& pred_in, const std::shared_ptr<Tensor>& target_in) {
+    auto pred = contiguous(pred_in);
+    auto target = contiguous(target_in);
     if (pred->shape != target->shape) {
         throw std::runtime_error("The shape of your prediction and target doesn't match man..");
     }
@@ -1737,7 +1788,9 @@ struct BoolMaskBackward : public Node {
 };
 
 // boolean mask
-inline std::shared_ptr<Tensor> bool_mask(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& m) {
+inline std::shared_ptr<Tensor> bool_mask(const std::shared_ptr<Tensor>& a_in, const std::shared_ptr<Tensor>& m_in) {
+    auto a = contiguous(a_in);
+    auto m = contiguous(m_in);
     int ndim = a->shape.size();
     if (ndim < 2) throw std::invalid_argument("bool_mask requires tensor with ndim >= 2");
     int r = a->shape[ndim - 2];
@@ -1820,7 +1873,8 @@ struct CausalMaskBackward : public Node {
 };
 
 // causal mask
-inline std::shared_ptr<Tensor> causal_mask(const std::shared_ptr<Tensor>& a) {
+inline std::shared_ptr<Tensor> causal_mask(const std::shared_ptr<Tensor>& a_in) {
+    auto a = contiguous(a_in);
     int ndim = a->shape.size();
     if (ndim < 2) throw std::invalid_argument("causal_mask requires tensor with ndim >= 2");
     int r = a->shape[ndim - 2];
@@ -1942,7 +1996,8 @@ struct MeanBackward : public Node {
     }
 };
 
-inline std::shared_ptr<Tensor> mean(const std::shared_ptr<Tensor>& a, int axis) {
+inline std::shared_ptr<Tensor> mean(const std::shared_ptr<Tensor>& a_in, int axis) {
+    auto a = contiguous(a_in);
     int ndim = a->ndim();
     if (ndim < 2) throw std::invalid_argument("mean requires tensor with ndim >= 2");
     int r = a->shape[ndim - 2];
@@ -2019,7 +2074,8 @@ struct AddScalarBackward : public Node {
     }
 };
 
-inline std::shared_ptr<Tensor> add_scalar(const std::shared_ptr<Tensor>& a, float s) {
+inline std::shared_ptr<Tensor> add_scalar(const std::shared_ptr<Tensor>& a_in, float s) {
+    auto a = contiguous(a_in);
     bool req_grad = a->requires_grad;
     Device dev = a->device;
     auto a_cpu = (dev == Device::CPU) ? a : a->cpu();
@@ -2052,7 +2108,8 @@ struct SubScalarBackward : public Node {
     }
 };
 
-inline std::shared_ptr<Tensor> sub_scalar(const std::shared_ptr<Tensor>& a, float s) {
+inline std::shared_ptr<Tensor> sub_scalar(const std::shared_ptr<Tensor>& a_in, float s) {
+    auto a = contiguous(a_in);
     bool req_grad = a->requires_grad;
     Device dev = a->device;
     auto a_cpu = (dev == Device::CPU) ? a : a->cpu();
@@ -2100,7 +2157,8 @@ struct MulScalarBackward : public Node {
     }
 };
 
-inline std::shared_ptr<Tensor> mul_scalar(const std::shared_ptr<Tensor>& a, float s) {
+inline std::shared_ptr<Tensor> mul_scalar(const std::shared_ptr<Tensor>& a_in, float s) {
+    auto a = contiguous(a_in);
     bool req_grad = a->requires_grad;
     Device dev = a->device;
     auto a_cpu = (dev == Device::CPU) ? a : a->cpu();
@@ -2148,7 +2206,8 @@ struct DivScalarBackward : public Node {
     }
 };
 
-inline std::shared_ptr<Tensor> div_scalar(const std::shared_ptr<Tensor>& a, float s) {
+inline std::shared_ptr<Tensor> div_scalar(const std::shared_ptr<Tensor>& a_in, float s) {
+    auto a = contiguous(a_in);
     bool req_grad = a->requires_grad;
     Device dev = a->device;
     auto a_cpu = (dev == Device::CPU) ? a : a->cpu();
@@ -2197,7 +2256,8 @@ struct RsubScalarBackward : public Node {
     }
 };
 
-inline std::shared_ptr<Tensor> rsub_scalar(float s, const std::shared_ptr<Tensor>& a) {
+inline std::shared_ptr<Tensor> rsub_scalar(float s, const std::shared_ptr<Tensor>& a_in) {
+    auto a = contiguous(a_in);
     bool req_grad = a->requires_grad;
     Device dev = a->device;
     auto a_cpu = (dev == Device::CPU) ? a : a->cpu();
@@ -2253,7 +2313,8 @@ struct RdivScalarBackward : public Node {
     }
 };
 
-inline std::shared_ptr<Tensor> rdiv_scalar(float s, const std::shared_ptr<Tensor>& a) {
+inline std::shared_ptr<Tensor> rdiv_scalar(float s, const std::shared_ptr<Tensor>& a_in) {
+    auto a = contiguous(a_in);
     bool req_grad = a->requires_grad;
     Device dev = a->device;
     auto a_cpu = (dev == Device::CPU) ? a : a->cpu();
@@ -2298,20 +2359,31 @@ struct SliceBackward : public Node {
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
         if (grads.empty() || !grads[0] || !original_tensor) return {nullptr};
-        auto grad_out = grads[0];
-        
-        // Create full gradient tensor filled with zeros
-        auto grad_in = std::make_shared<Tensor>(original_tensor->shape, original_tensor->device, original_tensor->dtype, false);
+        Device dev = grads[0]->device;
+        auto grad_out = (dev == Device::CPU) ? grads[0] : grads[0]->cpu();  // dense: the engine densifies grads
+
+        // Zero gradient for the full input; the sliced window receives grad_out. grad_in is dense,
+        // so the window is `len` consecutive rows of `inner` elements inside each `outer` block.
+        const auto& shape = original_tensor->shape;
+        auto grad_in = std::make_shared<Tensor>(shape, Device::CPU, original_tensor->dtype, false);
         grad_in->fill_(0.0f);
 
-        // Map grad_out directly into the specific slice window of grad_in using storage-sharing constructor
-        size_t slice_offset = grad_in->global_offset + start * grad_in->strides[dim];
-        auto grad_in_slice = std::make_shared<Tensor>(grad_in->storage, grad_out->shape, grad_in->strides, slice_offset, grad_in->device, grad_in->dtype, false);
+        int64_t outer = 1, inner = 1;
+        for (int d = 0; d < dim; ++d) outer *= shape[d];
+        for (int d = dim + 1; d < (int)shape.size(); ++d) inner *= shape[d];
+        int64_t full = shape[dim], len = end - start;
 
-        // In-place addition to funnel gradients into the right spot
-        tensor_add_inplace(grad_in_slice, grad_out);
+        const float* g = grad_out->data_ptr<float>();
+        float* gi = grad_in->data_ptr<float>();
+        for (int64_t o = 0; o < outer; ++o) {
+            for (int64_t s = 0; s < len; ++s) {
+                const float* src = g + (o * len + s) * inner;
+                float* dst = gi + (o * full + start + s) * inner;
+                for (int64_t k = 0; k < inner; ++k) dst[k] = src[k];
+            }
+        }
 
-        return {grad_in};
+        return {(dev == Device::CPU) ? grad_in : grad_in->to(dev)};
     }
 };
 
@@ -2395,7 +2467,8 @@ struct SoftmaxBackward : public Node {
     }
 };
 
-inline std::shared_ptr<Tensor> softmax(const std::shared_ptr<Tensor>& a, int axis = -1) {
+inline std::shared_ptr<Tensor> softmax(const std::shared_ptr<Tensor>& a_in, int axis = -1) {
+    auto a = contiguous(a_in);
     int ndim = a->shape.size();
     if (ndim < 1) throw std::runtime_error("softmax: tensor must be at least 1D");
     if (axis < 0) axis = ndim + axis;
@@ -2540,7 +2613,8 @@ struct StdDevBackward : public Node {
 };
 
 // standard deviation
-inline std::shared_ptr<Tensor> std_dev(const std::shared_ptr<Tensor>& a, int axis) {
+inline std::shared_ptr<Tensor> std_dev(const std::shared_ptr<Tensor>& a_in, int axis) {
+    auto a = contiguous(a_in);
     int ndim = a->shape.size();
     if (ndim < 2) throw std::runtime_error("std_dev: tensor must be at least 2D");
     if (axis != 0 && axis != 1) throw std::runtime_error("std_dev: axis must be 0 or 1");
@@ -2670,7 +2744,8 @@ struct SumBackward : public Node {
 };
 
 // sum
-inline std::shared_ptr<Tensor> sum(const std::shared_ptr<Tensor>& a, int axis) {
+inline std::shared_ptr<Tensor> sum(const std::shared_ptr<Tensor>& a_in, int axis) {
+    auto a = contiguous(a_in);
     int ndim = a->shape.size();
     if (ndim < 2) throw std::runtime_error("sum: tensor must be at least 2D");
     if (axis < 0) axis = ndim + axis;
@@ -2853,7 +2928,8 @@ struct VarBackward : public Node {
 };
 
 // variance
-inline std::shared_ptr<Tensor> var(const std::shared_ptr<Tensor>& a, int axis) {
+inline std::shared_ptr<Tensor> var(const std::shared_ptr<Tensor>& a_in, int axis) {
+    auto a = contiguous(a_in);
     int ndim = a->shape.size();
     if (ndim < 2) throw std::runtime_error("var: tensor must be at least 2D");
     if (axis != 0 && axis != 1) throw std::runtime_error("var: axis must be 0 or 1");
@@ -3078,7 +3154,8 @@ struct Im2ColBackward : public Node {
     }
 };
 
-inline std::shared_ptr<Tensor> im2col(const std::shared_ptr<Tensor>& x, int kH, int kW, int padH, int padW, int strideH, int strideW) {
+inline std::shared_ptr<Tensor> im2col(const std::shared_ptr<Tensor>& x_in, int kH, int kW, int padH, int padW, int strideH, int strideW) {
+    auto x = contiguous(x_in);
     if (x->ndim() != 4) throw std::runtime_error("im2col requires 4D tensor (B, C, H, W)");
 
     if (x->device != Device::CPU) {

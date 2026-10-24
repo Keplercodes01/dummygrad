@@ -77,9 +77,12 @@ struct ScaleAndShiftBackward : public Node {
 };
 
 // scale_n_shift
-inline std::shared_ptr<Tensor> scale_n_shift(const std::shared_ptr<Tensor>& x,
-                                             const std::shared_ptr<Tensor>& gamma,
-                                             const std::shared_ptr<Tensor>& beta) {
+inline std::shared_ptr<Tensor> scale_n_shift(const std::shared_ptr<Tensor>& x_in,
+                                             const std::shared_ptr<Tensor>& gamma_in,
+                                             const std::shared_ptr<Tensor>& beta_in) {
+    auto x = contiguous(x_in);
+    auto gamma = contiguous(gamma_in);
+    auto beta = contiguous(beta_in);
     int ndim = x->ndim();
     if (ndim < 2) {
         throw std::invalid_argument("scale_n_shift requires tensor with ndim >= 2");

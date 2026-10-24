@@ -72,7 +72,8 @@ struct SlidingWindowMaskBackward : public Node {
 
 // Applies Sliding Window Attention mask to scores tensor [..., seq_len, seq_len]
 // Tokens attend only to the past window_size tokens: i - window_size <= j <= i
-inline std::shared_ptr<Tensor> sliding_window_mask(const std::shared_ptr<Tensor>& scores, int window_size) {
+inline std::shared_ptr<Tensor> sliding_window_mask(const std::shared_ptr<Tensor>& scores_in, int window_size) {
+    auto scores = contiguous(scores_in);
     int ndim = scores->shape.size();
     if (ndim < 2) {
         throw std::invalid_argument("sliding_window_mask requires tensor of at least 2 dimensions");
@@ -169,7 +170,8 @@ struct PrefixCausalMaskBackward : public Node {
 };
 
 // Applies Prefix-Causal mask: bidirectional inside prefix [0, prefix_len), causal afterwards
-inline std::shared_ptr<Tensor> prefix_causal_mask(const std::shared_ptr<Tensor>& scores, int prefix_len) {
+inline std::shared_ptr<Tensor> prefix_causal_mask(const std::shared_ptr<Tensor>& scores_in, int prefix_len) {
+    auto scores = contiguous(scores_in);
     int ndim = scores->shape.size();
     if (ndim < 2) {
         throw std::invalid_argument("prefix_causal_mask requires tensor of at least 2 dimensions");
@@ -273,7 +275,8 @@ inline std::shared_ptr<Tensor> alibi_bias(
 //    into an additive mask [batch, 1, 1, seq_len] (0.0f = keep, -1e9f = pad)
 //    Broadcasting handles [B, n_heads, seq_len, seq_len] automatically.
 // -------------------------------------------------------------
-inline std::shared_ptr<Tensor> create_padding_mask(const std::shared_ptr<Tensor>& pad_mask) {
+inline std::shared_ptr<Tensor> create_padding_mask(const std::shared_ptr<Tensor>& pad_mask_in) {
+    auto pad_mask = contiguous(pad_mask_in);
     if (pad_mask->shape.size() != 2) {
         throw std::invalid_argument("create_padding_mask requires pad_mask with shape [batch, seq_len]");
     }
@@ -307,7 +310,8 @@ inline std::shared_ptr<Tensor> create_padding_mask(const std::shared_ptr<Tensor>
 //    doc_ids is [batch, seq_len] or [seq_len] specifying document index for each token.
 //    Attention is allowed if and only if (doc_ids[i] == doc_ids[j] && j <= i).
 // -------------------------------------------------------------
-inline std::shared_ptr<Tensor> document_causal_mask(const std::shared_ptr<Tensor>& doc_ids) {
+inline std::shared_ptr<Tensor> document_causal_mask(const std::shared_ptr<Tensor>& doc_ids_in) {
+    auto doc_ids = contiguous(doc_ids_in);
     int ndim = doc_ids->ndim();
     if (ndim != 1 && ndim != 2) {
         throw std::invalid_argument("document_causal_mask requires doc_ids to be 1D [seq_len] or 2D [batch, seq_len]");

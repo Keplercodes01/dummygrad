@@ -99,7 +99,8 @@ public:
         gamma->requires_grad = true;
     }
 
-    std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x) {
+    std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x_in) {
+        auto x = contiguous(x_in);
         if (!x) throw std::runtime_error("RMSNorm: input tensor is null");
         int ndim = x->ndim();
         if (ndim < 1) throw std::runtime_error("RMSNorm: input tensor must be at least 1D");
@@ -294,11 +295,14 @@ struct RoPEBackward : public Node {
 // Applies Rotary Position Embedding to Query or Key tensor x
 // Supports 4D [batch, seq_len, n_heads, head_dim], 3D [batch, seq_len, head_dim], and 2D [seq_len, head_dim]
 inline std::shared_ptr<Tensor> apply_rotary_emb(
-    const std::shared_ptr<Tensor>& x,
-    const std::shared_ptr<Tensor>& cos_freqs,
-    const std::shared_ptr<Tensor>& sin_freqs,
+    const std::shared_ptr<Tensor>& x_in,
+    const std::shared_ptr<Tensor>& cos_freqs_in,
+    const std::shared_ptr<Tensor>& sin_freqs_in,
     int start_pos = 0
 ) {
+    auto x = contiguous(x_in);
+    auto cos_freqs = contiguous(cos_freqs_in);
+    auto sin_freqs = contiguous(sin_freqs_in);
     if (!x || !cos_freqs || !sin_freqs) throw std::runtime_error("apply_rotary_emb: null tensor passed");
     int ndim = x->ndim();
     if (ndim < 2) throw std::runtime_error("apply_rotary_emb: tensor must be at least 2D (seq_len, head_dim)");

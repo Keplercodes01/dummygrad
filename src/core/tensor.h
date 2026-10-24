@@ -99,5 +99,7 @@ public:
 };
 
 std::shared_ptr<Tensor> make_contiguous(const std::shared_ptr<Tensor>& a);
+// dst += src for gradient accumulation. A null dst becomes a dense copy of src, and a strided
+// dst is replaced by a dense copy first, so never pass a view you expect to be written through.
 void tensor_add_inplace(std::shared_ptr<Tensor>& dst, const std::shared_ptr<Tensor>& src);
 Edge get_grad_edge(const std::shared_ptr<Tensor>& t);
