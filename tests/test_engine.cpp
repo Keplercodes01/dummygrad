@@ -100,6 +100,18 @@ static LeafSpec leaf(std::vector<int64_t> shape, float lo = -1.0f, float hi = 1.
     return s;
 }
 
+// Shuffled, evenly spaced values: neighbours differ by more than the finite-difference step,
+// so argmax-style ops (max_pool2d) keep the same winner under perturbation.
+static LeafSpec distinct_leaf(std::vector<int64_t> shape) {
+    LeafSpec s;
+    s.shape = std::move(shape);
+    int64_t n = numel(s.shape);
+    s.data.resize(n);
+    for (int64_t i = 0; i < n; ++i) s.data[i] = -1.0f + 2.0f * (float)i / (float)std::max<int64_t>(1, n - 1);
+    std::shuffle(s.data.begin(), s.data.end(), g_test_rng);
+    return s;
+}
+
 struct GradTest {
     std::string name;
     std::vector<LeafSpec> leaves;
@@ -399,6 +411,146 @@ static std::vector<GradTest> build_grad_tests() {
     };
     attention_test("nn.MultiHeadAttention", 2, 0, false);
     attention_test("nn.MultiHeadAttention_gqa_rope", 4, 2, true);
+
+    // --- Shape ops ---
+    add_test("concat_rows", {leaf({2, 3, 4}), leaf({2, 2, 4})},
+             [](const Leaves& L, Device) { return concat(L[0], L[1], 0); });
+    add_test("concat_cols", {leaf({2, 3, 4}), leaf({2, 3, 2})},
+             [](const Leaves& L, Device) { return concat(L[0], L[1], 1); });
+    add_test("broadcast_rows", {leaf({2, 1, 4})}, [](const Leaves& L, Device) { return broadcast(L[0], 0, 3); });
+    add_test("broadcast_cols", {leaf({2, 3, 1})}, [](const Leaves& L, Device) { return broadcast(L[0], 1, 4); });
+    // Slices are strided views; gradients must land in the right window of the input
+    add_test("slice_dim0", {leaf({4, 3})}, [](const Leaves& L, Device) { return slice(L[0], 0, 1, 3); });
+    add_test("slice_inner_dim", {leaf({2, 5, 3})}, [](const Leaves& L, Device) { return slice(L[0], 1, 1, 4); });
+    add_test("slice_last_dim", {leaf({2, 3, 4})}, [](const Leaves& L, Device) { return slice(L[0], 2, 0, 2); });
+    add_test("slice_negative_bounds", {leaf({2, 5})}, [](const Leaves& L, Device) { return slice(L[0], 1, -3, -1); });
+
+    // --- Statistics ---
+    add_test("var_axis0", {leaf({2, 3, 4})}, [](const Leaves& L, Device) { return var(L[0], 0); });
+    add_test("var_axis1", {leaf({2, 3, 4})}, [](const Leaves& L, Device) { return var(L[0], 1); });
+    add_test("std_dev_axis0", {leaf({2, 3, 4})}, [](const Leaves& L, Device) { return std_dev(L[0], 0); });
+    add_test("std_dev_axis1", {leaf({2, 3, 4})}, [](const Leaves& L, Device) { return std_dev(L[0], 1); });
+
+    // --- Masks (followed by softmax, as in attention; masked entries are -1e9) ---
+    add_test("causal_mask", {leaf({2, 4, 4})}, [](const Leaves& L, Device) { return softmax(causal_mask(L[0])); });
+    {
+        std::vector<float> keep = {1, 1, 0, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 0};
+        add_test("bool_mask", {leaf({2, 3, 4})}, [keep](const Leaves& L, Device dev) {
+            return softmax(bool_mask(L[0], upload(keep, {2, 3, 4}, dev, false)));
+        });
+    }
+    add_test("sliding_window_mask", {leaf({2, 5, 5})},
+             [](const Leaves& L, Device) { return softmax(masking::sliding_window_mask(L[0], 2)); });
+    add_test("prefix_causal_mask", {leaf({2, 5, 5})},
+             [](const Leaves& L, Device) { return softmax(masking::prefix_causal_mask(L[0], 2)); });
+
+    // --- More losses & affine ---
+    {
+        std::vector<float> target = random_values(12, 0.0f, 1.0f);
+        add_test("cross_entropy", {leaf({3, 4}, 0.2f, 1.0f)}, [target](const Leaves& L, Device dev) {
+            return cross_entropy(L[0], upload(target, {3, 4}, dev, false));
+        });
+    }
+    {
+        // Targets far from predictions keep |pred - target| away from the kink
+        std::vector<float> target = random_values(12, 2.0f, 3.0f);
+        add_test("l1_loss", {leaf({3, 4})}, [target](const Leaves& L, Device dev) {
+            return l1_loss(L[0], upload(target, {3, 4}, dev, false));
+        });
+    }
+    add_test("scale_n_shift", {leaf({2, 3, 4}), leaf({4}, 0.5f, 1.5f), leaf({4})},
+             [](const Leaves& L, Device) { return scale_n_shift(L[0], L[1], L[2]); });
+
+    // --- Convolution, pooling, embedding ---
+    add_test("conv2d_padded", {leaf({2, 3, 5, 5}), leaf({4, 3, 3, 3}, -0.5f, 0.5f)},
+             [](const Leaves& L, Device) { return conv2d(L[0], L[1], 1, 1); });
+    add_test("conv2d_strided", {leaf({2, 2, 6, 5}), leaf({3, 2, 2, 3}, -0.5f, 0.5f)},
+             [](const Leaves& L, Device) { return conv2d(L[0], L[1], 2, 1, 0, 1); });
+    add_test("conv1d", {leaf({2, 3, 8}), leaf({4, 3, 3}, -0.5f, 0.5f)},
+             [](const Leaves& L, Device) { return conv1d(L[0], L[1], 2, 1); });
+    add_test("max_pool2d", {distinct_leaf({2, 2, 4, 4})},
+             [](const Leaves& L, Device) { return max_pool2d(L[0], 2, 2, 2, 2); });
+    {
+        auto emb = std::make_shared<Embedding>(10, 4);
+        std::vector<float> ids = {3, 0, 7, 3, 9, 1};
+        add_test("nn.Embedding", {leaf({10, 4})}, [emb, ids](const Leaves& L, Device dev) {
+            emb->weight = L[0];
+            return emb->forward(upload(ids, {2, 3}, dev, false));
+        });
+    }
+
+    // --- Strided inputs: every op must read transposed / sliced views correctly ---
+    using UnaryFn = std::function<TensorPtr(const TensorPtr&)>;
+    std::vector<std::pair<std::string, UnaryFn>> unary = {
+        {"relu", [](const TensorPtr& t) { return relu(t); }},
+        {"leaky_relu", [](const TensorPtr& t) { return leaky_relu(t, 0.1f); }},
+        {"tanh", [](const TensorPtr& t) { return tanh(t); }},
+        {"sigmoid", [](const TensorPtr& t) { return sigmoid(t); }},
+        {"gelu", [](const TensorPtr& t) { return gelu(t); }},
+        {"silu", [](const TensorPtr& t) { return silu(t); }},
+        {"softmax", [](const TensorPtr& t) { return softmax(t); }},
+        {"sum_last", [](const TensorPtr& t) { return sum(t, -1); }},
+        {"sum_rows", [](const TensorPtr& t) { return sum(t, -2); }},
+        {"mean_axis0", [](const TensorPtr& t) { return mean(t, 0); }},
+        {"mean_axis1", [](const TensorPtr& t) { return mean(t, 1); }},
+        {"var_axis1", [](const TensorPtr& t) { return var(t, 1); }},
+        {"std_dev_axis0", [](const TensorPtr& t) { return std_dev(t, 0); }},
+        {"scalar_ops", [](const TensorPtr& t) { return add_scalar(mul_scalar(t, 1.5f), 0.25f); }},
+    };
+    for (const auto& entry : unary) {
+        UnaryFn f = entry.second;
+        add_test("strided/" + entry.first, {leaf({4, 3}, -1, 1, 0.1f)},
+                 [f](const Leaves& L, Device) { return f(transpose(L[0], 0, 1)); });
+    }
+    add_test("strided/relu_of_slice", {leaf({3, 5}, -1, 1, 0.1f)},
+             [](const Leaves& L, Device) { return relu(slice(L[0], 1, 1, 4)); });
+    add_test("strided/add_same_shape", {leaf({4, 3}), leaf({3, 4})},
+             [](const Leaves& L, Device) { return add(transpose(L[0], 0, 1), L[1]); });
+    add_test("strided/add_bias_broadcast", {leaf({4, 3}), leaf({1, 4})},
+             [](const Leaves& L, Device) { return cast_n_add(transpose(L[0], 0, 1), L[1]); });
+    add_test("strided/mul_both", {leaf({4, 3}), leaf({4, 3})},
+             [](const Leaves& L, Device) { return mul(transpose(L[0], 0, 1), transpose(L[1], 0, 1)); });
+    add_test("strided/matmul_slice", {leaf({3, 5}), leaf({2, 4})},
+             [](const Leaves& L, Device) { return matmul(slice(L[0], 1, 1, 3), L[1]); });
+    add_test("strided/causal_mask", {leaf({2, 4, 4})},
+             [](const Leaves& L, Device) { return softmax(causal_mask(transpose(L[0], -2, -1))); });
+    {
+        auto ln = std::make_shared<LayerNorm>(6);
+        add_test("strided/nn.LayerNorm", {leaf({6, 2}), leaf({6}, 0.5f, 1.5f), leaf({6})}, [ln](const Leaves& L, Device) {
+            ln->gamma = L[1];
+            ln->beta = L[2];
+            return ln->forward(transpose(L[0], 0, 1));
+        });
+    }
+    {
+        auto rms = std::make_shared<RMSNorm>(6);
+        add_test("strided/nn.RMSNorm", {leaf({6, 2}), leaf({6}, 0.5f, 1.5f)}, [rms](const Leaves& L, Device) {
+            rms->gamma = L[1];
+            return rms->forward(transpose(L[0], 0, 1));
+        });
+    }
+    {
+        std::vector<float> targets = {0, 4, 2, 1, 3, 2};
+        add_test("strided/fused_cross_entropy", {leaf({5, 6}, -2, 2)}, [targets](const Leaves& L, Device dev) {
+            return fused_cross_entropy(transpose(L[0], 0, 1), upload(targets, {6}, dev, false));
+        });
+    }
+    {
+        std::vector<float> target = random_values(12, -1, 1);
+        add_test("strided/mse", {leaf({4, 3})}, [target](const Leaves& L, Device dev) {
+            return mse(transpose(L[0], 0, 1), upload(target, {3, 4}, dev, false));
+        });
+    }
+    {
+        auto freqs = precompute_freqs_cis(4, 8);
+        auto cos_h = download(freqs.first);
+        auto sin_h = download(freqs.second);
+        // [B, H, S, D] memory viewed as [B, S, H, D], as attention produces before RoPE
+        add_test("strided/rope", {leaf({2, 2, 3, 4})}, [cos_h, sin_h](const Leaves& L, Device dev) {
+            return apply_rotary_emb(transpose(L[0], 1, 2), upload(cos_h, {8, 2}, dev, false),
+                                    upload(sin_h, {8, 2}, dev, false), 0);
+        });
+    }
 
     return tests;
 }

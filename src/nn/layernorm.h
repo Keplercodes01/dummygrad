@@ -115,7 +115,8 @@ public:
         beta->requires_grad = true;
     }
 
-    std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x) {
+    std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x_in) {
+        auto x = contiguous(x_in);
         int ndim = x->ndim();
         if (ndim < 1) throw std::runtime_error("LayerNorm: input tensor must be at least 1D");
         int c = x->shape[ndim - 1];
