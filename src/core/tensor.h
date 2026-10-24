@@ -99,6 +99,16 @@ public:
     void backward(bool retain_graph = false);
 };
 
+// Host<->accelerator copies made through Tensor::to, counted process-wide. Every copy inside a
+// training step is a CPU fallback or a sync point, so these counters show where an op lacks a
+// device kernel. Reset before the region you want to measure.
+struct TransferStats {
+    uint64_t to_device_count = 0, to_device_bytes = 0;
+    uint64_t to_host_count = 0, to_host_bytes = 0;
+};
+TransferStats transfer_stats();
+void reset_transfer_stats();
+
 std::shared_ptr<Tensor> make_contiguous(const std::shared_ptr<Tensor>& a);
 // dst += src for gradient accumulation. A null dst becomes a dense copy of src, and a strided
 // dst is replaced by a dense copy first, so never pass a view you expect to be written through.

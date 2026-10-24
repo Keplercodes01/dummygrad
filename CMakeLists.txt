@@ -17,6 +17,7 @@ endif()
 option(ENABLE_CUDA "Enable NVIDIA CUDA GPU acceleration" ON)
 option(DUMMYGRAD_BUILD_TESTS "Build the gradient-check test suite (test_engine)" ${DUMMYGRAD_IS_TOP_LEVEL})
 option(DUMMYGRAD_BUILD_EXAMPLES "Build the examples (quickstart, custom_op, train_lm, train_colab)" ${DUMMYGRAD_IS_TOP_LEVEL})
+option(DUMMYGRAD_BUILD_BENCHMARKS "Build the training-step benchmark (dg_bench)" ${DUMMYGRAD_IS_TOP_LEVEL})
 
 # Source files for the core engine
 set(DUMMYGRAD_SOURCES
@@ -138,6 +139,12 @@ if(DUMMYGRAD_BUILD_EXAMPLES)
 
     add_executable(train_colab src/train_colab.cpp)
     target_link_libraries(train_colab PRIVATE dummygrad_engine)
+endif()
+
+# Training-step benchmark; bench/bench_torch.py is the PyTorch reference
+if(DUMMYGRAD_BUILD_BENCHMARKS)
+    add_executable(dg_bench bench/bench.cpp)
+    target_link_libraries(dg_bench PRIVATE dummygrad_engine)
 endif()
 
 # Gradient-check test suite: `ctest --output-on-failure` or run ./test_engine directly

@@ -36,6 +36,27 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure --verbose
 
+      - name: Benchmark smoke run
+        run: ./build/dg_bench tiny
+
+  # No GPU on hosted runners: compile the CUDA backend and everything that includes it, so kernel
+  # and header errors surface here instead of on a GPU machine. Running it happens on Colab.
+  cuda-build:
+    name: CUDA build (compile only)
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    steps:
+      - name: Install build tools
+        run: apt-get update && apt-get install -y --no-install-recommends cmake g++ git libopenblas-dev
+
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75
+
+      - name: Build
+        run: cmake --build build -j 4
+
   consumer:
     name: FetchContent consumer
     runs-on: ubuntu-latest
