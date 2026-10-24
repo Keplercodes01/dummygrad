@@ -16,13 +16,48 @@
 //    yielding higher training throughput with identical convergence.
 // ============================================================================
 
+namespace rmsnorm_detail {
+
+inline void forward_host(const float* x, const float* gamma, float* out, float* inv_rms, int64_t rows, int64_t cols, float eps) {
+    for (int64_t row = 0; row < rows; ++row) {
+        const float* xr = x + row * cols;
+        float sum_sq = 0.0f;
+        for (int64_t j = 0; j < cols; ++j) sum_sq += xr[j] * xr[j];
+        float irms = 1.0f / std::sqrt(sum_sq / (float)cols + eps);
+        inv_rms[row] = irms;
+        for (int64_t j = 0; j < cols; ++j) out[row * cols + j] = xr[j] * irms * gamma[j];
+    }
+}
+
+// dx = irms * (u - x * irms^2 * mean(u * x)) with u = grad * gamma;  dgamma = sum_rows(grad * x * irms)
+inline void backward_host(const float* grad, const float* x, const float* gamma, const float* inv_rms,
+                          float* gx, float* ggamma, int64_t rows, int64_t cols) {
+    if (ggamma) std::fill(ggamma, ggamma + cols, 0.0f);
+    for (int64_t row = 0; row < rows; ++row) {
+        const float* xr = x + row * cols;
+        const float* gr = grad + row * cols;
+        float irms = inv_rms[row];
+        if (ggamma) {
+            for (int64_t j = 0; j < cols; ++j) ggamma[j] += gr[j] * xr[j] * irms;
+        }
+        if (gx) {
+            float dot = 0.0f;
+            for (int64_t j = 0; j < cols; ++j) dot += gr[j] * gamma[j] * xr[j];
+            float factor = irms * irms * dot / (float)cols;
+            for (int64_t j = 0; j < cols; ++j) gx[row * cols + j] = irms * (gr[j] * gamma[j] - xr[j] * factor);
+        }
+    }
+}
+
+}  // namespace rmsnorm_detail
+
 struct RMSNormBackward : public Node {
     std::shared_ptr<Tensor> x, gamma, inv_rms;
-    int r, c, batch_size;
+    int64_t rows, cols;
 
-    RMSNormBackward(std::shared_ptr<Tensor> x, std::shared_ptr<Tensor> gamma,
-                    std::shared_ptr<Tensor> inv_rms, int r, int c, int batch_size)
-        : x(x), gamma(gamma), inv_rms(inv_rms), r(r), c(c), batch_size(batch_size) {}
+    RMSNormBackward(std::shared_ptr<Tensor> x, std::shared_ptr<Tensor> gamma, std::shared_ptr<Tensor> inv_rms,
+                    int64_t rows, int64_t cols)
+        : x(std::move(x)), gamma(std::move(gamma)), inv_rms(std::move(inv_rms)), rows(rows), cols(cols) {}
 
     void release_variables() override {
         x.reset();
@@ -32,63 +67,35 @@ struct RMSNormBackward : public Node {
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
         if (grads.empty() || !grads[0] || !x || !gamma || !inv_rms) return {nullptr, nullptr};
-        auto dout = grads[0];
-
-        if (x->device != Device::CPU) {
-            auto dout_cpu = dout->to(Device::CPU);
-            auto x_cpu = x->to(Device::CPU);
-            auto gamma_cpu = gamma->to(Device::CPU);
-            auto inv_rms_cpu = inv_rms->to(Device::CPU);
-            RMSNormBackward cpu_node(x_cpu, gamma_cpu, inv_rms_cpu, r, c, batch_size);
-            auto cpu_grads = cpu_node.apply({dout_cpu});
-            if (cpu_grads.size() < 2) return {nullptr, nullptr};
-            return {
-                cpu_grads[0] ? cpu_grads[0]->to(x->device) : nullptr,
-                cpu_grads[1] ? cpu_grads[1]->to(gamma->device) : nullptr
-            };
+        bool need_x = next_edges.size() > 0 && next_edges[0].function;
+        bool need_g = next_edges.size() > 1 && next_edges[1].function;
+        auto g = grads[0];
+        Device dev = x->device;
+        std::shared_ptr<Tensor> gx, gg;
+#ifdef USE_CUDA
+        if (dev == Device::CUDA) {
+            if (need_x) gx = std::make_shared<Tensor>(x->shape, dev, x->dtype, false);
+            if (need_g) gg = std::make_shared<Tensor>(gamma->shape, dev, gamma->dtype, false);
+            cuda::rmsnorm_backward(g->data_ptr<float>(), x->data_ptr<float>(), gamma->data_ptr<float>(), inv_rms->data_ptr<float>(),
+                                   gx ? gx->data_ptr<float>() : nullptr, gg ? gg->data_ptr<float>() : nullptr, rows, cols);
+            return {gx, gg};
         }
-
-        auto dx = std::make_shared<Tensor>(x->shape, x->device, x->dtype, false); dx->fill_(0.0f);
-        auto dg = std::make_shared<Tensor>(gamma->shape, gamma->device, gamma->dtype, false); dg->fill_(0.0f);
-
-        const float* dout_ptr = dout->data_ptr<float>();
-        const float* x_ptr = x->data_ptr<float>();
-        const float* inv_rms_ptr = inv_rms->data_ptr<float>();
-        const float* g_ptr = gamma->data_ptr<float>();
-
-        float* dx_ptr = dx->data_ptr<float>();
-        float* dg_ptr = dg->data_ptr<float>();
-
-        for (int batch = 0; batch < batch_size; batch++) {
-            for (int i = 0; i < r; i++) {
-                int offset = batch * r * c + i * c;
-                float irms = inv_rms_ptr[batch * r + i];
-
-                // Step 1: Accumulate dg and sum(dout * gamma * x)
-                float sum_u_x = 0.0f;
-                for (int j = 0; j < c; j++) {
-                    float d = dout_ptr[offset + j];
-                    float x_val = x_ptr[offset + j];
-                    dg_ptr[j] += d * x_val * irms;
-
-                    float u = d * g_ptr[j];
-                    sum_u_x += u * x_val;
-                }
-
-                // Step 2: Compute dx_i = irms * (u_i - (x_i / c) * irms^2 * sum(u * x))
-                float f_c = 1.0f / static_cast<float>(c);
-                float factor = f_c * irms * irms * sum_u_x;
-                for (int j = 0; j < c; j++) {
-                    float u = dout_ptr[offset + j] * g_ptr[j];
-                    float x_val = x_ptr[offset + j];
-                    dx_ptr[offset + j] = irms * (u - x_val * factor);
-                }
-            }
+#endif
+        auto host = [](const std::shared_ptr<Tensor>& t) { return t->device == Device::CPU ? t : t->cpu(); };
+        auto gh = host(g), xh = host(x), gmh = host(gamma), ih = host(inv_rms);
+        if (need_x) gx = std::make_shared<Tensor>(x->shape, Device::CPU, x->dtype, false);
+        if (need_g) gg = std::make_shared<Tensor>(gamma->shape, Device::CPU, gamma->dtype, false);
+        rmsnorm_detail::backward_host(gh->data_ptr<float>(), xh->data_ptr<float>(), gmh->data_ptr<float>(), ih->data_ptr<float>(),
+                                      gx ? gx->data_ptr<float>() : nullptr, gg ? gg->data_ptr<float>() : nullptr, rows, cols);
+        if (dev != Device::CPU) {
+            if (gx) gx = gx->to(dev);
+            if (gg) gg = gg->to(dev);
         }
-        return {dx, dg};
+        return {gx, gg};
     }
 };
 
+// RMSNorm over the last dimension: x / sqrt(mean(x^2) + eps) * gamma
 class RMSNorm : public Module {
 public:
     std::shared_ptr<Tensor> gamma;
@@ -101,74 +108,47 @@ public:
     }
 
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x_in) {
+        if (!x_in) throw std::runtime_error("RMSNorm: input tensor is null");
         auto x = contiguous(x_in);
-        if (!x) throw std::runtime_error("RMSNorm: input tensor is null");
-        int ndim = x->ndim();
-        if (ndim < 1) throw std::runtime_error("RMSNorm: input tensor must be at least 1D");
-        int c = x->shape[ndim - 1];
-        if (c != gamma->shape[0]) {
-            throw std::runtime_error("RMSNorm: feature dimension mismatch, expected " +
-                                     std::to_string(gamma->shape[0]) + " but got " + std::to_string(c));
+        if (x->ndim() < 1) throw std::runtime_error("RMSNorm: input tensor must be at least 1D");
+        int64_t cols = x->shape.back();
+        if (cols != gamma->shape[0]) {
+            throw std::runtime_error("RMSNorm: feature dimension mismatch, expected " + std::to_string(gamma->shape[0]) +
+                                     " but got " + std::to_string(cols));
         }
-        int r = (ndim >= 2) ? x->shape[ndim - 2] : 1;
-        int batch_size = x->size() / (r * c);
-        bool req_grad = grad_enabled() && ((x && x->requires_grad) || (gamma && gamma->requires_grad));
+        if (gamma->device != x->device) throw std::runtime_error("RMSNorm: input and gamma are on different devices");
+        int64_t rows = x->size() / cols;
+        Device dev = x->device;
+        auto out = std::make_shared<Tensor>(x->shape, dev, x->dtype, false);
+        auto inv_rms = std::make_shared<Tensor>(std::vector<int64_t>{rows}, dev, x->dtype, false);
 
-        if (x->device != Device::CPU) {
-            auto x_cpu = x->to(Device::CPU);
-            auto gamma_cpu = gamma->to(Device::CPU);
-            x_cpu->requires_grad = needs_grad(x);
-            gamma_cpu->requires_grad = needs_grad(gamma);
-            RMSNorm norm_cpu(gamma->shape[0], eps);
-            norm_cpu.gamma = gamma_cpu;
-            auto out_cpu = norm_cpu.forward(x_cpu);
-            auto out_res = out_cpu->to(x->device);
-            if (req_grad && out_cpu->grad_fn) {
-                auto grad_fn = std::make_shared<RMSNormBackward>(
-                    x, gamma,
-                    std::static_pointer_cast<RMSNormBackward>(out_cpu->grad_fn)->inv_rms->to(x->device),
-                    r, c, batch_size
-                );
-                grad_fn->add_next_edge(get_grad_edge(x).function);
-                grad_fn->add_next_edge(get_grad_edge(gamma).function);
-                out_res->grad_fn = grad_fn;
-            }
-            return out_res;
+#ifdef USE_CUDA
+        if (dev == Device::CUDA) {
+            cuda::rmsnorm_forward(x->data_ptr<float>(), gamma->data_ptr<float>(), out->data_ptr<float>(),
+                                  inv_rms->data_ptr<float>(), rows, cols, eps);
+        } else
+#endif
+        if (dev == Device::CPU) {
+            rmsnorm_detail::forward_host(x->data_ptr<float>(), gamma->data_ptr<float>(), out->data_ptr<float>(),
+                                         inv_rms->data_ptr<float>(), rows, cols, eps);
+        } else {
+            auto xh = x->cpu(), gh = gamma->cpu();
+            auto oh = std::make_shared<Tensor>(x->shape, Device::CPU, x->dtype, false);
+            auto ih = std::make_shared<Tensor>(std::vector<int64_t>{rows}, Device::CPU, x->dtype, false);
+            rmsnorm_detail::forward_host(xh->data_ptr<float>(), gh->data_ptr<float>(), oh->data_ptr<float>(),
+                                         ih->data_ptr<float>(), rows, cols, eps);
+            out = oh->to(dev);
+            inv_rms = ih->to(dev);
         }
 
-        auto out = std::make_shared<Tensor>(x->shape, x->device, x->dtype, req_grad);
-        auto inv_rms = std::make_shared<Tensor>(std::vector<int64_t>{batch_size * r}, x->device, x->dtype, false);
-
-        const float* x_ptr = x->data_ptr<float>();
-        const float* g_ptr = gamma->data_ptr<float>();
-        float* out_ptr = out->data_ptr<float>();
-        float* irms_ptr = inv_rms->data_ptr<float>();
-
-        for (int batch = 0; batch < batch_size; batch++) {
-            for (int i = 0; i < r; i++) {
-                int offset = batch * r * c + i * c;
-                float sum_sq = 0.0f;
-                for (int j = 0; j < c; j++) {
-                    float val = x_ptr[offset + j];
-                    sum_sq += val * val;
-                }
-                float rms = std::sqrt(sum_sq / static_cast<float>(c) + eps);
-                float irms = 1.0f / rms;
-                irms_ptr[batch * r + i] = irms;
-
-                for (int j = 0; j < c; j++) {
-                    out_ptr[offset + j] = x_ptr[offset + j] * irms * g_ptr[j];
-                }
-            }
-        }
-
+        bool req_grad = needs_grad(x) || needs_grad(gamma);
+        out->requires_grad = req_grad;
         if (req_grad) {
-            auto grad_fn = std::make_shared<RMSNormBackward>(x, gamma, inv_rms, r, c, batch_size);
+            auto grad_fn = std::make_shared<RMSNormBackward>(x, gamma, inv_rms, rows, cols);
             grad_fn->add_next_edge(get_grad_edge(x).function);
             grad_fn->add_next_edge(get_grad_edge(gamma).function);
             out->grad_fn = grad_fn;
         }
-
         return out;
     }
 
@@ -426,13 +406,30 @@ public:
 inline float clip_grad_norm_(const std::vector<std::shared_ptr<Tensor>>& parameters, float max_norm) {
     // Accumulate in double: summing millions of squared floats in float loses precision
     double total_sq = 0.0;
+#ifdef USE_CUDA
+    std::vector<std::shared_ptr<Tensor>> keep_alive;
+    std::vector<const float*> device_grads;
+    std::vector<int64_t> device_sizes;
+#endif
     for (const auto& p : parameters) {
         if (!p || !p->grad) continue;
         auto g = make_contiguous(p->grad);
+#ifdef USE_CUDA
+        if (g->device == Device::CUDA) {
+            // Reduced on the GPU below, all parameters in one pass with a single host copy
+            device_grads.push_back(g->data_ptr<float>());
+            device_sizes.push_back(g->size());
+            keep_alive.push_back(g);
+            continue;
+        }
+#endif
         if (g->device != Device::CPU) g = g->cpu();
         const float* d = g->data_ptr<float>();
         for (int64_t i = 0; i < g->size(); ++i) total_sq += (double)d[i] * (double)d[i];
     }
+#ifdef USE_CUDA
+    total_sq += cuda::sum_of_squares(device_grads, device_sizes);
+#endif
     float total_norm = (float)std::sqrt(total_sq);
 
     if (total_norm > max_norm) {

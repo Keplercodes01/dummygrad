@@ -8,6 +8,15 @@ All notable changes to dummygrad are documented here. Versions follow [Semantic 
 - **Benchmark** (`bench/bench.cpp`, target `dg_bench`): full ModernTransformer training steps at three sizes, timed as forward / backward / optimizer, with host-device traffic per step. `bench/bench_torch.py` runs the same architecture in PyTorch; the Colab notebook runs both.
 - `transfer_stats()` / `reset_transfer_stats()`: counts host-device copies made through `Tensor::to`, which exposes ops that fall back to the CPU.
 - CI compiles the CUDA backend (in NVIDIA's CUDA container) on every change, and smoke-runs the benchmark on CPU.
+- **GPU kernels for the ops that fell back to the CPU** (`cuda_core_ops.cu`): broadcast add/sub/mul/div forward and backward, scalar ops, RMSNorm, fused cross entropy, embedding lookup, GQA head repetition, and the gradient-norm reduction. A training step no longer copies activations or gradients between GPU and CPU. All reductions are deterministic (fixed-order partial sums, no atomics), so GPU results are reproducible too.
+
+### Changed
+- **Broadcasting follows NumPy rules** (shapes aligned from the right; each dimension 1 or equal). The previous rule mapped a smaller batch onto contiguous groups of a larger one, which applied `[1, H, S, S]` operands such as ALiBi biases to the wrong heads whenever the batch size was above 1. Incompatible shapes now raise an error instead of reading out of bounds.
+- The four broadcast ops and six scalar ops are each one implementation (`broadcast_binary`, `scalar_op`) instead of separate copies; `add`, `mul`, `cast_n_*`, `*_scalar`, `neg` are thin wrappers.
+- `Embedding` looks up rows directly instead of multiplying a one-hot matrix by the table.
+- `fused_cross_entropy` saves per-row log-sum-exp instead of the full probability matrix and recomputes the softmax in backward; on the GPU the loss stays on the device.
+- `RMSNorm` runs natively on each device instead of building a CPU copy of the layer on every call.
+- `Node::name()` gives backward functions readable names in error messages (e.g. `ScalarOpBackward(rdiv)`).
 
 ## [0.4.0] - 2026-10-24
 

@@ -57,6 +57,45 @@ namespace cuda {
     void prefix_causal_mask(const float* in, float* out, int batch, int seq_len, int prefix_len);
     void prefix_causal_mask_backward(const float* grad_out, float* grad_in, int batch, int seq_len, int prefix_len);
 
+    // ---- cuda_core_ops.cu: deterministic training-step kernels ----
+
+    // Broadcast binary ops (op: 0 add, 1 sub, 2 mul, 3 div), NumPy-style: y_shape is aligned to
+    // x_shape's rank and each y dimension is 1 or equal to x's. Output and gx have x's shape.
+    void broadcast_binary_forward(int op, const float* x, const float* y, float* out,
+                                  const std::vector<int64_t>& x_shape, const std::vector<int64_t>& y_shape);
+    void broadcast_binary_backward_x(int op, const float* grad, const float* y, float* gx,
+                                     const std::vector<int64_t>& x_shape, const std::vector<int64_t>& y_shape);
+    void broadcast_binary_backward_y(int op, const float* grad, const float* x, const float* y, float* gy,
+                                     const std::vector<int64_t>& x_shape, const std::vector<int64_t>& y_shape);
+
+    // Scalar ops (op: 0 add, 1 sub, 2 mul, 3 div, 4 rsub = s - a, 5 rdiv = s / a)
+    void scalar_forward(int op, const float* a, float s, float* out, int64_t n);
+    void scalar_backward(int op, const float* grad, const float* a, float s, float* ga, int64_t n);
+
+    // RMSNorm over rows of `cols` elements; gx or ggamma may be null to skip that gradient
+    void rmsnorm_forward(const float* x, const float* gamma, float* out, float* inv_rms, int64_t rows, int64_t cols, float eps);
+    void rmsnorm_backward(const float* grad, const float* x, const float* gamma, const float* inv_rms,
+                          float* gx, float* ggamma, int64_t rows, int64_t cols);
+
+    // Fused cross entropy: logits [rows, vocab], targets = class ids as floats. loss and count are
+    // single device floats (mean loss over valid rows, number of valid rows); lse is [rows].
+    void cross_entropy_forward(const float* logits, const float* targets, float* loss, float* lse, float* count,
+                               int64_t rows, int64_t vocab, int ignore_index);
+    void cross_entropy_backward(const float* logits, const float* targets, const float* lse, const float* count,
+                                const float* dloss, float* grad, int64_t rows, int64_t vocab, int ignore_index);
+
+    // Embedding lookup; the backward takes positions grouped by token id (CSR, built on the host)
+    void embedding_forward(const float* indices, const float* weight, float* out, int64_t n, int64_t vocab, int64_t dim);
+    void embedding_backward(const float* grad, const std::vector<int>& positions, const std::vector<int>& unique_ids,
+                            const std::vector<int>& starts, float* grad_weight, int64_t vocab, int64_t dim);
+
+    // GQA: [B, kv_heads, S, D] -> [B, kv_heads * group, S, D], and its gradient
+    void repeat_kv_forward(const float* in, float* out, int64_t batch, int64_t kv_heads, int64_t group, int64_t head_elems);
+    void repeat_kv_backward(const float* grad, float* gin, int64_t batch, int64_t kv_heads, int64_t group, int64_t head_elems);
+
+    // Sum of squares over several device buffers, in double precision (for gradient clipping)
+    double sum_of_squares(const std::vector<const float*>& buffers, const std::vector<int64_t>& sizes);
+
     // Rotary Position Embeddings (RoPE)
     void rope_forward(const float* in, const float* cos_freqs, const float* sin_freqs,
                       float* out, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos);

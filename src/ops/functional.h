@@ -655,529 +655,268 @@ inline std::shared_ptr<Tensor> broadcast(const std::shared_ptr<Tensor>& a_in, in
     return out;
 }
 
-// Batch index into a broadcast operand y for flattened batch index `batch` of x.
-// Equal batch counts map 1:1; a smaller y that divides x is shared by contiguous groups
-// (GQA: query head h uses kv head h / (n_heads / n_kv_heads)); otherwise y is broadcast.
-// Forward and backward of every cast_n_* op must use this same mapping.
-inline int broadcast_batch_index(int batch, int batch_size, int y_batch_size) {
-    if (y_batch_size == batch_size) return batch;
-    if (y_batch_size > 1 && batch_size % y_batch_size == 0) return batch / (batch_size / y_batch_size);
-    return 0;
+// ========================================
+// Broadcast binary ops: add, sub, mul, div
+// ========================================
+// NumPy-style broadcasting of y onto x: shapes are aligned from the right, and every y dimension
+// must be 1 or equal to x's. The output has x's shape. Padding masks [B, 1, 1, S], ALiBi biases
+// [1, H, S, S] and Linear biases [1, out] all broadcast this way.
+enum class BinaryOp : int { Add = 0, Sub = 1, Mul = 2, Div = 3 };
+
+inline std::shared_ptr<Tensor> mul_scalar(const std::shared_ptr<Tensor>& a, float s);
+
+inline const char* binary_op_name(BinaryOp op) {
+    switch (op) {
+        case BinaryOp::Add: return "add";
+        case BinaryOp::Sub: return "sub";
+        case BinaryOp::Mul: return "mul";
+        default: return "div";
+    }
 }
 
-// --- ADD BACKWARD NODE ---
-struct AddBackward : public Node {
-    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
-        if (grads.empty() || !grads[0]) return {nullptr, nullptr};
-        return {grads[0], make_contiguous(grads[0])};
-    }
-};
+inline std::string shape_string(const std::vector<int64_t>& shape) {
+    std::string s = "[";
+    for (size_t i = 0; i < shape.size(); ++i) s += (i ? ", " : "") + std::to_string(shape[i]);
+    return s + "]";
+}
 
-// --- CAST ADD BACKWARD NODE ---
-struct CastAddBackward : public Node {
-    std::vector<int64_t> x_shape, y_shape;
-    int r, c, batch_size;
+// Indexing plan for broadcasting y onto x. Shapes are simplified before use: dimensions of size 1
+// are dropped and neighbouring dimensions with the same broadcast status are merged, so a Linear
+// bias [B, T, O] + [1, O] becomes [B*T, O] + [1, O]. Both the CPU loops and the CUDA kernels index
+// with these collapsed shapes.
+struct BroadcastLayout {
+    std::vector<int64_t> x_shape, y_shape;  // collapsed, same rank (>= 1)
+    std::vector<int64_t> y_strides;         // 0 where y broadcasts
+    int64_t numel = 1;
 
-    CastAddBackward(const std::vector<int64_t>& x_shape, const std::vector<int64_t>& y_shape, int r, int c, int batch_size)
-        : x_shape(x_shape), y_shape(y_shape), r(r), c(c), batch_size(batch_size) {}
-
-    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
-        if (grads.empty() || !grads[0]) return {nullptr, nullptr};
-        std::shared_ptr<Tensor> self_grad = grads[0];
-        Device dev = self_grad->device;
-        auto sg_cpu = (dev == Device::CPU) ? self_grad : self_grad->cpu();
-        auto gx = std::make_shared<Tensor>(x_shape, Device::CPU, sg_cpu->dtype, false);
-        gx->fill_(0.0f);
-        auto gy = std::make_shared<Tensor>(y_shape, Device::CPU, sg_cpu->dtype, false);
-        gy->fill_(0.0f);
-
-        const float* sg_ptr = sg_cpu->data_ptr<float>();
-        float* gx_ptr = gx->data_ptr<float>();
-        float* gy_ptr = gy->data_ptr<float>();
-
-        int yr = y_shape.size() > 1 ? y_shape[y_shape.size() - 2] : 1;
-        int yc = y_shape.size() > 0 ? y_shape[y_shape.size() - 1] : 1;
-
-        int y_batch_size = 1;
-        for (int i = 0; i < (int)y_shape.size() - 2; i++) { y_batch_size *= y_shape[i]; }
-
-        for (int batch = 0; batch < batch_size; batch++) {
-            int y_b = broadcast_batch_index(batch, batch_size, y_batch_size);
-            for (int i = 0; i < r; i++) {
-                for (int j = 0; j < c; j++) {
-                    int x_idx = batch * r * c + i * c + j;
-                    int yi = (yr == 1) ? 0 : i;
-                    int yj = (yc == 1) ? 0 : j;
-                    int y_idx = y_b * yr * yc + yi * yc + yj;
-
-                    float val = sg_ptr[x_idx];
-                    gx_ptr[x_idx] += val;
-                    gy_ptr[y_idx] += val;
-                }
+    // Calls f(x_index, y_index) for every element of x in order. The innermost dimension is a
+    // plain loop and outer dimensions advance like an odometer, so no division per element.
+    template <typename F>
+    void for_each(F&& f) const {
+        int nd = (int)x_shape.size();
+        int64_t inner = x_shape[nd - 1];
+        int64_t inner_y = y_strides[nd - 1];
+        int64_t outer = numel / inner;
+        std::vector<int64_t> idx(nd, 0);
+        int64_t y_base = 0;
+        for (int64_t o = 0; o < outer; ++o) {
+            int64_t xb = o * inner;
+            if (inner_y) {
+                for (int64_t j = 0; j < inner; ++j) f(xb + j, y_base + j);
+            } else {
+                for (int64_t j = 0; j < inner; ++j) f(xb + j, y_base);
+            }
+            for (int d = nd - 2; d >= 0; --d) {
+                y_base += y_strides[d];
+                if (++idx[d] < x_shape[d]) break;
+                y_base -= y_strides[d] * x_shape[d];
+                idx[d] = 0;
             }
         }
-        return {(dev == Device::CPU) ? gx : gx->to(dev),
-                (dev == Device::CPU) ? gy : gy->to(dev)};
     }
 };
 
-// broadcast and add
-inline std::shared_ptr<Tensor> cast_n_add(const std::shared_ptr<Tensor>& x_in,
-                                          const std::shared_ptr<Tensor>& y_in) {
-    auto x = contiguous(x_in);
-    auto y = contiguous(y_in);
-    int ndim = x->shape.size();
-    int r = (ndim >= 2) ? x->shape[ndim - 2] : 1;
-    int c = x->shape[ndim - 1];
-    int batch_size = 1;
-    for (int i = 0; i < ndim - 2; i++) { batch_size *= x->shape[i]; }
+inline BroadcastLayout broadcast_layout(const std::vector<int64_t>& xs, const std::vector<int64_t>& ys, BinaryOp op) {
+    std::vector<int64_t> x = xs.empty() ? std::vector<int64_t>{1} : xs;
+    size_t rank = x.size();
+    // Align y to x's rank; y may have extra leading dimensions only if they are 1
+    size_t extra = ys.size() > rank ? ys.size() - rank : 0;
+    bool ok = true;
+    for (size_t i = 0; i < extra; ++i) ok &= (ys[i] == 1);
+    std::vector<int64_t> y(rank, 1);
+    for (size_t i = extra; i < ys.size(); ++i) y[rank - (ys.size() - i)] = ys[i];
+    for (size_t d = 0; d < rank; ++d) ok &= (y[d] == 1 || y[d] == x[d]);
+    if (!ok) {
+        throw std::invalid_argument(std::string(binary_op_name(op)) + ": cannot broadcast shape " + shape_string(ys) +
+                                    " onto " + shape_string(xs));
+    }
 
-    int yr = y->shape.size() > 1 ? y->shape[y->shape.size() - 2] : 1;
-    int yc = y->shape.size() > 0 ? y->shape[y->shape.size() - 1] : 1;
-
-    int y_batch_size = 1;
-    for (int i = 0; i < (int)y->shape.size() - 2; i++) { y_batch_size *= y->shape[i]; }
-
-    bool req_grad = grad_enabled() && (x->requires_grad || y->requires_grad);
-    auto out = std::make_shared<Tensor>(x->shape, x->device, x->dtype, req_grad);
-
-#ifdef USE_CUDA
-    if (x->device == Device::CUDA) {
-        auto xc = make_contiguous(x);
-        auto yc_t = make_contiguous(y);
-        if (yc_t->size() == c) {
-            cuda::make_contiguous(*out, *xc);
-            cuda::add_bias(out->data_ptr<float>(), yc_t->data_ptr<float>(), batch_size * r, c);
-        } else if (xc->size() == yc_t->size()) {
-            cuda::make_contiguous(*out, *xc);
-            cuda::add_inplace(*out, *yc_t);
+    BroadcastLayout l;
+    for (size_t d = 0; d < rank; ++d) {
+        l.numel *= x[d];
+        if (x[d] == 1) continue;  // size-1 dimensions don't affect indexing
+        bool broadcast = (y[d] == 1);
+        if (!l.x_shape.empty() && (l.y_shape.back() == 1) == broadcast) {
+            l.x_shape.back() *= x[d];
+            l.y_shape.back() *= y[d];
         } else {
-            auto x_cpu = xc->cpu();
-            auto y_cpu = yc_t->cpu();
-            auto out_cpu = cast_n_add(x_cpu, y_cpu);
-            auto out_cuda = out_cpu->to(Device::CUDA);
-            if (req_grad) {
-                auto grad_fn = std::make_shared<CastAddBackward>(x->shape, y->shape, r, c, batch_size);
-                grad_fn->add_next_edge(get_grad_edge(x).function);
-                grad_fn->add_next_edge(get_grad_edge(y).function);
-                out_cuda->grad_fn = grad_fn;
-            }
-            return out_cuda;
-        }
-
-        if (req_grad) {
-            auto grad_fn = std::make_shared<CastAddBackward>(x->shape, y->shape, r, c, batch_size);
-            grad_fn->add_next_edge(get_grad_edge(x).function);
-            grad_fn->add_next_edge(get_grad_edge(y).function);
-            out->grad_fn = grad_fn;
-        }
-        return out;
-    }
-#endif
-
-    const float* x_ptr = x->data_ptr<float>();
-    const float* y_ptr = y->data_ptr<float>();
-    float* out_ptr = out->data_ptr<float>();
-
-    for (int batch = 0; batch < batch_size; batch++) {
-        int y_b = broadcast_batch_index(batch, batch_size, y_batch_size);
-        for (int i = 0; i < r; i++) {
-            for (int j = 0; j < c; j++) {
-                int x_idx = batch * r * c + i * c + j;
-                int yi = (yr == 1) ? 0 : i;
-                int yj = (yc == 1) ? 0 : j;
-                int y_idx = y_b * yr * yc + yi * yc + yj;
-                out_ptr[x_idx] = x_ptr[x_idx] + y_ptr[y_idx];
-            }
+            l.x_shape.push_back(x[d]);
+            l.y_shape.push_back(y[d]);
         }
     }
-
-    if (req_grad) {
-        auto grad_fn = std::make_shared<CastAddBackward>(x->shape, y->shape, r, c, batch_size);
-        grad_fn->add_next_edge(get_grad_edge(x).function);
-        grad_fn->add_next_edge(get_grad_edge(y).function);
-        out->grad_fn = grad_fn;
+    if (l.x_shape.empty()) {
+        l.x_shape = {1};
+        l.y_shape = {1};
     }
-
-    return out;
+    l.y_strides.assign(l.x_shape.size(), 0);
+    int64_t stride = 1;
+    for (int d = (int)l.x_shape.size() - 1; d >= 0; --d) {
+        if (l.y_shape[d] != 1) l.y_strides[d] = stride;
+        stride *= l.y_shape[d];
+    }
+    return l;
 }
 
-// Intelligent elementwise / broadcast addition
-inline std::shared_ptr<Tensor> add(const std::shared_ptr<Tensor>& x,
-                                   const std::shared_ptr<Tensor>& y) {
-    if (x->shape == y->shape) {
-        bool req_grad = grad_enabled() && (x->requires_grad || y->requires_grad);
-        auto out = std::make_shared<Tensor>(x->shape, x->device, x->dtype, req_grad);
+namespace broadcast_detail {
 
-#ifdef USE_CUDA
-        if (x->device == Device::CUDA) {
-            auto xc = make_contiguous(x);
-            auto yc_t = make_contiguous(y);
-            cuda::make_contiguous(*out, *xc);
-            cuda::add_inplace(*out, *yc_t);
-
-            if (req_grad) {
-                auto grad_fn = std::make_shared<AddBackward>();
-                grad_fn->add_next_edge(get_grad_edge(x).function);
-                grad_fn->add_next_edge(get_grad_edge(y).function);
-                out->grad_fn = grad_fn;
-            }
-            return out;
-        }
-#endif
-
-        auto xc = make_contiguous(x);
-        auto yc = make_contiguous(y);
-        const float* xp = xc->data_ptr<float>();
-        const float* yp = yc->data_ptr<float>();
-        float* outp = out->data_ptr<float>();
-        int64_t n = x->size();
-
-        for (int64_t i = 0; i < n; i++) {
-            outp[i] = xp[i] + yp[i];
-        }
-
-        if (req_grad) {
-            auto grad_fn = std::make_shared<AddBackward>();
-            grad_fn->add_next_edge(get_grad_edge(x).function);
-            grad_fn->add_next_edge(get_grad_edge(y).function);
-            out->grad_fn = grad_fn;
-        }
-
-        return out;
+inline void forward_host(BinaryOp op, const float* x, const float* y, float* out, const BroadcastLayout& l) {
+    switch (op) {
+        case BinaryOp::Add: l.for_each([&](int64_t i, int64_t yo) { out[i] = x[i] + y[yo]; }); break;
+        case BinaryOp::Sub: l.for_each([&](int64_t i, int64_t yo) { out[i] = x[i] - y[yo]; }); break;
+        case BinaryOp::Mul: l.for_each([&](int64_t i, int64_t yo) { out[i] = x[i] * y[yo]; }); break;
+        default: l.for_each([&](int64_t i, int64_t yo) { out[i] = x[i] / y[yo]; }); break;
     }
-
-    return cast_n_add(x, y);
 }
 
-// --- CAST SUB BACKWARD NODE ---
-struct CastSubBackward : public Node {
-    std::vector<int64_t> x_shape, y_shape;
-    int r, c, batch_size;
+// dL/dx for mul and div (for add and sub it is the incoming gradient itself)
+inline void grad_x_host(BinaryOp op, const float* g, const float* y, float* gx, const BroadcastLayout& l) {
+    if (op == BinaryOp::Mul) l.for_each([&](int64_t i, int64_t yo) { gx[i] = g[i] * y[yo]; });
+    else l.for_each([&](int64_t i, int64_t yo) { gx[i] = g[i] / y[yo]; });
+}
 
-    CastSubBackward(const std::vector<int64_t>& x_shape, const std::vector<int64_t>& y_shape, int r, int c, int batch_size)
-        : x_shape(x_shape), y_shape(y_shape), r(r), c(c), batch_size(batch_size) {}
+// dL/dy accumulated in x order, so the result is deterministic. gy must start zeroed.
+inline void grad_y_host(BinaryOp op, const float* g, const float* x, const float* y, float* gy, const BroadcastLayout& l) {
+    switch (op) {
+        case BinaryOp::Add: l.for_each([&](int64_t i, int64_t yo) { gy[yo] += g[i]; }); break;
+        case BinaryOp::Sub: l.for_each([&](int64_t i, int64_t yo) { gy[yo] -= g[i]; }); break;
+        case BinaryOp::Mul: l.for_each([&](int64_t i, int64_t yo) { gy[yo] += g[i] * x[i]; }); break;
+        default: l.for_each([&](int64_t i, int64_t yo) { gy[yo] -= g[i] * x[i] / (y[yo] * y[yo]); }); break;
+    }
+}
+
+}  // namespace broadcast_detail
+
+struct BroadcastBinaryBackward : public Node {
+    BinaryOp op;
+    std::vector<int64_t> x_shape, y_shape;  // as given by the caller
+    BroadcastLayout layout;
+    std::shared_ptr<Tensor> x, y;           // saved only for mul and div
+
+    BroadcastBinaryBackward(BinaryOp op, std::vector<int64_t> x_shape, std::vector<int64_t> y_shape, BroadcastLayout layout,
+                            std::shared_ptr<Tensor> x, std::shared_ptr<Tensor> y)
+        : op(op), x_shape(std::move(x_shape)), y_shape(std::move(y_shape)), layout(std::move(layout)),
+          x(std::move(x)), y(std::move(y)) {}
+
+    void release_variables() override {
+        x.reset();
+        y.reset();
+    }
+
+    std::string name() const override { return std::string("BroadcastBinaryBackward(") + binary_op_name(op) + ")"; }
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
         if (grads.empty() || !grads[0]) return {nullptr, nullptr};
-        std::shared_ptr<Tensor> self_grad = grads[0];
-        Device dev = self_grad->device;
-        auto sg_cpu = (dev == Device::CPU) ? self_grad : self_grad->cpu();
-        auto gx = std::make_shared<Tensor>(x_shape, Device::CPU, sg_cpu->dtype, false);
-        gx->fill_(0.0f);
-        auto gy = std::make_shared<Tensor>(y_shape, Device::CPU, sg_cpu->dtype, false);
-        gy->fill_(0.0f);
+        bool need_x = next_edges.size() > 0 && next_edges[0].function;
+        bool need_y = next_edges.size() > 1 && next_edges[1].function;
+        bool uses_values = (op == BinaryOp::Mul || op == BinaryOp::Div);
+        if (uses_values && (!x || !y)) return {nullptr, nullptr};
+        auto g = grads[0];
+        Device dev = g->device;
+        std::shared_ptr<Tensor> gx, gy;
 
-        const float* sg_ptr = sg_cpu->data_ptr<float>();
-        float* gx_ptr = gx->data_ptr<float>();
-        float* gy_ptr = gy->data_ptr<float>();
-
-        int yr = y_shape.size() > 1 ? y_shape[y_shape.size() - 2] : 1;
-        int yc = y_shape.size() > 0 ? y_shape[y_shape.size() - 1] : 1;
-
-        int y_batch_size = 1;
-        for (int i = 0; i < (int)y_shape.size() - 2; i++) { y_batch_size *= y_shape[i]; }
-
-        for (int batch = 0; batch < batch_size; batch++) {
-            int y_b = broadcast_batch_index(batch, batch_size, y_batch_size);
-            for (int i = 0; i < r; i++) {
-                for (int j = 0; j < c; j++) {
-                    int x_idx = batch * r * c + i * c + j;
-                    int yi = (yr == 1) ? 0 : i;
-                    int yj = (yc == 1) ? 0 : j;
-                    int y_idx = y_b * yr * yc + yi * yc + yj;
-
-                    float val = sg_ptr[x_idx];
-                    gx_ptr[x_idx] += val;
-                    gy_ptr[y_idx] -= val;
-                }
-            }
+        // add/sub: dL/dx is the incoming gradient itself (the output has x's shape)
+        if (need_x && !uses_values) gx = g;
+        // add/sub with equal shapes: dL/dy is the gradient (or its negation)
+        if (need_y && !uses_values && layout.y_shape == layout.x_shape) {
+            gy = (op == BinaryOp::Add) ? g->_reshape(y_shape) : mul_scalar(g, -1.0f)->_reshape(y_shape);
+            need_y = false;
         }
-        return {(dev == Device::CPU) ? gx : gx->to(dev),
-                (dev == Device::CPU) ? gy : gy->to(dev)};
+        need_x = need_x && uses_values;
+        if (!need_x && !need_y) return {gx, gy};
+
+#ifdef USE_CUDA
+        if (dev == Device::CUDA) {
+            if (need_x) {
+                gx = std::make_shared<Tensor>(x_shape, dev, g->dtype, false);
+                cuda::broadcast_binary_backward_x((int)op, g->data_ptr<float>(), y->data_ptr<float>(), gx->data_ptr<float>(),
+                                                  layout.x_shape, layout.y_shape);
+            }
+            if (need_y) {
+                gy = std::make_shared<Tensor>(y_shape, dev, g->dtype, false);
+                cuda::broadcast_binary_backward_y((int)op, g->data_ptr<float>(), uses_values ? x->data_ptr<float>() : nullptr,
+                                                  uses_values ? y->data_ptr<float>() : nullptr, gy->data_ptr<float>(),
+                                                  layout.x_shape, layout.y_shape);
+            }
+            return {gx, gy};
+        }
+#endif
+        // Host: CPU tensors directly; other devices through CPU copies
+        auto host = [](const std::shared_ptr<Tensor>& t) { return (!t || t->device == Device::CPU) ? t : t->cpu(); };
+        auto gh = host(g), xh = uses_values ? host(x) : nullptr, yh = uses_values ? host(y) : nullptr;
+        if (need_x) {
+            auto gxh = std::make_shared<Tensor>(x_shape, Device::CPU, g->dtype, false);
+            broadcast_detail::grad_x_host(op, gh->data_ptr<float>(), yh->data_ptr<float>(), gxh->data_ptr<float>(), layout);
+            gx = (dev == Device::CPU) ? gxh : gxh->to(dev);
+        }
+        if (need_y) {
+            auto gyh = std::make_shared<Tensor>(y_shape, Device::CPU, g->dtype, false);
+            gyh->fill_(0.0f);
+            broadcast_detail::grad_y_host(op, gh->data_ptr<float>(), xh ? xh->data_ptr<float>() : nullptr,
+                                          yh ? yh->data_ptr<float>() : nullptr, gyh->data_ptr<float>(), layout);
+            gy = (dev == Device::CPU) ? gyh : gyh->to(dev);
+        }
+        return {gx, gy};
     }
 };
 
-// broadcast and subtract
-inline std::shared_ptr<Tensor> cast_n_sub(const std::shared_ptr<Tensor>& x_in,
-                                          const std::shared_ptr<Tensor>& y_in) {
+inline std::shared_ptr<Tensor> broadcast_binary(BinaryOp op, const std::shared_ptr<Tensor>& x_in,
+                                                const std::shared_ptr<Tensor>& y_in) {
+    if (!x_in || !y_in) throw std::invalid_argument(std::string(binary_op_name(op)) + ": null tensor");
+    if (x_in->device != y_in->device) throw std::invalid_argument(std::string(binary_op_name(op)) + ": tensors are on different devices");
+    if (x_in->dtype != DType::Float32 || y_in->dtype != DType::Float32) {
+        throw std::invalid_argument(std::string(binary_op_name(op)) + ": only Float32 is supported");
+    }
     auto x = contiguous(x_in);
     auto y = contiguous(y_in);
-    int ndim = x->shape.size();
-    if (ndim < 2) throw std::invalid_argument("cast_n_sub requires tensor with ndim >= 2");
-    int r = x->shape[ndim - 2];
-    int c = x->shape[ndim - 1];
-    int batch_size = 1;
-    for (int i = 0; i < ndim - 2; i++) { batch_size *= x->shape[i]; }
-
-    int yr = y->shape.size() > 1 ? y->shape[y->shape.size() - 2] : 1;
-    int yc = y->shape.size() > 0 ? y->shape[y->shape.size() - 1] : 1;
-
-    int y_batch_size = 1;
-    for (int i = 0; i < (int)y->shape.size() - 2; i++) { y_batch_size *= y->shape[i]; }
-
-    bool req_grad = grad_enabled() && (x->requires_grad || y->requires_grad);
+    BroadcastLayout layout = broadcast_layout(x->shape, y->shape, op);
     Device dev = x->device;
-    auto x_cpu = (dev == Device::CPU) ? x : x->cpu();
-    auto y_cpu = (y->device == Device::CPU) ? y : y->cpu();
-    auto out_cpu = std::make_shared<Tensor>(x_cpu->shape, Device::CPU, x_cpu->dtype, false);
-    const float* x_ptr = x_cpu->data_ptr<float>();
-    const float* y_ptr = y_cpu->data_ptr<float>();
-    float* out_ptr = out_cpu->data_ptr<float>();
+    bool req_grad = needs_grad(x) || needs_grad(y);
+    auto out = std::make_shared<Tensor>(x->shape, dev, x->dtype, false);
 
-    for (int batch = 0; batch < batch_size; batch++) {
-        int y_b = broadcast_batch_index(batch, batch_size, y_batch_size);
-        for (int i = 0; i < r; i++) {
-            for (int j = 0; j < c; j++) {
-                int x_idx = batch * r * c + i * c + j;
-                int yi = (yr == 1) ? 0 : i;
-                int yj = (yc == 1) ? 0 : j;
-                int y_idx = y_b * yr * yc + yi * yc + yj;
-                out_ptr[x_idx] = x_ptr[x_idx] - y_ptr[y_idx];
-            }
-        }
+#ifdef USE_CUDA
+    if (dev == Device::CUDA) {
+        cuda::broadcast_binary_forward((int)op, x->data_ptr<float>(), y->data_ptr<float>(), out->data_ptr<float>(),
+                                       layout.x_shape, layout.y_shape);
+    } else
+#endif
+    if (dev == Device::CPU) {
+        broadcast_detail::forward_host(op, x->data_ptr<float>(), y->data_ptr<float>(), out->data_ptr<float>(), layout);
+    } else {
+        auto xh = x->cpu(), yh = y->cpu();
+        auto oh = std::make_shared<Tensor>(x->shape, Device::CPU, x->dtype, false);
+        broadcast_detail::forward_host(op, xh->data_ptr<float>(), yh->data_ptr<float>(), oh->data_ptr<float>(), layout);
+        out = oh->to(dev);
     }
 
-    auto out = (dev == Device::CPU) ? out_cpu : out_cpu->to(dev);
     out->requires_grad = req_grad;
-
     if (req_grad) {
-        auto grad_fn = std::make_shared<CastSubBackward>(x->shape, y->shape, r, c, batch_size);
+        bool uses_values = (op == BinaryOp::Mul || op == BinaryOp::Div);
+        auto grad_fn = std::make_shared<BroadcastBinaryBackward>(op, x->shape, y->shape, layout,
+                                                                 uses_values ? x : nullptr, uses_values ? y : nullptr);
         grad_fn->add_next_edge(get_grad_edge(x).function);
         grad_fn->add_next_edge(get_grad_edge(y).function);
         out->grad_fn = grad_fn;
     }
-
     return out;
 }
 
-// --- CAST MUL BACKWARD NODE ---
-struct CastMulBackward : public Node {
-    std::shared_ptr<Tensor> x, y;
-    int r, c, batch_size;
-
-    CastMulBackward(std::shared_ptr<Tensor> x, std::shared_ptr<Tensor> y, int r, int c, int batch_size)
-        : x(x), y(y), r(r), c(c), batch_size(batch_size) {}
-
-    void release_variables() override {
-        x.reset();
-        y.reset();
-    }
-
-    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
-        if (grads.empty() || !grads[0] || !x || !y) return {nullptr, nullptr};
-        std::shared_ptr<Tensor> self_grad = grads[0];
-        Device dev = self_grad->device;
-        auto sg_cpu = (dev == Device::CPU) ? self_grad : self_grad->cpu();
-        auto x_cpu = (x->device == Device::CPU) ? x : x->cpu();
-        auto y_cpu = (y->device == Device::CPU) ? y : y->cpu();
-
-        auto gx = std::make_shared<Tensor>(x_cpu->shape, Device::CPU, x_cpu->dtype, false);
-        gx->fill_(0.0f);
-        auto gy = std::make_shared<Tensor>(y_cpu->shape, Device::CPU, y_cpu->dtype, false);
-        gy->fill_(0.0f);
-
-        const float* sg_ptr = sg_cpu->data_ptr<float>();
-        const float* x_ptr = x_cpu->data_ptr<float>();
-        const float* y_ptr = y_cpu->data_ptr<float>();
-        float* gx_ptr = gx->data_ptr<float>();
-        float* gy_ptr = gy->data_ptr<float>();
-
-        int yr = y->shape.size() > 1 ? y->shape[y->shape.size() - 2] : 1;
-        int yc = y->shape.size() > 0 ? y->shape[y->shape.size() - 1] : 1;
-
-        int y_batch_size = 1;
-        for (int i = 0; i < (int)y->shape.size() - 2; i++) { y_batch_size *= y->shape[i]; }
-
-        for (int batch = 0; batch < batch_size; batch++) {
-            int y_b = broadcast_batch_index(batch, batch_size, y_batch_size);
-            for (int i = 0; i < r; i++) {
-                for (int j = 0; j < c; j++) {
-                    int x_idx = batch * r * c + i * c + j;
-                    int yi = (yr == 1) ? 0 : i;
-                    int yj = (yc == 1) ? 0 : j;
-                    int y_idx = y_b * yr * yc + yi * yc + yj;
-
-                    float val = sg_ptr[x_idx];
-                    gx_ptr[x_idx] += y_ptr[y_idx] * val;
-                    gy_ptr[y_idx] += x_ptr[x_idx] * val;
-                }
-            }
-        }
-        return {(dev == Device::CPU) ? gx : gx->to(dev),
-                (dev == Device::CPU) ? gy : gy->to(dev)};
-    }
-};
-
-// broadcast and multiply
-inline std::shared_ptr<Tensor> cast_n_mul(const std::shared_ptr<Tensor>& x_in,
-                                          const std::shared_ptr<Tensor>& y_in) {
-    auto x = contiguous(x_in);
-    auto y = contiguous(y_in);
-    int ndim = x->shape.size();
-    if (ndim < 2) throw std::invalid_argument("cast_n_mul requires tensor with ndim >= 2");
-    int r = x->shape[ndim - 2];
-    int c = x->shape[ndim - 1];
-    int batch_size = 1;
-    for (int i = 0; i < ndim - 2; i++) { batch_size *= x->shape[i]; }
-
-    int yr = y->shape.size() > 1 ? y->shape[y->shape.size() - 2] : 1;
-    int yc = y->shape.size() > 0 ? y->shape[y->shape.size() - 1] : 1;
-
-    int y_batch_size = 1;
-    for (int i = 0; i < (int)y->shape.size() - 2; i++) { y_batch_size *= y->shape[i]; }
-
-    bool req_grad = grad_enabled() && (x->requires_grad || y->requires_grad);
-    Device dev = x->device;
-    auto x_cpu = (dev == Device::CPU) ? x : x->cpu();
-    auto y_cpu = (y->device == Device::CPU) ? y : y->cpu();
-    auto out_cpu = std::make_shared<Tensor>(x_cpu->shape, Device::CPU, x_cpu->dtype, false);
-    const float* x_ptr = x_cpu->data_ptr<float>();
-    const float* y_ptr = y_cpu->data_ptr<float>();
-    float* out_ptr = out_cpu->data_ptr<float>();
-
-    for (int batch = 0; batch < batch_size; batch++) {
-        int y_b = broadcast_batch_index(batch, batch_size, y_batch_size);
-        for (int i = 0; i < r; i++) {
-            for (int j = 0; j < c; j++) {
-                int x_idx = batch * r * c + i * c + j;
-                int yi = (yr == 1) ? 0 : i;
-                int yj = (yc == 1) ? 0 : j;
-                int y_idx = y_b * yr * yc + yi * yc + yj;
-                out_ptr[x_idx] = x_ptr[x_idx] * y_ptr[y_idx];
-            }
-        }
-    }
-
-    auto out = (dev == Device::CPU) ? out_cpu : out_cpu->to(dev);
-    out->requires_grad = req_grad;
-
-    if (req_grad) {
-        auto grad_fn = std::make_shared<CastMulBackward>(x, y, r, c, batch_size);
-        grad_fn->add_next_edge(get_grad_edge(x).function);
-        grad_fn->add_next_edge(get_grad_edge(y).function);
-        out->grad_fn = grad_fn;
-    }
-
-    return out;
+inline std::shared_ptr<Tensor> add(const std::shared_ptr<Tensor>& x, const std::shared_ptr<Tensor>& y) {
+    return broadcast_binary(BinaryOp::Add, x, y);
 }
-
-// Intelligent elementwise / broadcast multiplication
-inline std::shared_ptr<Tensor> mul(const std::shared_ptr<Tensor>& x,
-                                   const std::shared_ptr<Tensor>& y) {
-    return cast_n_mul(x, y);
+inline std::shared_ptr<Tensor> mul(const std::shared_ptr<Tensor>& x, const std::shared_ptr<Tensor>& y) {
+    return broadcast_binary(BinaryOp::Mul, x, y);
 }
-
-// --- CAST DIV BACKWARD NODE ---
-struct CastDivBackward : public Node {
-    std::shared_ptr<Tensor> x, y;
-    int r, c, batch_size;
-
-    CastDivBackward(std::shared_ptr<Tensor> x, std::shared_ptr<Tensor> y, int r, int c, int batch_size)
-        : x(x), y(y), r(r), c(c), batch_size(batch_size) {}
-
-    void release_variables() override {
-        x.reset();
-        y.reset();
-    }
-
-    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
-        if (grads.empty() || !grads[0] || !x || !y) return {nullptr, nullptr};
-        std::shared_ptr<Tensor> self_grad = grads[0];
-        Device dev = self_grad->device;
-        auto sg_cpu = (dev == Device::CPU) ? self_grad : self_grad->cpu();
-        auto x_cpu = (x->device == Device::CPU) ? x : x->cpu();
-        auto y_cpu = (y->device == Device::CPU) ? y : y->cpu();
-
-        auto gx = std::make_shared<Tensor>(x_cpu->shape, Device::CPU, x_cpu->dtype, false);
-        gx->fill_(0.0f);
-        auto gy = std::make_shared<Tensor>(y_cpu->shape, Device::CPU, y_cpu->dtype, false);
-        gy->fill_(0.0f);
-
-        const float* sg_ptr = sg_cpu->data_ptr<float>();
-        const float* x_ptr = x_cpu->data_ptr<float>();
-        const float* y_ptr = y_cpu->data_ptr<float>();
-        float* gx_ptr = gx->data_ptr<float>();
-        float* gy_ptr = gy->data_ptr<float>();
-
-        int yr = y->shape.size() > 1 ? y->shape[y->shape.size() - 2] : 1;
-        int yc = y->shape.size() > 0 ? y->shape[y->shape.size() - 1] : 1;
-
-        int y_batch_size = 1;
-        for (int i = 0; i < (int)y->shape.size() - 2; i++) { y_batch_size *= y->shape[i]; }
-
-        for (int batch = 0; batch < batch_size; batch++) {
-            int y_b = broadcast_batch_index(batch, batch_size, y_batch_size);
-            for (int i = 0; i < r; i++) {
-                for (int j = 0; j < c; j++) {
-                    int x_idx = batch * r * c + i * c + j;
-                    int yi = (yr == 1) ? 0 : i;
-                    int yj = (yc == 1) ? 0 : j;
-                    int y_idx = y_b * yr * yc + yi * yc + yj;
-
-                    float val = sg_ptr[x_idx];
-                    float y_val = y_ptr[y_idx];
-                    gx_ptr[x_idx] += val / y_val;
-                    gy_ptr[y_idx] -= (x_ptr[x_idx] * val) / (y_val * y_val);
-                }
-            }
-        }
-        return {(dev == Device::CPU) ? gx : gx->to(dev),
-                (dev == Device::CPU) ? gy : gy->to(dev)};
-    }
-};
-
-// broadcast and divide
-inline std::shared_ptr<Tensor> cast_n_div(const std::shared_ptr<Tensor>& x_in,
-                                          const std::shared_ptr<Tensor>& y_in) {
-    auto x = contiguous(x_in);
-    auto y = contiguous(y_in);
-    int ndim = x->shape.size();
-    if (ndim < 2) throw std::invalid_argument("cast_n_div requires tensor with ndim >= 2");
-    int r = x->shape[ndim - 2];
-    int c = x->shape[ndim - 1];
-    int batch_size = 1;
-    for (int i = 0; i < ndim - 2; i++) { batch_size *= x->shape[i]; }
-
-    int yr = y->shape.size() > 1 ? y->shape[y->shape.size() - 2] : 1;
-    int yc = y->shape.size() > 0 ? y->shape[y->shape.size() - 1] : 1;
-
-    int y_batch_size = 1;
-    for (int i = 0; i < (int)y->shape.size() - 2; i++) { y_batch_size *= y->shape[i]; }
-
-    bool req_grad = grad_enabled() && (x->requires_grad || y->requires_grad);
-    Device dev = x->device;
-    auto x_cpu = (dev == Device::CPU) ? x : x->cpu();
-    auto y_cpu = (y->device == Device::CPU) ? y : y->cpu();
-    auto out_cpu = std::make_shared<Tensor>(x_cpu->shape, Device::CPU, x_cpu->dtype, false);
-    const float* x_ptr = x_cpu->data_ptr<float>();
-    const float* y_ptr = y_cpu->data_ptr<float>();
-    float* out_ptr = out_cpu->data_ptr<float>();
-
-    for (int batch = 0; batch < batch_size; batch++) {
-        int y_b = broadcast_batch_index(batch, batch_size, y_batch_size);
-        for (int i = 0; i < r; i++) {
-            for (int j = 0; j < c; j++) {
-                int x_idx = batch * r * c + i * c + j;
-                int yi = (yr == 1) ? 0 : i;
-                int yj = (yc == 1) ? 0 : j;
-                int y_idx = y_b * yr * yc + yi * yc + yj;
-                out_ptr[x_idx] = x_ptr[x_idx] / y_ptr[y_idx];
-            }
-        }
-    }
-
-    auto out = (dev == Device::CPU) ? out_cpu : out_cpu->to(dev);
-    out->requires_grad = req_grad;
-
-    if (req_grad) {
-        auto grad_fn = std::make_shared<CastDivBackward>(x, y, r, c, batch_size);
-        grad_fn->add_next_edge(get_grad_edge(x).function);
-        grad_fn->add_next_edge(get_grad_edge(y).function);
-        out->grad_fn = grad_fn;
-    }
-
-    return out;
+inline std::shared_ptr<Tensor> cast_n_add(const std::shared_ptr<Tensor>& x, const std::shared_ptr<Tensor>& y) {
+    return broadcast_binary(BinaryOp::Add, x, y);
+}
+inline std::shared_ptr<Tensor> cast_n_sub(const std::shared_ptr<Tensor>& x, const std::shared_ptr<Tensor>& y) {
+    return broadcast_binary(BinaryOp::Sub, x, y);
+}
+inline std::shared_ptr<Tensor> cast_n_mul(const std::shared_ptr<Tensor>& x, const std::shared_ptr<Tensor>& y) {
+    return broadcast_binary(BinaryOp::Mul, x, y);
+}
+inline std::shared_ptr<Tensor> cast_n_div(const std::shared_ptr<Tensor>& x, const std::shared_ptr<Tensor>& y) {
+    return broadcast_binary(BinaryOp::Div, x, y);
 }
 
 // ========================================
@@ -1412,152 +1151,124 @@ inline std::shared_ptr<Tensor> cross_entropy(const std::shared_ptr<Tensor>& pred
     return out;
 }
 
-// --- FUSED SPARSE CROSS-ENTROPY BACKWARD NODE ---
+// Mean cross entropy between logits [..., vocab] and integer class ids (stored as floats), with
+// a numerically stable log-sum-exp. Rows whose target equals ignore_index are excluded from the
+// mean. Only the per-row log-sum-exp is saved; backward recomputes the softmax from it.
 struct FusedCrossEntropyBackward : public Node {
-    std::shared_ptr<Tensor> logits;
-    std::shared_ptr<Tensor> targets;
-    std::shared_ptr<Tensor> probs;
-    int N, V;
-    int valid_count;
+    std::shared_ptr<Tensor> logits, targets, lse, count;  // count: number of valid rows (1 element)
+    int64_t rows, vocab;
     int ignore_index;
 
-    FusedCrossEntropyBackward(std::shared_ptr<Tensor> logits,
-                              std::shared_ptr<Tensor> targets,
-                              std::shared_ptr<Tensor> probs,
-                              int N, int V, int valid_count, int ignore_index)
-        : logits(logits), targets(targets), probs(probs),
-          N(N), V(V), valid_count(valid_count), ignore_index(ignore_index) {}
+    FusedCrossEntropyBackward(std::shared_ptr<Tensor> logits, std::shared_ptr<Tensor> targets, std::shared_ptr<Tensor> lse,
+                              std::shared_ptr<Tensor> count, int64_t rows, int64_t vocab, int ignore_index)
+        : logits(std::move(logits)), targets(std::move(targets)), lse(std::move(lse)), count(std::move(count)),
+          rows(rows), vocab(vocab), ignore_index(ignore_index) {}
 
     void release_variables() override {
         logits.reset();
         targets.reset();
-        probs.reset();
+        lse.reset();
+        count.reset();
     }
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
-        if (grads.empty() || !grads[0] || !logits || !targets || !probs) return {nullptr};
+        if (grads.empty() || !grads[0] || !logits) return {nullptr};
         auto dloss = grads[0];
-        Device dev = dloss->device;
-        auto dloss_cpu = (dev == Device::CPU) ? dloss : dloss->cpu();
-        float dloss_val = dloss_cpu->data_ptr<float>()[0];
-        auto probs_cpu = (probs->device == Device::CPU) ? probs : probs->cpu();
-        auto targets_cpu = (targets->device == Device::CPU) ? targets : targets->cpu();
-
-        auto grad_logits = std::make_shared<Tensor>(logits->shape, Device::CPU, logits->dtype, false);
-        grad_logits->fill_(0.0f);
-
-        const float* p_ptr = probs_cpu->data_ptr<float>();
-        const float* t_ptr = targets_cpu->data_ptr<float>();
-        float* g_ptr = grad_logits->data_ptr<float>();
-
-        float scale = (valid_count > 0) ? (dloss_val / static_cast<float>(valid_count)) : 0.0f;
-
-        for (int i = 0; i < N; ++i) {
-            int target_idx = static_cast<int>(t_ptr[i]);
-            if (target_idx == ignore_index) continue;
-
-            int offset = i * V;
-            for (int c = 0; c < V; ++c) {
-                float prob = p_ptr[offset + c];
-                float grad_c = (c == target_idx) ? (prob - 1.0f) : prob;
-                g_ptr[offset + c] = scale * grad_c;
+        Device dev = logits->device;
+        auto grad = std::make_shared<Tensor>(logits->shape, dev, logits->dtype, false);
+#ifdef USE_CUDA
+        if (dev == Device::CUDA) {
+            cuda::cross_entropy_backward(logits->data_ptr<float>(), targets->data_ptr<float>(), lse->data_ptr<float>(),
+                                         count->data_ptr<float>(), dloss->data_ptr<float>(), grad->data_ptr<float>(),
+                                         rows, vocab, ignore_index);
+            return {grad};
+        }
+#endif
+        auto host = [](const std::shared_ptr<Tensor>& t) { return t->device == Device::CPU ? t : t->cpu(); };
+        auto lh = host(logits), th = host(targets), eh = host(lse), ch = host(count), dh = host(dloss);
+        auto gh = (dev == Device::CPU) ? grad : std::make_shared<Tensor>(logits->shape, Device::CPU, logits->dtype, false);
+        const float* l = lh->data_ptr<float>();
+        const float* t = th->data_ptr<float>();
+        const float* e = eh->data_ptr<float>();
+        float* g = gh->data_ptr<float>();
+        float n = ch->data_ptr<float>()[0];
+        float scale = n > 0.0f ? dh->data_ptr<float>()[0] / n : 0.0f;
+        for (int64_t row = 0; row < rows; ++row) {
+            int target = (int)t[row];
+            for (int64_t c = 0; c < vocab; ++c) {
+                int64_t i = row * vocab + c;
+                g[i] = (target == ignore_index) ? 0.0f : scale * (std::exp(l[i] - e[row]) - (c == target ? 1.0f : 0.0f));
             }
         }
-
-        return {(dev == Device::CPU) ? grad_logits : grad_logits->to(dev)};
+        return {(dev == Device::CPU) ? gh : gh->to(dev)};
     }
 };
 
-// Fused Logits Cross Entropy with Integer Class Targets and LogSumExp Stability
-// logits: [..., vocab_size] (unnormalized scores)
-// targets: [...] (integer token/class IDs, e.g. [batch, seq_len] or [N])
-// ignore_index: tokens with this target ID are ignored in loss computation (default: -100)
-inline std::shared_ptr<Tensor> fused_cross_entropy(
-    const std::shared_ptr<Tensor>& logits_in,
-    const std::shared_ptr<Tensor>& targets_in,
-    int ignore_index = -100
-) {
+inline std::shared_ptr<Tensor> fused_cross_entropy(const std::shared_ptr<Tensor>& logits_in,
+                                                   const std::shared_ptr<Tensor>& targets_in, int ignore_index = -100) {
     auto logits = contiguous(logits_in);
-    auto targets = contiguous(targets_in);
-    int ndim = logits->ndim();
-    int V = logits->shape[ndim - 1];
-    int N = logits->size() / V;
-
-    if (targets->size() != N) {
-        throw std::invalid_argument(
-            "fused_cross_entropy: target size (" + std::to_string(targets->size()) +
-            ") must match total logit positions (" + std::to_string(N) + ")"
-        );
+    if (logits->ndim() < 1) throw std::invalid_argument("fused_cross_entropy: logits must have a class dimension");
+    int64_t vocab = logits->shape.back();
+    int64_t rows = logits->size() / vocab;
+    if (targets_in->size() != rows) {
+        throw std::invalid_argument("fused_cross_entropy: target size (" + std::to_string(targets_in->size()) +
+                                    ") must match total logit positions (" + std::to_string(rows) + ")");
     }
-
     Device dev = logits->device;
-    auto l_cpu = (dev == Device::CPU) ? logits : logits->cpu();
-    auto t_cpu = (targets->device == Device::CPU) ? targets : targets->cpu();
+    auto targets = contiguous(targets_in->device == dev ? targets_in : targets_in->to(dev));
 
-    const float* l_ptr = l_cpu->data_ptr<float>();
-    const float* t_ptr = t_cpu->data_ptr<float>();
+    auto out = std::make_shared<Tensor>(std::vector<int64_t>{1, 1}, dev, logits->dtype, false);
+    auto lse = std::make_shared<Tensor>(std::vector<int64_t>{rows}, dev, logits->dtype, false);
+    auto count = std::make_shared<Tensor>(std::vector<int64_t>{1}, dev, logits->dtype, false);
 
-    auto probs = std::make_shared<Tensor>(std::vector<int64_t>{N, V}, Device::CPU, logits->dtype, false);
-    float* p_ptr = probs->data_ptr<float>();
-
-    float total_loss = 0.0f;
-    int valid_count = 0;
-
-    for (int i = 0; i < N; ++i) {
-        int target_idx = static_cast<int>(t_ptr[i]);
-        int offset = i * V;
-
-        // 1. Numerically stable row-max subtraction
-        float max_val = -1e20f;
-        for (int c = 0; c < V; ++c) {
-            float val = l_ptr[offset + c];
-            if (val > max_val) max_val = val;
-        }
-
-        // 2. Compute sum of exps
-        float sum_exp = 0.0f;
-        for (int c = 0; c < V; ++c) {
-            float exp_val = std::exp(l_ptr[offset + c] - max_val);
-            p_ptr[offset + c] = exp_val;
-            sum_exp += exp_val;
-        }
-
-        // 3. Normalize into probabilities
-        float inv_sum = 1.0f / sum_exp;
-        for (int c = 0; c < V; ++c) {
-            p_ptr[offset + c] *= inv_sum;
-        }
-
-        // 4. LogSumExp loss: (log(sum_exp) + max_val) - logits[target_idx]
-        if (target_idx != ignore_index) {
-            if (target_idx < 0 || target_idx >= V) {
-                throw std::out_of_range(
-                    "fused_cross_entropy: target index " + std::to_string(target_idx) +
-                    " is out of bounds for vocab size " + std::to_string(V)
-                );
+#ifdef USE_CUDA
+    if (dev == Device::CUDA) {
+        cuda::cross_entropy_forward(logits->data_ptr<float>(), targets->data_ptr<float>(), out->data_ptr<float>(),
+                                    lse->data_ptr<float>(), count->data_ptr<float>(), rows, vocab, ignore_index);
+    } else
+#endif
+    {
+        auto lh = (dev == Device::CPU) ? logits : logits->cpu();
+        auto th = (dev == Device::CPU) ? targets : targets->cpu();
+        auto eh = (dev == Device::CPU) ? lse : std::make_shared<Tensor>(std::vector<int64_t>{rows}, Device::CPU, logits->dtype, false);
+        const float* l = lh->data_ptr<float>();
+        const float* t = th->data_ptr<float>();
+        float* e = eh->data_ptr<float>();
+        double total = 0.0;
+        int64_t valid = 0;
+        for (int64_t row = 0; row < rows; ++row) {
+            const float* lr = l + row * vocab;
+            float mx = -INFINITY;
+            for (int64_t c = 0; c < vocab; ++c) mx = std::max(mx, lr[c]);
+            float sum = 0.0f;
+            for (int64_t c = 0; c < vocab; ++c) sum += std::exp(lr[c] - mx);
+            e[row] = std::log(sum) + mx;
+            int target = (int)t[row];
+            if (target == ignore_index) continue;
+            if (target < 0 || target >= vocab) {
+                throw std::out_of_range("fused_cross_entropy: target index " + std::to_string(target) +
+                                        " is out of bounds for vocab size " + std::to_string(vocab));
             }
-            float lse = std::log(sum_exp) + max_val;
-            total_loss += (lse - l_ptr[offset + target_idx]);
-            valid_count++;
+            total += e[row] - lr[target];
+            ++valid;
+        }
+        float loss = valid > 0 ? (float)(total / (double)valid) : 0.0f;
+        if (dev == Device::CPU) {
+            out->data_ptr<float>()[0] = loss;
+            count->data_ptr<float>()[0] = (float)valid;
+        } else {
+            out->copy_from_vector({loss});
+            count->copy_from_vector({(float)valid});
+            lse = eh->to(dev);
         }
     }
 
-    float mean_loss = (valid_count > 0) ? (total_loss / static_cast<float>(valid_count)) : 0.0f;
-
-    bool req_grad = grad_enabled() && (logits->requires_grad);
-    auto out_cpu = std::make_shared<Tensor>(std::vector<int64_t>{1, 1}, Device::CPU, logits->dtype, false);
-    out_cpu->data_ptr<float>()[0] = mean_loss;
-    auto out = (dev == Device::CPU) ? out_cpu : out_cpu->to(dev);
-    out->requires_grad = req_grad;
-
-    if (req_grad) {
-        auto grad_fn = std::make_shared<FusedCrossEntropyBackward>(
-            logits, targets, probs, N, V, valid_count, ignore_index
-        );
+    out->requires_grad = needs_grad(logits);
+    if (needs_grad(logits)) {
+        auto grad_fn = std::make_shared<FusedCrossEntropyBackward>(logits, targets, lse, count, rows, vocab, ignore_index);
         grad_fn->add_next_edge(get_grad_edge(logits).function);
         out->grad_fn = grad_fn;
     }
-
     return out;
 }
 
@@ -2072,278 +1783,107 @@ inline std::shared_ptr<Tensor> mean(const std::shared_ptr<Tensor>& a_in, int axi
 // ========================================
 // From scalar_ops.h
 // ========================================
-// --- ADD SCALAR BACKWARD NODE ---
-struct AddScalarBackward : public Node {
-    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
-        if (grads.empty() || !grads[0]) return {nullptr};
-        return {grads[0]};
+// Elementwise ops with a scalar: add, sub, mul, div, and the reversed s - a and s / a.
+enum class ScalarOp : int { Add = 0, Sub = 1, Mul = 2, Div = 3, RSub = 4, RDiv = 5 };
+
+namespace scalar_detail {
+
+inline float forward(ScalarOp op, float a, float s) {
+    switch (op) {
+        case ScalarOp::Add: return a + s;
+        case ScalarOp::Sub: return a - s;
+        case ScalarOp::Mul: return a * s;
+        case ScalarOp::Div: return a / s;
+        case ScalarOp::RSub: return s - a;
+        default: return s / a;
     }
-};
-
-inline std::shared_ptr<Tensor> add_scalar(const std::shared_ptr<Tensor>& a_in, float s) {
-    auto a = contiguous(a_in);
-    bool req_grad = grad_enabled() && (a->requires_grad);
-    Device dev = a->device;
-    auto a_cpu = (dev == Device::CPU) ? a : a->cpu();
-    auto out_cpu = std::make_shared<Tensor>(a_cpu->shape, Device::CPU, a_cpu->dtype, false);
-    const float* a_ptr = a_cpu->data_ptr<float>();
-    float* out_ptr = out_cpu->data_ptr<float>();
-    int size = a_cpu->size();
-
-    for (int i = 0; i < size; i++) {
-        out_ptr[i] = a_ptr[i] + s;
-    }
-
-    auto out = (dev == Device::CPU) ? out_cpu : out_cpu->to(dev);
-    out->requires_grad = req_grad;
-
-    if (req_grad) {
-        auto grad_fn = std::make_shared<AddScalarBackward>();
-        grad_fn->add_next_edge(get_grad_edge(a).function);
-        out->grad_fn = grad_fn;
-    }
-
-    return out;
 }
 
-// --- SUB SCALAR BACKWARD NODE ---
-struct SubScalarBackward : public Node {
-    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
-        if (grads.empty() || !grads[0]) return {nullptr};
-        return {grads[0]};
+inline float backward(ScalarOp op, float g, float a, float s) {
+    switch (op) {
+        case ScalarOp::Add: case ScalarOp::Sub: return g;
+        case ScalarOp::Mul: return g * s;
+        case ScalarOp::Div: return g / s;
+        case ScalarOp::RSub: return -g;
+        default: return -s * g / (a * a);
     }
-};
-
-inline std::shared_ptr<Tensor> sub_scalar(const std::shared_ptr<Tensor>& a_in, float s) {
-    auto a = contiguous(a_in);
-    bool req_grad = grad_enabled() && (a->requires_grad);
-    Device dev = a->device;
-    auto a_cpu = (dev == Device::CPU) ? a : a->cpu();
-    auto out_cpu = std::make_shared<Tensor>(a_cpu->shape, Device::CPU, a_cpu->dtype, false);
-    const float* a_ptr = a_cpu->data_ptr<float>();
-    float* out_ptr = out_cpu->data_ptr<float>();
-    int size = a_cpu->size();
-
-    for (int i = 0; i < size; i++) {
-        out_ptr[i] = a_ptr[i] - s;
-    }
-
-    auto out = (dev == Device::CPU) ? out_cpu : out_cpu->to(dev);
-    out->requires_grad = req_grad;
-
-    if (req_grad) {
-        auto grad_fn = std::make_shared<SubScalarBackward>();
-        grad_fn->add_next_edge(get_grad_edge(a).function);
-        out->grad_fn = grad_fn;
-    }
-
-    return out;
 }
 
-// --- MUL SCALAR BACKWARD NODE ---
-struct MulScalarBackward : public Node {
+}  // namespace scalar_detail
+
+struct ScalarOpBackward : public Node {
+    ScalarOp op;
     float scalar;
-    explicit MulScalarBackward(float s) : scalar(s) {}
+    std::shared_ptr<Tensor> a;  // saved only for rdiv
+
+    ScalarOpBackward(ScalarOp op, float scalar, std::shared_ptr<Tensor> a) : op(op), scalar(scalar), a(std::move(a)) {}
+
+    std::string name() const override {
+        static const char* names[] = {"add", "sub", "mul", "div", "rsub", "rdiv"};
+        return std::string("ScalarOpBackward(") + names[(int)op] + ")";
+    }
+
+    void release_variables() override { a.reset(); }
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
         if (grads.empty() || !grads[0]) return {nullptr};
-        std::shared_ptr<Tensor> grad = grads[0];
-        Device dev = grad->device;
-        auto grad_cpu = (dev == Device::CPU) ? grad : grad->cpu();
-        auto da = std::make_shared<Tensor>(grad_cpu->shape, Device::CPU, grad_cpu->dtype, false);
-        da->fill_(0.0f);
-        const float* g_ptr = grad_cpu->data_ptr<float>();
-        float* da_ptr = da->data_ptr<float>();
-        int size = grad_cpu->size();
-
-        for (int i = 0; i < size; i++) {
-            da_ptr[i] = g_ptr[i] * scalar;
+        auto g = grads[0];
+        if (op == ScalarOp::Add || op == ScalarOp::Sub) return {g};
+        if (op == ScalarOp::RDiv && !a) return {nullptr};
+        Device dev = g->device;
+        auto ga = std::make_shared<Tensor>(g->shape, dev, g->dtype, false);
+#ifdef USE_CUDA
+        if (dev == Device::CUDA) {
+            cuda::scalar_backward((int)op, g->data_ptr<float>(), a ? a->data_ptr<float>() : nullptr, scalar,
+                                  ga->data_ptr<float>(), g->size());
+            return {ga};
         }
-        return {(dev == Device::CPU) ? da : da->to(dev)};
+#endif
+        auto gh = (dev == Device::CPU) ? g : g->cpu();
+        auto ah = !a ? nullptr : (a->device == Device::CPU ? a : a->cpu());
+        auto out = (dev == Device::CPU) ? ga : std::make_shared<Tensor>(g->shape, Device::CPU, g->dtype, false);
+        const float* gp = gh->data_ptr<float>();
+        const float* ap = ah ? ah->data_ptr<float>() : nullptr;
+        float* op_ = out->data_ptr<float>();
+        for (int64_t i = 0; i < g->size(); ++i) op_[i] = scalar_detail::backward(op, gp[i], ap ? ap[i] : 0.0f, scalar);
+        return {(dev == Device::CPU) ? out : out->to(dev)};
     }
 };
 
-inline std::shared_ptr<Tensor> mul_scalar(const std::shared_ptr<Tensor>& a_in, float s) {
+inline std::shared_ptr<Tensor> scalar_op(ScalarOp op, const std::shared_ptr<Tensor>& a_in, float s) {
     auto a = contiguous(a_in);
-    bool req_grad = grad_enabled() && (a->requires_grad);
+    if (a->dtype != DType::Float32) throw std::invalid_argument("scalar ops: only Float32 is supported");
     Device dev = a->device;
-    auto a_cpu = (dev == Device::CPU) ? a : a->cpu();
-    auto out_cpu = std::make_shared<Tensor>(a_cpu->shape, Device::CPU, a_cpu->dtype, false);
-    const float* a_ptr = a_cpu->data_ptr<float>();
-    float* out_ptr = out_cpu->data_ptr<float>();
-    int size = a_cpu->size();
-
-    for (int i = 0; i < size; i++) {
-        out_ptr[i] = a_ptr[i] * s;
+    auto out = std::make_shared<Tensor>(a->shape, dev, a->dtype, false);
+#ifdef USE_CUDA
+    if (dev == Device::CUDA) {
+        cuda::scalar_forward((int)op, a->data_ptr<float>(), s, out->data_ptr<float>(), a->size());
+    } else
+#endif
+    {
+        auto ah = (dev == Device::CPU) ? a : a->cpu();
+        auto oh = (dev == Device::CPU) ? out : std::make_shared<Tensor>(a->shape, Device::CPU, a->dtype, false);
+        const float* ap = ah->data_ptr<float>();
+        float* op_ = oh->data_ptr<float>();
+        for (int64_t i = 0; i < a->size(); ++i) op_[i] = scalar_detail::forward(op, ap[i], s);
+        if (dev != Device::CPU) out = oh->to(dev);
     }
-
-    auto out = (dev == Device::CPU) ? out_cpu : out_cpu->to(dev);
-    out->requires_grad = req_grad;
-
-    if (req_grad) {
-        auto grad_fn = std::make_shared<MulScalarBackward>(s);
+    out->requires_grad = needs_grad(a);
+    if (needs_grad(a)) {
+        auto grad_fn = std::make_shared<ScalarOpBackward>(op, s, op == ScalarOp::RDiv ? a : nullptr);
         grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
-
     return out;
 }
 
-// --- DIV SCALAR BACKWARD NODE ---
-struct DivScalarBackward : public Node {
-    float scalar;
-    explicit DivScalarBackward(float s) : scalar(s) {}
-
-    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
-        if (grads.empty() || !grads[0]) return {nullptr};
-        std::shared_ptr<Tensor> grad = grads[0];
-        Device dev = grad->device;
-        auto grad_cpu = (dev == Device::CPU) ? grad : grad->cpu();
-        auto da = std::make_shared<Tensor>(grad_cpu->shape, Device::CPU, grad_cpu->dtype, false);
-        da->fill_(0.0f);
-        const float* g_ptr = grad_cpu->data_ptr<float>();
-        float* da_ptr = da->data_ptr<float>();
-        int size = grad_cpu->size();
-
-        for (int i = 0; i < size; i++) {
-            da_ptr[i] = g_ptr[i] / scalar;
-        }
-        return {(dev == Device::CPU) ? da : da->to(dev)};
-    }
-};
-
-inline std::shared_ptr<Tensor> div_scalar(const std::shared_ptr<Tensor>& a_in, float s) {
-    auto a = contiguous(a_in);
-    bool req_grad = grad_enabled() && (a->requires_grad);
-    Device dev = a->device;
-    auto a_cpu = (dev == Device::CPU) ? a : a->cpu();
-    auto out_cpu = std::make_shared<Tensor>(a_cpu->shape, Device::CPU, a_cpu->dtype, false);
-    const float* a_ptr = a_cpu->data_ptr<float>();
-    float* out_ptr = out_cpu->data_ptr<float>();
-    int size = a_cpu->size();
-
-    for (int i = 0; i < size; i++) {
-        out_ptr[i] = a_ptr[i] / s;
-    }
-
-    auto out = (dev == Device::CPU) ? out_cpu : out_cpu->to(dev);
-    out->requires_grad = req_grad;
-
-    if (req_grad) {
-        auto grad_fn = std::make_shared<DivScalarBackward>(s);
-        grad_fn->add_next_edge(get_grad_edge(a).function);
-        out->grad_fn = grad_fn;
-    }
-
-    return out;
-}
-
-inline std::shared_ptr<Tensor> neg(const std::shared_ptr<Tensor>& a) {
-    return mul_scalar(a, -1.0f);
-}
-
-// --- RSUB SCALAR BACKWARD NODE ---
-struct RsubScalarBackward : public Node {
-    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
-        if (grads.empty() || !grads[0]) return {nullptr};
-        std::shared_ptr<Tensor> grad = grads[0];
-        Device dev = grad->device;
-        auto grad_cpu = (dev == Device::CPU) ? grad : grad->cpu();
-        auto da = std::make_shared<Tensor>(grad_cpu->shape, Device::CPU, grad_cpu->dtype, false);
-        da->fill_(0.0f);
-        const float* g_ptr = grad_cpu->data_ptr<float>();
-        float* da_ptr = da->data_ptr<float>();
-        int size = grad_cpu->size();
-
-        for (int i = 0; i < size; i++) {
-            da_ptr[i] = -g_ptr[i];
-        }
-        return {(dev == Device::CPU) ? da : da->to(dev)};
-    }
-};
-
-inline std::shared_ptr<Tensor> rsub_scalar(float s, const std::shared_ptr<Tensor>& a_in) {
-    auto a = contiguous(a_in);
-    bool req_grad = grad_enabled() && (a->requires_grad);
-    Device dev = a->device;
-    auto a_cpu = (dev == Device::CPU) ? a : a->cpu();
-    auto out_cpu = std::make_shared<Tensor>(a_cpu->shape, Device::CPU, a_cpu->dtype, false);
-    const float* a_ptr = a_cpu->data_ptr<float>();
-    float* out_ptr = out_cpu->data_ptr<float>();
-    int size = a_cpu->size();
-
-    for (int i = 0; i < size; i++) {
-        out_ptr[i] = s - a_ptr[i];
-    }
-
-    auto out = (dev == Device::CPU) ? out_cpu : out_cpu->to(dev);
-    out->requires_grad = req_grad;
-
-    if (req_grad) {
-        auto grad_fn = std::make_shared<RsubScalarBackward>();
-        grad_fn->add_next_edge(get_grad_edge(a).function);
-        out->grad_fn = grad_fn;
-    }
-
-    return out;
-}
-
-// --- RDIV SCALAR BACKWARD NODE ---
-struct RdivScalarBackward : public Node {
-    std::shared_ptr<Tensor> a;
-    float scalar;
-    RdivScalarBackward(std::shared_ptr<Tensor> a, float s) : a(a), scalar(s) {}
-
-    void release_variables() override {
-        a.reset();
-    }
-
-    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
-        if (grads.empty() || !grads[0] || !a) return {nullptr};
-        std::shared_ptr<Tensor> grad = grads[0];
-        Device dev = grad->device;
-        auto grad_cpu = (dev == Device::CPU) ? grad : grad->cpu();
-        auto a_cpu = (a->device == Device::CPU) ? a : a->cpu();
-        auto da = std::make_shared<Tensor>(a_cpu->shape, Device::CPU, a_cpu->dtype, false);
-        da->fill_(0.0f);
-        const float* g_ptr = grad_cpu->data_ptr<float>();
-        const float* a_ptr = a_cpu->data_ptr<float>();
-        float* da_ptr = da->data_ptr<float>();
-        int size = a_cpu->size();
-
-        for (int i = 0; i < size; i++) {
-            float val = a_ptr[i];
-            da_ptr[i] = -scalar * g_ptr[i] / (val * val);
-        }
-        return {(dev == Device::CPU) ? da : da->to(dev)};
-    }
-};
-
-inline std::shared_ptr<Tensor> rdiv_scalar(float s, const std::shared_ptr<Tensor>& a_in) {
-    auto a = contiguous(a_in);
-    bool req_grad = grad_enabled() && (a->requires_grad);
-    Device dev = a->device;
-    auto a_cpu = (dev == Device::CPU) ? a : a->cpu();
-    auto out_cpu = std::make_shared<Tensor>(a_cpu->shape, Device::CPU, a_cpu->dtype, false);
-    const float* a_ptr = a_cpu->data_ptr<float>();
-    float* out_ptr = out_cpu->data_ptr<float>();
-    int size = a_cpu->size();
-
-    for (int i = 0; i < size; i++) {
-        out_ptr[i] = s / a_ptr[i];
-    }
-
-    auto out = (dev == Device::CPU) ? out_cpu : out_cpu->to(dev);
-    out->requires_grad = req_grad;
-
-    if (req_grad) {
-        auto grad_fn = std::make_shared<RdivScalarBackward>(a, s);
-        grad_fn->add_next_edge(get_grad_edge(a).function);
-        out->grad_fn = grad_fn;
-    }
-
-    return out;
-}
+inline std::shared_ptr<Tensor> add_scalar(const std::shared_ptr<Tensor>& a, float s) { return scalar_op(ScalarOp::Add, a, s); }
+inline std::shared_ptr<Tensor> sub_scalar(const std::shared_ptr<Tensor>& a, float s) { return scalar_op(ScalarOp::Sub, a, s); }
+inline std::shared_ptr<Tensor> mul_scalar(const std::shared_ptr<Tensor>& a, float s) { return scalar_op(ScalarOp::Mul, a, s); }
+inline std::shared_ptr<Tensor> div_scalar(const std::shared_ptr<Tensor>& a, float s) { return scalar_op(ScalarOp::Div, a, s); }
+inline std::shared_ptr<Tensor> neg(const std::shared_ptr<Tensor>& a) { return scalar_op(ScalarOp::Mul, a, -1.0f); }
+inline std::shared_ptr<Tensor> rsub_scalar(float s, const std::shared_ptr<Tensor>& a) { return scalar_op(ScalarOp::RSub, a, s); }
+inline std::shared_ptr<Tensor> rdiv_scalar(float s, const std::shared_ptr<Tensor>& a) { return scalar_op(ScalarOp::RDiv, a, s); }
 
 // ========================================
 // From slice.h

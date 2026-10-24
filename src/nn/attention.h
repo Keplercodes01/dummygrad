@@ -120,62 +120,79 @@ public:
     }
 };
 
-// Backward Node for GQA head repetition (aggregates gradients from repeated heads to original KV heads)
-struct GQARepeatBackward : public Node {
-    std::shared_ptr<Tensor> orig;
-    int B, n_heads, n_kv_heads, S, d_k;
+// GQA: each of the kv heads serves `group` consecutive query heads (query head h reads kv head
+// h / group). [B, kv, S, D] -> [B, kv * group, S, D]; the gradient sums each group back.
+struct RepeatKVBackward : public Node {
+    int64_t batch, kv_heads, group, head_elems;
+    std::vector<int64_t> in_shape;
 
-    GQARepeatBackward(std::shared_ptr<Tensor> orig, int B, int n_heads, int n_kv_heads, int S, int d_k)
-        : orig(orig), B(B), n_heads(n_heads), n_kv_heads(n_kv_heads), S(S), d_k(d_k) {}
-
-    void release_variables() override {
-        orig.reset();
-    }
+    RepeatKVBackward(int64_t batch, int64_t kv_heads, int64_t group, int64_t head_elems, std::vector<int64_t> in_shape)
+        : batch(batch), kv_heads(kv_heads), group(group), head_elems(head_elems), in_shape(std::move(in_shape)) {}
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
-        if (grads.empty() || !grads[0] || !orig) return {nullptr};
-        auto dout = grads[0];
-        auto din = std::make_shared<Tensor>(orig->shape, orig->device, orig->dtype, false);
-        din->fill_(0.0f);
-        int group_size = n_heads / n_kv_heads;
-        const float* dout_ptr = dout->data_ptr<float>();
-        float* din_ptr = din->data_ptr<float>();
-
+        if (grads.empty() || !grads[0]) return {nullptr};
+        auto g = grads[0];
+        Device dev = g->device;
+        auto gin = std::make_shared<Tensor>(in_shape, dev, g->dtype, false);
 #ifdef USE_CUDA
-        if (orig->device == Device::CUDA) {
-            int dout_size = B * n_heads * S * d_k;
-            int din_size = B * n_kv_heads * S * d_k;
-            std::vector<float> h_dout(dout_size);
-            std::vector<float> h_din(din_size, 0.0f);
-            cudaMemcpy(h_dout.data(), dout_ptr, dout_size * sizeof(float), cudaMemcpyDeviceToHost);
-            for (int b = 0; b < B; ++b) {
-                for (int h = 0; h < n_heads; ++h) {
-                    int kv_h = h / group_size;
-                    int src_offset = (b * n_heads + h) * S * d_k;
-                    int dst_offset = (b * n_kv_heads + kv_h) * S * d_k;
-                    for (int i = 0; i < S * d_k; ++i) {
-                        h_din[dst_offset + i] += h_dout[src_offset + i];
-                    }
-                }
-            }
-            cudaMemcpy(din_ptr, h_din.data(), din_size * sizeof(float), cudaMemcpyHostToDevice);
-            return {din};
+        if (dev == Device::CUDA) {
+            cuda::repeat_kv_backward(g->data_ptr<float>(), gin->data_ptr<float>(), batch, kv_heads, group, head_elems);
+            return {gin};
         }
 #endif
-
-        for (int b = 0; b < B; ++b) {
-            for (int h = 0; h < n_heads; ++h) {
-                int kv_h = h / group_size;
-                int src_offset = (b * n_heads + h) * S * d_k;
-                int dst_offset = (b * n_kv_heads + kv_h) * S * d_k;
-                for (int i = 0; i < S * d_k; ++i) {
-                    din_ptr[dst_offset + i] += dout_ptr[src_offset + i];
+        auto gh = (dev == Device::CPU) ? g : g->cpu();
+        auto oh = (dev == Device::CPU) ? gin : std::make_shared<Tensor>(in_shape, Device::CPU, g->dtype, false);
+        const float* gp = gh->data_ptr<float>();
+        float* op = oh->data_ptr<float>();
+        for (int64_t b = 0; b < batch; ++b) {
+            for (int64_t k = 0; k < kv_heads; ++k) {
+                float* dst = op + (b * kv_heads + k) * head_elems;
+                std::fill(dst, dst + head_elems, 0.0f);
+                for (int64_t r = 0; r < group; ++r) {
+                    const float* src = gp + ((b * kv_heads + k) * group + r) * head_elems;
+                    for (int64_t e = 0; e < head_elems; ++e) dst[e] += src[e];
                 }
             }
         }
-        return {din};
+        return {(dev == Device::CPU) ? oh : oh->to(dev)};
     }
 };
+
+inline std::shared_ptr<Tensor> repeat_kv(const std::shared_ptr<Tensor>& x_in, int64_t group) {
+    if (group == 1) return x_in;
+    auto x = contiguous(x_in);
+    if (x->ndim() != 4) throw std::invalid_argument("repeat_kv: expected [batch, kv_heads, seq, head_dim]");
+    int64_t batch = x->shape[0], kv_heads = x->shape[1], head_elems = x->shape[2] * x->shape[3];
+    std::vector<int64_t> out_shape{batch, kv_heads * group, x->shape[2], x->shape[3]};
+    Device dev = x->device;
+    auto out = std::make_shared<Tensor>(out_shape, dev, x->dtype, false);
+#ifdef USE_CUDA
+    if (dev == Device::CUDA) {
+        cuda::repeat_kv_forward(x->data_ptr<float>(), out->data_ptr<float>(), batch, kv_heads, group, head_elems);
+    } else
+#endif
+    {
+        auto xh = (dev == Device::CPU) ? x : x->cpu();
+        auto oh = (dev == Device::CPU) ? out : std::make_shared<Tensor>(out_shape, Device::CPU, x->dtype, false);
+        const float* xp = xh->data_ptr<float>();
+        float* op = oh->data_ptr<float>();
+        for (int64_t b = 0; b < batch; ++b) {
+            for (int64_t h = 0; h < kv_heads * group; ++h) {
+                const float* src = xp + (b * kv_heads + h / group) * head_elems;
+                std::copy(src, src + head_elems, op + (b * kv_heads * group + h) * head_elems);
+            }
+        }
+        if (dev != Device::CPU) out = oh->to(dev);
+    }
+    out->requires_grad = needs_grad(x);
+    if (needs_grad(x)) {
+        auto grad_fn = std::make_shared<RepeatKVBackward>(batch, kv_heads, group, head_elems, x->shape);
+        grad_fn->add_next_edge(get_grad_edge(x).function);
+        out->grad_fn = grad_fn;
+    }
+    return out;
+}
+
 
 // Multi-Head Self-Attention (Supports MHA, GQA, and MQA)
 class MultiHeadAttention : public Module {
@@ -236,57 +253,11 @@ public:
         auto K_split = transpose(K_4d, 1, 2);
         auto V_split = transpose(reshape(V, {B, S, n_kv_heads, d_k}), 1, 2);
 
-        // Grouped Query Attention (GQA): Repeat KV heads across query head groups
+        // Grouped Query Attention (GQA): each kv head serves a group of query heads
         if (n_kv_heads < n_heads) {
-            int group_size = n_heads / n_kv_heads;
-            auto K_rep = std::make_shared<Tensor>(
-                std::vector<int64_t>{B, n_heads, S, d_k}, K_split->device, K_split->dtype, needs_grad(K_split)
-            );
-            auto V_rep = std::make_shared<Tensor>(
-                std::vector<int64_t>{B, n_heads, S, d_k}, V_split->device, V_split->dtype, needs_grad(V_split)
-            );
-
-            // K_split / V_split are transposed views of [B, S, kv, d] memory; the per-head
-            // copies below need real [B, kv, S, d] layout. Autograd still flows to the views.
-            auto K_dense = make_contiguous(K_split);
-            auto V_dense = make_contiguous(V_split);
-            const float* k_src = K_dense->data_ptr<float>();
-            const float* v_src = V_dense->data_ptr<float>();
-            float* k_dst = K_rep->data_ptr<float>();
-            float* v_dst = V_rep->data_ptr<float>();
-
-            int head_elements = S * d_k;
-            for (int b = 0; b < B; ++b) {
-                for (int h = 0; h < n_heads; ++h) {
-                    int kv_h = h / group_size;
-                    int src_offset = (b * n_kv_heads + kv_h) * head_elements;
-                    int dst_offset = (b * n_heads + h) * head_elements;
-#ifdef USE_CUDA
-                    if (K_split->device == Device::CUDA) {
-                        cudaMemcpy(k_dst + dst_offset, k_src + src_offset, head_elements * sizeof(float), cudaMemcpyDeviceToDevice);
-                        cudaMemcpy(v_dst + dst_offset, v_src + src_offset, head_elements * sizeof(float), cudaMemcpyDeviceToDevice);
-                    } else
-#endif
-                    {
-                        std::memcpy(k_dst + dst_offset, k_src + src_offset, head_elements * sizeof(float));
-                        std::memcpy(v_dst + dst_offset, v_src + src_offset, head_elements * sizeof(float));
-                    }
-                }
-            }
-
-            if (needs_grad(K_split)) {
-                auto grad_fn = std::make_shared<GQARepeatBackward>(K_split, B, n_heads, n_kv_heads, S, d_k);
-                grad_fn->add_next_edge(get_grad_edge(K_split).function);
-                K_rep->grad_fn = grad_fn;
-            }
-            if (needs_grad(V_split)) {
-                auto grad_fn = std::make_shared<GQARepeatBackward>(V_split, B, n_heads, n_kv_heads, S, d_k);
-                grad_fn->add_next_edge(get_grad_edge(V_split).function);
-                V_rep->grad_fn = grad_fn;
-            }
-
-            K_split = K_rep;
-            V_split = V_rep;
+            int64_t group = n_heads / n_kv_heads;
+            K_split = repeat_kv(K_split, group);
+            V_split = repeat_kv(V_split, group);
         }
 
         // Scaled dot product

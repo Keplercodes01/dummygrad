@@ -5,6 +5,7 @@
 #include <mutex>
 #include <atomic>
 #include <cstdint>
+#include <string>
 
 class Tensor;
 struct Node;
@@ -35,6 +36,8 @@ struct Node : public std::enable_shared_from_this<Node> {
     virtual std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) = 0;
     void add_next_edge(const std::shared_ptr<Node>& fn, size_t input_slot = 0);
     virtual void release_variables(){} 
+    // Name used in error messages (e.g. anomaly detection); defaults to the C++ type name.
+    virtual std::string name() const;
 };
 
 struct AccumulateGrad : public Node {
