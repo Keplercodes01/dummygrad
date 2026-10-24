@@ -21,6 +21,7 @@ The correctness release. Highlights below; full details in [CHANGELOG.md](CHANGE
 - **CUDA RoPE kernels** and FP16/BF16-safe strided copies.
 - **A real test suite.** `test_engine` checks every op and layer against finite differences, compares CUDA with CPU, stress-tests the engine, and trains a small transformer end to end.
 - **One-click Colab.** Build, test and train on a free GPU from [`notebooks/dummygrad_colab.ipynb`](notebooks/dummygrad_colab.ipynb).
+- **v0.2.1:** a full [Getting Started](#getting-started) guide — per-OS install, a runnable [quickstart](examples/quickstart.cpp), using dummygrad from your own CMake project, troubleshooting.
 
 > **Upgrading from 0.1:** checkpoints still load, but models using CUDA, grouped-query attention or tied embeddings were trained with incorrect activations or gradients — retrain rather than fine-tune.
 
@@ -62,37 +63,149 @@ The correctness release. Highlights below; full details in [CHANGELOG.md](CHANGE
 
 ---
 
-## Quickstart & Build
+## Getting Started
 
-### Prerequisites
-- C++17 compatible compiler (`g++` $\ge 9$, `clang++` $\ge 11$)
-- CMake $\ge 3.18$
-- NVIDIA CUDA Toolkit $\ge 11.0$ (for GPU execution)
-- Optional: OpenBLAS / oneMKL / BLAS (for CPU acceleration)
+### Try it in your browser (no install)
 
-### Build
+The fastest way to see dummygrad run is on a free Colab GPU:
+
+1. Click the **Open in Colab** badge at the top of this page.
+2. Select **Runtime → Change runtime type → T4 GPU**.
+3. Select **Runtime → Run all**.
+
+The notebook builds dummygrad with CUDA, runs the test suite, the quickstart example, and a transformer training demo — about 5 minutes end to end.
+
+### 1. Install the prerequisites
+
+| Platform | Backends | Status |
+|---|---|---|
+| Linux (Ubuntu / Debian) | CPU, CUDA | Tested on Colab (T4, CUDA 13) |
+| macOS (Apple Silicon) | CPU, Metal | Engine builds; test suite not yet run on macOS |
+| Windows | CPU, CUDA via WSL2 | Use the Linux steps inside WSL2 |
+
+You need a C++17 compiler (GCC ≥ 9 or Clang ≥ 11), CMake ≥ 3.18 and git. CUDA and BLAS are optional.
+
+**Ubuntu / Debian**
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake git libopenblas-dev
+cmake --version          # needs 3.18+; on older distros: pip install --upgrade cmake
+```
+
+**macOS**
+```bash
+xcode-select --install   # Apple's compiler toolchain
+brew install cmake git
+```
+
+**Windows:** install [WSL2 with Ubuntu](https://learn.microsoft.com/windows/wsl/install), then follow the Ubuntu steps inside it. For GPU support, use NVIDIA's [CUDA on WSL](https://docs.nvidia.com/cuda/wsl-user-guide/) guide.
+
+**NVIDIA GPU (optional):** install the NVIDIA driver and the [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) (11.0 or newer), then check both are visible:
+```bash
+nvidia-smi               # shows your GPU
+nvcc --version           # if not found: export PATH=/usr/local/cuda/bin:$PATH
+```
+
+### 2. Build
+
 ```bash
 git clone https://github.com/Keplercodes01/dummygrad.git
 cd dummygrad
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
+cmake --build build -j
 ```
+
+CMake prints whether it found CUDA (`Building with GPU support`) or is building CPU-only. Either is fine — dummygrad picks the backend at configure time.
 
 | CMake option | Default | Effect |
 |---|---|---|
-| `ENABLE_CUDA` | `ON` | Build the CUDA backend when `nvcc` is found (falls back to CPU-only otherwise) |
-| `CMAKE_CUDA_ARCHITECTURES` | `native` (CMake ≥ 3.24) | GPU generations to compile for, e.g. `75` for T4, `80` for A100 |
-| `DUMMYGRAD_BUILD_TESTS` | `ON` | Build the `test_engine` test suite |
+| `ENABLE_CUDA` | `ON` | Build the CUDA backend when `nvcc` is found; set `OFF` to force CPU-only |
+| `CMAKE_CUDA_ARCHITECTURES` | `native` (CMake ≥ 3.24) | GPU generations to compile for, e.g. `75` for T4, `80` for A100, `89` for RTX 40xx |
+| `DUMMYGRAD_BUILD_TESTS` | `ON`* | Build the `test_engine` test suite |
+| `DUMMYGRAD_BUILD_EXAMPLES` | `ON`* | Build `quickstart` and `train_colab` |
 
-### Tests
+\* Only when dummygrad is the top-level project; off when used inside your own project.
+
+### 3. Check that it works
+
 ```bash
-./build/test_engine          # or: cd build && ctest --output-on-failure
+./build/test_engine      # gradient checks, CUDA-vs-CPU checks, engine tests, training
+./build/quickstart       # a tour of the API, trains a small network on XOR
 ```
 
-`test_engine` checks every op and layer's gradients against finite differences on CPU, checks the CUDA backend against the CPU (when a GPU is present), stress-tests the multithreaded autograd engine, and trains a small transformer end to end. It exits non-zero on any failure.
+`test_engine` should end with `N passed, 0 failed`; it compares every op's gradients against finite differences, checks the CUDA backend against the CPU when a GPU is present, and trains a small transformer end to end. `quickstart` should show the loss falling towards zero. You can also run everything through CTest: `cd build && ctest --output-on-failure`.
 
-### Run on Colab (no local GPU needed)
-Open [`notebooks/dummygrad_colab.ipynb`](notebooks/dummygrad_colab.ipynb) in Colab with the badge above, select a GPU runtime, and **Run all**. It clones the repo, builds with CUDA, runs the test suite and the `train_colab` demo. To test a branch, set `BRANCH` in the clone cell.
+### 4. Your first program
+
+[`examples/quickstart.cpp`](examples/quickstart.cpp) is a complete, runnable program. The essentials:
+
+```cpp
+#include "dummy_core.h"
+
+// Tensors are std::shared_ptr<Tensor>. requires_grad=true makes autograd track them.
+auto x = ones({2, 3}, Device::CPU, DType::Float32, /*requires_grad=*/true);
+
+// Ops are free functions that build the graph as they run.
+// sum() reduces one axis and keeps it, so two sums give a [1, 1] scalar.
+auto y = sum(sum(mul_scalar(x, 3.0f), -1), -2);
+y->backward();            // x->grad now holds dy/dx
+x->show_grad();           // prints 3s
+
+// Layers own their parameters; move them to a device with .to().
+Linear hidden(2, 8), output(8, 1);
+hidden.to(Device::CUDA);  // or Device::CPU
+output.to(Device::CUDA);
+std::vector<std::shared_ptr<Tensor>> params = {hidden.W, hidden.b, output.W, output.b};
+Adam optimizer(0.05f);
+
+for (int step = 0; step < 500; ++step) {
+    optimizer.zero_grad(params);
+    auto loss = mse(output.forward(tanh(hidden.forward(X))), Y);
+    loss->backward();
+    optimizer.step(params);
+}
+```
+
+A few conventions worth knowing:
+- Inputs and parameters live on one device; copy data over with `tensor->to(Device::CUDA)` and read results back with `tensor->cpu()->data_ptr<float>()`.
+- Integer data such as token ids and class labels is stored in `Float32` tensors.
+- Collect a layer's `parameters()` *after* calling `.to()` — moving replaces the tensors.
+
+The bigger building blocks — `ModernTransformer`, `GPT`, `MultiHeadAttention`, `RMSNorm`, `SwiGLU`, RoPE — are shown in the sections below.
+
+### 5. Use dummygrad in your own project
+
+dummygrad is a CMake library. The simplest way to depend on it is `FetchContent`, which downloads and builds it with your project:
+
+```cmake
+cmake_minimum_required(VERSION 3.18)
+project(my_app LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+
+include(FetchContent)
+FetchContent_Declare(dummygrad
+    GIT_REPOSITORY https://github.com/Keplercodes01/dummygrad.git
+    GIT_TAG        v0.2.1)
+FetchContent_MakeAvailable(dummygrad)
+
+add_executable(my_app main.cpp)
+target_link_libraries(my_app PRIVATE dummygrad::dummygrad)
+```
+
+Then `#include "dummy_core.h"` in `main.cpp` and build with the usual `cmake -S . -B build && cmake --build build`. CUDA is enabled automatically when `nvcc` is found, and the `ENABLE_CUDA` / `CMAKE_CUDA_ARCHITECTURES` options above work from your project too.
+
+Prefer vendoring? Add the repository as a git submodule and replace the `FetchContent` lines with `add_subdirectory(external/dummygrad)`.
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `CUDA compiler not found. Building CPU-only.` | `nvcc` isn't on your `PATH`. Run `export PATH=/usr/local/cuda/bin:$PATH`, or pass `-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc`. Delete `build/` and configure again. |
+| `CMake 3.18 or higher is required` | `pip install --upgrade cmake`, then open a new shell. |
+| `nvcc fatal : Unsupported gpu architecture` | Your CMake or CUDA is too old for `native`. Pass your GPU's compute capability, e.g. `-DCMAKE_CUDA_ARCHITECTURES=75`. |
+| `Illegal instruction` when running a binary on another machine | Builds use `-march=native`. Rebuild on the machine that runs the program. |
+| `BLAS found` is missing from the CMake output | Optional. Install `libopenblas-dev` (Linux) for faster CPU matmuls. |
+| A `test_engine` check fails | Please [open an issue](https://github.com/Keplercodes01/dummygrad/issues) with the full output and your GPU / OS. |
 
 ---
 

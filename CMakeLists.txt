@@ -1,13 +1,22 @@
 cmake_minimum_required(VERSION 3.18)
-project(dummygrad VERSION 0.2.0 LANGUAGES CXX)
+project(dummygrad VERSION 0.2.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Tests and examples are built by default only when dummygrad is the top-level project,
+# not when another project pulls it in with add_subdirectory / FetchContent.
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    set(DUMMYGRAD_IS_TOP_LEVEL ON)
+else()
+    set(DUMMYGRAD_IS_TOP_LEVEL OFF)
+endif()
+
 option(ENABLE_CUDA "Enable NVIDIA CUDA GPU acceleration" ON)
-option(DUMMYGRAD_BUILD_TESTS "Build the gradient-check test suite (test_engine)" ON)
+option(DUMMYGRAD_BUILD_TESTS "Build the gradient-check test suite (test_engine)" ${DUMMYGRAD_IS_TOP_LEVEL})
+option(DUMMYGRAD_BUILD_EXAMPLES "Build quickstart and train_colab" ${DUMMYGRAD_IS_TOP_LEVEL})
 
 # Source files for the core engine
 set(DUMMYGRAD_SOURCES
@@ -50,6 +59,7 @@ endif()
 
 # Build engine static library
 add_library(dummygrad_engine STATIC ${DUMMYGRAD_SOURCES})
+add_library(dummygrad::dummygrad ALIAS dummygrad_engine)
 target_include_directories(dummygrad_engine PUBLIC
     src
     src/core
@@ -63,7 +73,13 @@ target_link_libraries(dummygrad_engine PRIVATE ${CMAKE_DL_LIBS})
 target_compile_definitions(dummygrad_engine PUBLIC DUMMYGRAD_VERSION="${PROJECT_VERSION}")
 
 # The autograd engine runs backward on a worker thread pool
-find_package(Threads REQUIRED)
+# Imported targets from find_package are only visible in the directory that created them.
+# These are part of dummygrad_engine's public link interface, so when dummygrad is pulled in
+# with add_subdirectory / FetchContent they must be global or consumers can't resolve them.
+if(NOT TARGET Threads::Threads)
+    find_package(Threads REQUIRED)
+    set_target_properties(Threads::Threads PROPERTIES IMPORTED_GLOBAL TRUE)
+endif()
 target_link_libraries(dummygrad_engine PUBLIC Threads::Threads)
 
 # Optional BLAS (OpenBLAS / oneMKL / MKL / Netlib) for fast CPU linear algebra
@@ -77,7 +93,10 @@ endif()
 # Link CUDA libraries when CUDA is enabled. PUBLIC because the public headers
 # (optimizers.h, multi_gpu.h, ...) call the CUDA runtime when USE_CUDA is defined.
 if(ENABLE_CUDA AND CMAKE_CUDA_COMPILER)
-    find_package(CUDAToolkit REQUIRED)
+    if(NOT TARGET CUDA::cudart)
+        find_package(CUDAToolkit REQUIRED)
+        set_target_properties(CUDA::cudart CUDA::cublas PROPERTIES IMPORTED_GLOBAL TRUE)
+    endif()
     target_link_libraries(dummygrad_engine PUBLIC CUDA::cudart CUDA::cublas)
     target_compile_definitions(dummygrad_engine PUBLIC USE_CUDA=1)
 endif()
@@ -100,14 +119,21 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
     target_link_libraries(dummygrad_test PRIVATE dummygrad_engine)
 endif()
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/train_colab.cpp")
+if(DUMMYGRAD_BUILD_TESTS OR DUMMYGRAD_BUILD_EXAMPLES)
+    enable_testing()
+endif()
+
+if(DUMMYGRAD_BUILD_EXAMPLES)
+    add_executable(quickstart examples/quickstart.cpp)
+    target_link_libraries(quickstart PRIVATE dummygrad_engine)
+    add_test(NAME example_quickstart COMMAND quickstart)
+
     add_executable(train_colab src/train_colab.cpp)
     target_link_libraries(train_colab PRIVATE dummygrad_engine)
 endif()
 
 # Gradient-check test suite: `ctest --output-on-failure` or run ./test_engine directly
 if(DUMMYGRAD_BUILD_TESTS)
-    enable_testing()
     add_executable(test_engine tests/test_engine.cpp)
     target_link_libraries(test_engine PRIVATE dummygrad_engine)
     add_test(NAME test_engine COMMAND test_engine)
