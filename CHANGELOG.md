@@ -2,6 +2,13 @@
 
 All notable changes to dummygrad are documented here. Versions follow [Semantic Versioning](https://semver.org/); while the major version is 0, minor releases may change behavior.
 
+## [Unreleased]
+
+### Added
+- **Benchmark** (`bench/bench.cpp`, target `dg_bench`): full ModernTransformer training steps at three sizes, timed as forward / backward / optimizer, with host-device traffic per step. `bench/bench_torch.py` runs the same architecture in PyTorch; the Colab notebook runs both.
+- `transfer_stats()` / `reset_transfer_stats()`: counts host-device copies made through `Tensor::to`, which exposes ops that fall back to the CPU.
+- CI compiles the CUDA backend (in NVIDIA's CUDA container) on every change, and smoke-runs the benchmark on CPU.
+
 ## [0.4.0] - 2026-10-24
 
 The workflow release: everything around the model that day-to-day research needs. Write and verify custom ops, build models from modules, train with resumable checkpoints, data loaders and metric logs, and get bitwise-reproducible gradients.

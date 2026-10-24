@@ -7,9 +7,26 @@
 #include <cuda_runtime.h>
 #endif
 #include <unordered_map>
+#include <atomic>
 #include <queue>
 #include <functional>
 #include <stdexcept>
+
+static std::atomic<uint64_t> g_to_device_count{0}, g_to_device_bytes{0};
+static std::atomic<uint64_t> g_to_host_count{0}, g_to_host_bytes{0};
+
+TransferStats transfer_stats() {
+    TransferStats s;
+    s.to_device_count = g_to_device_count;
+    s.to_device_bytes = g_to_device_bytes;
+    s.to_host_count = g_to_host_count;
+    s.to_host_bytes = g_to_host_bytes;
+    return s;
+}
+
+void reset_transfer_stats() {
+    g_to_device_count = g_to_device_bytes = g_to_host_count = g_to_host_bytes = 0;
+}
 
 Tensor::Tensor(std::vector<int64_t> s, Device d, DType type, bool req_grad)
     : shape(std::move(s)), global_offset(0), device(d), dtype(type), requires_grad(req_grad) {  
@@ -298,6 +315,13 @@ std::shared_ptr<Tensor> Tensor::to(Device target_device, DType target_dtype, int
     // Step 4: Device transfer with matching dtype (this->dtype == target_dtype)
     auto out = std::make_shared<Tensor>(this->shape, target_device, this->dtype, this->requires_grad);
     size_t copy_bytes = this->size() * dtype_size(this->dtype);
+    if (this->device == Device::CPU && target_device != Device::CPU) {
+        g_to_device_count++;
+        g_to_device_bytes += copy_bytes;
+    } else if (this->device != Device::CPU && target_device == Device::CPU) {
+        g_to_host_count++;
+        g_to_host_bytes += copy_bytes;
+    }
 
     if (this->device == Device::CPU && target_device == Device::CUDA) {
 #ifdef USE_CUDA
