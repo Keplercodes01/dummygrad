@@ -167,6 +167,14 @@ void tensor_add_inplace(std::shared_ptr<Tensor>& dst, const std::shared_ptr<Tens
         ops::make_contiguous(*dst, *src); // acts as deep copy
         return;
     }
+    // Backends add element-wise over flat memory, so both operands must be dense.
+    // Gradients routinely arrive as strided views (TransposeBackward), e.g. a tied
+    // embedding weight that is also used transposed as the LM head.
+    if (!dst->is_contiguous()) dst = make_contiguous(dst);
+    if (!src->is_contiguous()) {
+        ops::add_inplace(*dst, *make_contiguous(src));
+        return;
+    }
     ops::add_inplace(*dst, *src);
 }
 

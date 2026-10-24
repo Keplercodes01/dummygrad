@@ -77,16 +77,18 @@ public:
             auto Q_4d = make_contiguous(reshape(Q, {B, 1, S, d_k}));
             auto K_4d = make_contiguous(reshape(K, {B, 1, S, d_k}));
             auto V_4d = make_contiguous(reshape(V, {B, 1, S, d_k}));
-            auto out_4d = std::make_shared<Tensor>(Q_4d->shape, Device::CUDA, x->dtype, x->requires_grad);
+            // Q/K/V carry the weights' requires_grad even when the input x does not
+            bool qkv_grad = Q->requires_grad || K->requires_grad || V->requires_grad;
+            auto out_4d = std::make_shared<Tensor>(Q_4d->shape, Device::CUDA, x->dtype, qkv_grad);
             cuda::flash_attention_forward(Q_4d->data_ptr<float>(), K_4d->data_ptr<float>(), V_4d->data_ptr<float>(),
                                           out_4d->data_ptr<float>(),
                                           B, 1, S, d_k, causal, scale);
-            if (x->requires_grad) {
+            if (qkv_grad) {
                 auto grad_fn = std::make_shared<FlashAttentionBackward>(Q_4d, K_4d, V_4d, out_4d,
                                                                         B, 1, S, d_k, causal, scale);
-                grad_fn->add_next_edge(get_grad_edge(Q).function, 0);
-                grad_fn->add_next_edge(get_grad_edge(K).function, 1);
-                grad_fn->add_next_edge(get_grad_edge(V).function, 2);
+                grad_fn->add_next_edge(get_grad_edge(Q).function);
+                grad_fn->add_next_edge(get_grad_edge(K).function);
+                grad_fn->add_next_edge(get_grad_edge(V).function);
                 out_4d->grad_fn = grad_fn;
             }
             out = reshape(out_4d, {B, S, d_k});
@@ -253,8 +255,12 @@ public:
                 std::vector<int64_t>{B, n_heads, S, d_k}, V_split->device, V_split->dtype, V_split->requires_grad
             );
 
-            const float* k_src = K_split->data_ptr<float>();
-            const float* v_src = V_split->data_ptr<float>();
+            // K_split / V_split are transposed views of [B, S, kv, d] memory; the per-head
+            // copies below need real [B, kv, S, d] layout. Autograd still flows to the views.
+            auto K_dense = make_contiguous(K_split);
+            auto V_dense = make_contiguous(V_split);
+            const float* k_src = K_dense->data_ptr<float>();
+            const float* v_src = V_dense->data_ptr<float>();
             float* k_dst = K_rep->data_ptr<float>();
             float* v_dst = V_rep->data_ptr<float>();
 
@@ -279,12 +285,12 @@ public:
 
             if (K_split->requires_grad) {
                 auto grad_fn = std::make_shared<GQARepeatBackward>(K_split, B, n_heads, n_kv_heads, S, d_k);
-                grad_fn->add_next_edge(get_grad_edge(K_split).function, 0);
+                grad_fn->add_next_edge(get_grad_edge(K_split).function);
                 K_rep->grad_fn = grad_fn;
             }
             if (V_split->requires_grad) {
                 auto grad_fn = std::make_shared<GQARepeatBackward>(V_split, B, n_heads, n_kv_heads, S, d_k);
-                grad_fn->add_next_edge(get_grad_edge(V_split).function, 0);
+                grad_fn->add_next_edge(get_grad_edge(V_split).function);
                 V_rep->grad_fn = grad_fn;
             }
 
@@ -301,16 +307,18 @@ public:
             auto Q_c = make_contiguous(Q_split);
             auto K_c = make_contiguous(K_split);
             auto V_c = make_contiguous(V_split);
-            attn_out = std::make_shared<Tensor>(Q_split->shape, Device::CUDA, x->dtype, x->requires_grad);
+            // Q/K/V carry the weights' requires_grad even when the input x does not
+            bool qkv_grad = Q_split->requires_grad || K_split->requires_grad || V_split->requires_grad;
+            attn_out = std::make_shared<Tensor>(Q_split->shape, Device::CUDA, x->dtype, qkv_grad);
             cuda::flash_attention_forward(Q_c->data_ptr<float>(), K_c->data_ptr<float>(), V_c->data_ptr<float>(),
                                           attn_out->data_ptr<float>(),
                                           B, n_heads, S, d_k, causal, scale);
-            if (x->requires_grad) {
+            if (qkv_grad) {
                 auto grad_fn = std::make_shared<FlashAttentionBackward>(Q_c, K_c, V_c, attn_out,
                                                                         B, n_heads, S, d_k, causal, scale);
-                grad_fn->add_next_edge(get_grad_edge(Q_split).function, 0);
-                grad_fn->add_next_edge(get_grad_edge(K_split).function, 1);
-                grad_fn->add_next_edge(get_grad_edge(V_split).function, 2);
+                grad_fn->add_next_edge(get_grad_edge(Q_split).function);
+                grad_fn->add_next_edge(get_grad_edge(K_split).function);
+                grad_fn->add_next_edge(get_grad_edge(V_split).function);
                 attn_out->grad_fn = grad_fn;
             }
         } else {

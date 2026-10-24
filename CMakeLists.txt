@@ -1,10 +1,13 @@
 cmake_minimum_required(VERSION 3.18)
-project(dummygrad LANGUAGES CXX)
+project(dummygrad VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+option(ENABLE_CUDA "Enable NVIDIA CUDA GPU acceleration" ON)
+option(DUMMYGRAD_BUILD_TESTS "Build the gradient-check test suite (test_engine)" ON)
 
 # Source files for the core engine
 set(DUMMYGRAD_SOURCES
@@ -20,17 +23,24 @@ set(DUMMYGRAD_SOURCES
 )
 
 # Detect and configure CUDA for GPU execution
-option(ENABLE_CUDA "Enable NVIDIA CUDA GPU acceleration" ON)
-
 if(ENABLE_CUDA)
     include(CheckLanguage)
     check_language(CUDA)
     if(CMAKE_CUDA_COMPILER)
+        # Compile for the GPU in this machine when CMake can detect it (Colab, cloud boxes),
+        # otherwise for the common datacenter/consumer generations (T4, A100, RTX 30xx).
+        if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+            if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+                set(CMAKE_CUDA_ARCHITECTURES native)
+            else()
+                set(CMAKE_CUDA_ARCHITECTURES 75 80 86)
+            endif()
+        endif()
         enable_language(CUDA)
         set(CMAKE_CUDA_STANDARD 17)
         set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --use_fast_math")
         list(APPEND DUMMYGRAD_SOURCES src/backends/cuda/cuda_ops.cu)
-        message(STATUS "CUDA found: ${CMAKE_CUDA_COMPILER}. Building with GPU support.")
+        message(STATUS "CUDA found: ${CMAKE_CUDA_COMPILER} (archs: ${CMAKE_CUDA_ARCHITECTURES}). Building with GPU support.")
     else()
         message(STATUS "CUDA compiler not found. Building CPU-only.")
     endif()
@@ -40,7 +50,7 @@ endif()
 
 # Build engine static library
 add_library(dummygrad_engine STATIC ${DUMMYGRAD_SOURCES})
-target_include_directories(dummygrad_engine PUBLIC 
+target_include_directories(dummygrad_engine PUBLIC
     src
     src/core
     src/autograd
@@ -50,6 +60,11 @@ target_include_directories(dummygrad_engine PUBLIC
     src/models
 )
 target_link_libraries(dummygrad_engine PRIVATE ${CMAKE_DL_LIBS})
+target_compile_definitions(dummygrad_engine PUBLIC DUMMYGRAD_VERSION="${PROJECT_VERSION}")
+
+# The autograd engine runs backward on a worker thread pool
+find_package(Threads REQUIRED)
+target_link_libraries(dummygrad_engine PUBLIC Threads::Threads)
 
 # Optional BLAS (OpenBLAS / oneMKL / MKL / Netlib) for fast CPU linear algebra
 find_package(BLAS QUIET)
@@ -59,10 +74,11 @@ if(BLAS_FOUND)
     target_compile_definitions(dummygrad_engine PUBLIC USE_BLAS=1)
 endif()
 
-# Link CUDA libraries when CUDA is enabled
+# Link CUDA libraries when CUDA is enabled. PUBLIC because the public headers
+# (optimizers.h, multi_gpu.h, ...) call the CUDA runtime when USE_CUDA is defined.
 if(ENABLE_CUDA AND CMAKE_CUDA_COMPILER)
     find_package(CUDAToolkit REQUIRED)
-    target_link_libraries(dummygrad_engine PRIVATE CUDA::cudart CUDA::cublas)
+    target_link_libraries(dummygrad_engine PUBLIC CUDA::cudart CUDA::cublas)
     target_compile_definitions(dummygrad_engine PUBLIC USE_CUDA=1)
 endif()
 
@@ -89,3 +105,10 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/train_colab.cpp")
     target_link_libraries(train_colab PRIVATE dummygrad_engine)
 endif()
 
+# Gradient-check test suite: `ctest --output-on-failure` or run ./test_engine directly
+if(DUMMYGRAD_BUILD_TESTS)
+    enable_testing()
+    add_executable(test_engine tests/test_engine.cpp)
+    target_link_libraries(test_engine PRIVATE dummygrad_engine)
+    add_test(NAME test_engine COMMAND test_engine)
+endif()

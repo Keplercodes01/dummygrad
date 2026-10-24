@@ -7,6 +7,7 @@
 #include <cublas_v2.h>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 #define CUDA_CHECK(call) \
     do { \
@@ -27,12 +28,18 @@
     } while (0)
 
 inline cublasHandle_t get_cublas_handle() {
-    static cublasHandle_t handle = nullptr;
-    if (!handle) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    static thread_local std::unordered_map<int, cublasHandle_t> handles;
+    auto it = handles.find(dev);
+    if (it == handles.end()) {
+        cublasHandle_t handle = nullptr;
         CUBLAS_CHECK(cublasCreate(&handle));
         cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
+        handles[dev] = handle;
+        return handle;
     }
-    return handle;
+    return it->second;
 }
 
 // -------------------------------------------------------------

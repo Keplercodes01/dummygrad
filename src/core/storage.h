@@ -17,6 +17,6 @@ struct Storage {
 
     Storage(const Storage&) = delete;
     Storage& operator=(const Storage&) = delete;
-    Storage(Storage&&) noexcept = default;
-    Storage& operator=(Storage&&) noexcept = default;
+    Storage(Storage&& other) noexcept;
+    Storage& operator=(Storage&& other) noexcept;
 };

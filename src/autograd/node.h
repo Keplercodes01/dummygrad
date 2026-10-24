@@ -7,6 +7,9 @@
 class Tensor;
 struct Node;
 
+// input_slot is the index into the *destination* node's incoming grads, not the
+// position of the input in the producing op. Every node here has a single output,
+// so it is always 0 — pass get_grad_edge(t).function with no slot argument.
 struct Edge {
     std::shared_ptr<Node> function;
     size_t input_slot{0};

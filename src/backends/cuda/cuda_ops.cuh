@@ -3,6 +3,8 @@
 #include <vector>
 
 #ifdef USE_CUDA
+// Headers that dispatch to these ops also call the runtime API directly (cudaMemcpy, cudaMemset)
+#include <cuda_runtime.h>
 
 namespace cuda {
     // Primitive tensor ops
@@ -54,6 +56,12 @@ namespace cuda {
     void sliding_window_mask_backward(const float* grad_out, float* grad_in, int batch, int seq_len, int window_size);
     void prefix_causal_mask(const float* in, float* out, int batch, int seq_len, int prefix_len);
     void prefix_causal_mask_backward(const float* grad_out, float* grad_in, int batch, int seq_len, int prefix_len);
+
+    // Rotary Position Embeddings (RoPE)
+    void rope_forward(const float* in, const float* cos_freqs, const float* sin_freqs,
+                      float* out, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos);
+    void rope_backward(const float* grad_out, const float* cos_freqs, const float* sin_freqs,
+                       float* grad_in, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos);
 
     // Frontier Tiled FlashAttention (Online Softmax, O(N) memory)
     void flash_attention_forward(const float* q, const float* k, const float* v,

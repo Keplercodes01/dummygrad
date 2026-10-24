@@ -28,7 +28,9 @@ public:
 
 class CUDACachingAllocator : public Allocator {
 private:
-    std::unordered_map<size_t, std::vector<void*>> free_blocks;
+    // Pools are per device: a block cudaMalloc'd on one GPU must never be reused on another
+    std::unordered_map<int, std::unordered_map<size_t, std::vector<void*>>> free_blocks;
+    std::unordered_map<void*, int> ptr_device;
     std::mutex mtx;
     size_t round_up(size_t bytes) { return (bytes + 511) & ~511; }
 public:

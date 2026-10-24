@@ -73,7 +73,7 @@ inline std::shared_ptr<Tensor> relu(const std::shared_ptr<Tensor>& a) {
         cuda::relu_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size());
         if (req_grad) {
             auto grad_fn = std::make_shared<ReluBackward>(a);
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -89,7 +89,7 @@ inline std::shared_ptr<Tensor> relu(const std::shared_ptr<Tensor>& a) {
 
     if (req_grad) {
         auto grad_fn = std::make_shared<ReluBackward>(a);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -142,7 +142,7 @@ inline std::shared_ptr<Tensor> tanh(const std::shared_ptr<Tensor>& a) {
         cuda::tanh_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size());
         if (req_grad) {
             auto grad_fn = std::make_shared<TanhBackward>(out);
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -164,7 +164,7 @@ inline std::shared_ptr<Tensor> tanh(const std::shared_ptr<Tensor>& a) {
 
     if (req_grad) {
         auto grad_fn = std::make_shared<TanhBackward>(out);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -224,7 +224,7 @@ inline std::shared_ptr<Tensor> gelu(const std::shared_ptr<Tensor>& a) {
         cuda::gelu_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size());
         if (req_grad) {
             auto grad_fn = std::make_shared<GeluBackward>(a, sqrt_2_over_pi, coeff);
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -243,7 +243,7 @@ inline std::shared_ptr<Tensor> gelu(const std::shared_ptr<Tensor>& a) {
 
     if (req_grad) {
         auto grad_fn = std::make_shared<GeluBackward>(a, sqrt_2_over_pi, coeff);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -296,7 +296,7 @@ inline std::shared_ptr<Tensor> sigmoid(const std::shared_ptr<Tensor>& a) {
         cuda::sigmoid_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size());
         if (req_grad) {
             auto grad_fn = std::make_shared<SigmoidBackward>(out);
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -306,7 +306,7 @@ inline std::shared_ptr<Tensor> sigmoid(const std::shared_ptr<Tensor>& a) {
         MetalBackend::get().sigmoid_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size());
         if (req_grad) {
             auto grad_fn = std::make_shared<SigmoidBackward>(out);
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -315,7 +315,7 @@ inline std::shared_ptr<Tensor> sigmoid(const std::shared_ptr<Tensor>& a) {
         out->storage->tpu_handle = TPUEngine::get().sigmoid(a->storage->tpu_handle, a->shape, a->dtype);
         if (req_grad) {
             auto grad_fn = std::make_shared<SigmoidBackward>(out);
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -330,7 +330,7 @@ inline std::shared_ptr<Tensor> sigmoid(const std::shared_ptr<Tensor>& a) {
 
     if (req_grad) {
         auto grad_fn = std::make_shared<SigmoidBackward>(out);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -384,7 +384,7 @@ inline std::shared_ptr<Tensor> silu(const std::shared_ptr<Tensor>& a) {
         cuda::silu_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size());
         if (req_grad) {
             auto grad_fn = std::make_shared<SiluBackward>(a);
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -394,7 +394,7 @@ inline std::shared_ptr<Tensor> silu(const std::shared_ptr<Tensor>& a) {
         MetalBackend::get().silu_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size());
         if (req_grad) {
             auto grad_fn = std::make_shared<SiluBackward>(a);
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -403,7 +403,7 @@ inline std::shared_ptr<Tensor> silu(const std::shared_ptr<Tensor>& a) {
         out->storage->tpu_handle = TPUEngine::get().silu(a->storage->tpu_handle, a->shape, a->dtype);
         if (req_grad) {
             auto grad_fn = std::make_shared<SiluBackward>(a);
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -419,7 +419,7 @@ inline std::shared_ptr<Tensor> silu(const std::shared_ptr<Tensor>& a) {
 
     if (req_grad) {
         auto grad_fn = std::make_shared<SiluBackward>(a);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -477,7 +477,7 @@ inline std::shared_ptr<Tensor> leaky_relu(const std::shared_ptr<Tensor>& a, floa
         cuda::leaky_relu_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size(), negative_slope);
         if (req_grad) {
             auto grad_fn = std::make_shared<LeakyReluBackward>(a, negative_slope);
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -487,7 +487,7 @@ inline std::shared_ptr<Tensor> leaky_relu(const std::shared_ptr<Tensor>& a, floa
         MetalBackend::get().leaky_relu_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size(), negative_slope);
         if (req_grad) {
             auto grad_fn = std::make_shared<LeakyReluBackward>(a, negative_slope);
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -496,7 +496,7 @@ inline std::shared_ptr<Tensor> leaky_relu(const std::shared_ptr<Tensor>& a, floa
         out->storage->tpu_handle = TPUEngine::get().leaky_relu(a->storage->tpu_handle, a->shape, negative_slope, a->dtype);
         if (req_grad) {
             auto grad_fn = std::make_shared<LeakyReluBackward>(a, negative_slope);
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -512,7 +512,7 @@ inline std::shared_ptr<Tensor> leaky_relu(const std::shared_ptr<Tensor>& a, floa
 
     if (req_grad) {
         auto grad_fn = std::make_shared<LeakyReluBackward>(a, negative_slope);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -609,11 +609,21 @@ inline std::shared_ptr<Tensor> broadcast(const std::shared_ptr<Tensor>& a, int a
 
     if (req_grad) {
         auto grad_fn = std::make_shared<BroadcastBackward>(a->shape, axis, n, r, c, batch_size);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
     return out;
+}
+
+// Batch index into a broadcast operand y for flattened batch index `batch` of x.
+// Equal batch counts map 1:1; a smaller y that divides x is shared by contiguous groups
+// (GQA: query head h uses kv head h / (n_heads / n_kv_heads)); otherwise y is broadcast.
+// Forward and backward of every cast_n_* op must use this same mapping.
+inline int broadcast_batch_index(int batch, int batch_size, int y_batch_size) {
+    if (y_batch_size == batch_size) return batch;
+    if (y_batch_size > 1 && batch_size % y_batch_size == 0) return batch / (batch_size / y_batch_size);
+    return 0;
 }
 
 // --- ADD BACKWARD NODE ---
@@ -653,7 +663,7 @@ struct CastAddBackward : public Node {
         for (int i = 0; i < (int)y_shape.size() - 2; i++) { y_batch_size *= y_shape[i]; }
 
         for (int batch = 0; batch < batch_size; batch++) {
-            int y_b = (y_batch_size == batch_size) ? batch : 0;
+            int y_b = broadcast_batch_index(batch, batch_size, y_batch_size);
             for (int i = 0; i < r; i++) {
                 for (int j = 0; j < c; j++) {
                     int x_idx = batch * r * c + i * c + j;
@@ -707,8 +717,8 @@ inline std::shared_ptr<Tensor> cast_n_add(const std::shared_ptr<Tensor>& x,
             auto out_cuda = out_cpu->to(Device::CUDA);
             if (req_grad) {
                 auto grad_fn = std::make_shared<CastAddBackward>(x->shape, y->shape, r, c, batch_size);
-                grad_fn->add_next_edge(get_grad_edge(x).function, 0);
-                grad_fn->add_next_edge(get_grad_edge(y).function, 1);
+                grad_fn->add_next_edge(get_grad_edge(x).function);
+                grad_fn->add_next_edge(get_grad_edge(y).function);
                 out_cuda->grad_fn = grad_fn;
             }
             return out_cuda;
@@ -716,8 +726,8 @@ inline std::shared_ptr<Tensor> cast_n_add(const std::shared_ptr<Tensor>& x,
 
         if (req_grad) {
             auto grad_fn = std::make_shared<CastAddBackward>(x->shape, y->shape, r, c, batch_size);
-            grad_fn->add_next_edge(get_grad_edge(x).function, 0);
-            grad_fn->add_next_edge(get_grad_edge(y).function, 1);
+            grad_fn->add_next_edge(get_grad_edge(x).function);
+            grad_fn->add_next_edge(get_grad_edge(y).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -729,7 +739,7 @@ inline std::shared_ptr<Tensor> cast_n_add(const std::shared_ptr<Tensor>& x,
     float* out_ptr = out->data_ptr<float>();
 
     for (int batch = 0; batch < batch_size; batch++) {
-        int y_b = (y_batch_size == batch_size) ? batch : 0;
+        int y_b = broadcast_batch_index(batch, batch_size, y_batch_size);
         for (int i = 0; i < r; i++) {
             for (int j = 0; j < c; j++) {
                 int x_idx = batch * r * c + i * c + j;
@@ -743,8 +753,8 @@ inline std::shared_ptr<Tensor> cast_n_add(const std::shared_ptr<Tensor>& x,
 
     if (req_grad) {
         auto grad_fn = std::make_shared<CastAddBackward>(x->shape, y->shape, r, c, batch_size);
-        grad_fn->add_next_edge(get_grad_edge(x).function, 0);
-        grad_fn->add_next_edge(get_grad_edge(y).function, 1);
+        grad_fn->add_next_edge(get_grad_edge(x).function);
+        grad_fn->add_next_edge(get_grad_edge(y).function);
         out->grad_fn = grad_fn;
     }
 
@@ -767,8 +777,8 @@ inline std::shared_ptr<Tensor> add(const std::shared_ptr<Tensor>& x,
 
             if (req_grad) {
                 auto grad_fn = std::make_shared<AddBackward>();
-                grad_fn->add_next_edge(get_grad_edge(x).function, 0);
-                grad_fn->add_next_edge(get_grad_edge(y).function, 1);
+                grad_fn->add_next_edge(get_grad_edge(x).function);
+                grad_fn->add_next_edge(get_grad_edge(y).function);
                 out->grad_fn = grad_fn;
             }
             return out;
@@ -788,8 +798,8 @@ inline std::shared_ptr<Tensor> add(const std::shared_ptr<Tensor>& x,
 
         if (req_grad) {
             auto grad_fn = std::make_shared<AddBackward>();
-            grad_fn->add_next_edge(get_grad_edge(x).function, 0);
-            grad_fn->add_next_edge(get_grad_edge(y).function, 1);
+            grad_fn->add_next_edge(get_grad_edge(x).function);
+            grad_fn->add_next_edge(get_grad_edge(y).function);
             out->grad_fn = grad_fn;
         }
 
@@ -828,7 +838,7 @@ struct CastSubBackward : public Node {
         for (int i = 0; i < (int)y_shape.size() - 2; i++) { y_batch_size *= y_shape[i]; }
 
         for (int batch = 0; batch < batch_size; batch++) {
-            int y_b = (y_batch_size == batch_size) ? batch : 0;
+            int y_b = broadcast_batch_index(batch, batch_size, y_batch_size);
             for (int i = 0; i < r; i++) {
                 for (int j = 0; j < c; j++) {
                     int x_idx = batch * r * c + i * c + j;
@@ -873,7 +883,7 @@ inline std::shared_ptr<Tensor> cast_n_sub(const std::shared_ptr<Tensor>& x,
     float* out_ptr = out_cpu->data_ptr<float>();
 
     for (int batch = 0; batch < batch_size; batch++) {
-        int y_b = (y_batch_size == batch_size) ? batch : 0;
+        int y_b = broadcast_batch_index(batch, batch_size, y_batch_size);
         for (int i = 0; i < r; i++) {
             for (int j = 0; j < c; j++) {
                 int x_idx = batch * r * c + i * c + j;
@@ -890,8 +900,8 @@ inline std::shared_ptr<Tensor> cast_n_sub(const std::shared_ptr<Tensor>& x,
 
     if (req_grad) {
         auto grad_fn = std::make_shared<CastSubBackward>(x->shape, y->shape, r, c, batch_size);
-        grad_fn->add_next_edge(get_grad_edge(x).function, 0);
-        grad_fn->add_next_edge(get_grad_edge(y).function, 1);
+        grad_fn->add_next_edge(get_grad_edge(x).function);
+        grad_fn->add_next_edge(get_grad_edge(y).function);
         out->grad_fn = grad_fn;
     }
 
@@ -937,7 +947,7 @@ struct CastMulBackward : public Node {
         for (int i = 0; i < (int)y->shape.size() - 2; i++) { y_batch_size *= y->shape[i]; }
 
         for (int batch = 0; batch < batch_size; batch++) {
-            int y_b = (y_batch_size == batch_size) ? batch : 0;
+            int y_b = broadcast_batch_index(batch, batch_size, y_batch_size);
             for (int i = 0; i < r; i++) {
                 for (int j = 0; j < c; j++) {
                     int x_idx = batch * r * c + i * c + j;
@@ -982,7 +992,7 @@ inline std::shared_ptr<Tensor> cast_n_mul(const std::shared_ptr<Tensor>& x,
     float* out_ptr = out_cpu->data_ptr<float>();
 
     for (int batch = 0; batch < batch_size; batch++) {
-        int y_b = (y_batch_size == batch_size) ? batch : 0;
+        int y_b = broadcast_batch_index(batch, batch_size, y_batch_size);
         for (int i = 0; i < r; i++) {
             for (int j = 0; j < c; j++) {
                 int x_idx = batch * r * c + i * c + j;
@@ -999,8 +1009,8 @@ inline std::shared_ptr<Tensor> cast_n_mul(const std::shared_ptr<Tensor>& x,
 
     if (req_grad) {
         auto grad_fn = std::make_shared<CastMulBackward>(x, y, r, c, batch_size);
-        grad_fn->add_next_edge(get_grad_edge(x).function, 0);
-        grad_fn->add_next_edge(get_grad_edge(y).function, 1);
+        grad_fn->add_next_edge(get_grad_edge(x).function);
+        grad_fn->add_next_edge(get_grad_edge(y).function);
         out->grad_fn = grad_fn;
     }
 
@@ -1052,7 +1062,7 @@ struct CastDivBackward : public Node {
         for (int i = 0; i < (int)y->shape.size() - 2; i++) { y_batch_size *= y->shape[i]; }
 
         for (int batch = 0; batch < batch_size; batch++) {
-            int y_b = (y_batch_size == batch_size) ? batch : 0;
+            int y_b = broadcast_batch_index(batch, batch_size, y_batch_size);
             for (int i = 0; i < r; i++) {
                 for (int j = 0; j < c; j++) {
                     int x_idx = batch * r * c + i * c + j;
@@ -1098,7 +1108,7 @@ inline std::shared_ptr<Tensor> cast_n_div(const std::shared_ptr<Tensor>& x,
     float* out_ptr = out_cpu->data_ptr<float>();
 
     for (int batch = 0; batch < batch_size; batch++) {
-        int y_b = (y_batch_size == batch_size) ? batch : 0;
+        int y_b = broadcast_batch_index(batch, batch_size, y_batch_size);
         for (int i = 0; i < r; i++) {
             for (int j = 0; j < c; j++) {
                 int x_idx = batch * r * c + i * c + j;
@@ -1115,8 +1125,8 @@ inline std::shared_ptr<Tensor> cast_n_div(const std::shared_ptr<Tensor>& x,
 
     if (req_grad) {
         auto grad_fn = std::make_shared<CastDivBackward>(x, y, r, c, batch_size);
-        grad_fn->add_next_edge(get_grad_edge(x).function, 0);
-        grad_fn->add_next_edge(get_grad_edge(y).function, 1);
+        grad_fn->add_next_edge(get_grad_edge(x).function);
+        grad_fn->add_next_edge(get_grad_edge(y).function);
         out->grad_fn = grad_fn;
     }
 
@@ -1268,8 +1278,8 @@ inline std::shared_ptr<Tensor> concat(const std::shared_ptr<Tensor>& a,
 
     if (req_grad) {
         auto grad_fn = std::make_shared<ConcatBackward>(a->shape, b->shape, axis, r_a, c_a, r_b, c_b, r_out, c_out, batch_size);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
-        grad_fn->add_next_edge(get_grad_edge(b).function, 1);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
+        grad_fn->add_next_edge(get_grad_edge(b).function);
         out->grad_fn = grad_fn;
     }
 
@@ -1284,9 +1294,9 @@ inline std::shared_ptr<Tensor> concat(const std::shared_ptr<Tensor>& a,
 // --- CROSS ENTROPY BACKWARD NODE ---
 struct CrossEntropyBackward : public Node {
     std::shared_ptr<Tensor> pred, target;
-    int n;
-    CrossEntropyBackward(std::shared_ptr<Tensor> pred, std::shared_ptr<Tensor> target, int n)
-        : pred(pred), target(target), n(n) {}
+    int n, num_samples;
+    CrossEntropyBackward(std::shared_ptr<Tensor> pred, std::shared_ptr<Tensor> target, int n, int num_samples = 0)
+        : pred(pred), target(target), n(n), num_samples(num_samples > 0 ? num_samples : n) {}
 
     void release_variables() override {
         pred.reset();
@@ -1308,7 +1318,7 @@ struct CrossEntropyBackward : public Node {
         float g_val = sg_cpu->data_ptr<float>()[0];
 
         for (int i = 0; i < n; i++) {
-            gp_ptr[i] = -(t_ptr[i] / ((p_ptr[i] + 1e-8f) * n)) * g_val;
+            gp_ptr[i] = -(t_ptr[i] / ((p_ptr[i] + 1e-8f) * num_samples)) * g_val;
         }
         return {(dev == Device::CPU) ? grad_pred : grad_pred->to(dev)};
     }
@@ -1321,6 +1331,10 @@ inline std::shared_ptr<Tensor> cross_entropy(const std::shared_ptr<Tensor>& pred
     }
 
     int n = static_cast<int>(pred->size());
+    int V = pred->shape.empty() ? 1 : static_cast<int>(pred->shape.back());
+    int num_samples = (V > 0 && pred->ndim() >= 2) ? (n / V) : n;
+    if (num_samples <= 0) num_samples = 1;
+
     Device dev = pred->device;
     auto p_cpu = (dev == Device::CPU) ? pred : pred->cpu();
     auto t_cpu = (target->device == Device::CPU) ? target : target->cpu();
@@ -1334,13 +1348,13 @@ inline std::shared_ptr<Tensor> cross_entropy(const std::shared_ptr<Tensor>& pred
 
     bool req_grad = pred->requires_grad;
     auto out_cpu = std::make_shared<Tensor>(std::vector<int64_t>{1, 1}, Device::CPU, pred->dtype, false);
-    out_cpu->data_ptr<float>()[0] = sum_loss / n;
+    out_cpu->data_ptr<float>()[0] = sum_loss / static_cast<float>(num_samples);
     auto out = (dev == Device::CPU) ? out_cpu : out_cpu->to(dev);
     out->requires_grad = req_grad;
 
     if (req_grad) {
-        auto grad_fn = std::make_shared<CrossEntropyBackward>(pred, target, n);
-        grad_fn->add_next_edge(get_grad_edge(pred).function, 0);
+        auto grad_fn = std::make_shared<CrossEntropyBackward>(pred, target, n, num_samples);
+        grad_fn->add_next_edge(get_grad_edge(pred).function);
         out->grad_fn = grad_fn;
     }
 
@@ -1487,7 +1501,7 @@ inline std::shared_ptr<Tensor> fused_cross_entropy(
         auto grad_fn = std::make_shared<FusedCrossEntropyBackward>(
             logits, targets, probs, N, V, valid_count, ignore_index
         );
-        grad_fn->add_next_edge(get_grad_edge(logits).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(logits).function);
         out->grad_fn = grad_fn;
     }
 
@@ -1551,7 +1565,7 @@ inline std::shared_ptr<Tensor> mse(const std::shared_ptr<Tensor>& pred, const st
         out->storage->tpu_handle = TPUEngine::get().mse(pred->storage->tpu_handle, target->storage->tpu_handle, pred->shape, pred->dtype);
         if (req_grad) {
             auto grad_fn = std::make_shared<MseBackward>(pred, target, n);
-            grad_fn->add_next_edge(get_grad_edge(pred).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(pred).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -1577,7 +1591,7 @@ inline std::shared_ptr<Tensor> mse(const std::shared_ptr<Tensor>& pred, const st
 
     if (req_grad) {
         auto grad_fn = std::make_shared<MseBackward>(pred, target, n);
-        grad_fn->add_next_edge(get_grad_edge(pred).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(pred).function);
         out->grad_fn = grad_fn;
     }
 
@@ -1643,7 +1657,7 @@ inline std::shared_ptr<Tensor> l1_loss(const std::shared_ptr<Tensor>& pred, cons
         out->storage->tpu_handle = TPUEngine::get().l1_loss(pred->storage->tpu_handle, target->storage->tpu_handle, pred->shape, pred->dtype);
         if (req_grad) {
             auto grad_fn = std::make_shared<L1LossBackward>(pred, target, n);
-            grad_fn->add_next_edge(get_grad_edge(pred).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(pred).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -1668,7 +1682,7 @@ inline std::shared_ptr<Tensor> l1_loss(const std::shared_ptr<Tensor>& pred, cons
 
     if (req_grad) {
         auto grad_fn = std::make_shared<L1LossBackward>(pred, target, n);
-        grad_fn->add_next_edge(get_grad_edge(pred).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(pred).function);
         out->grad_fn = grad_fn;
     }
 
@@ -1756,7 +1770,7 @@ inline std::shared_ptr<Tensor> bool_mask(const std::shared_ptr<Tensor>& a, const
 
     if (req_grad) {
         auto grad_fn = std::make_shared<BoolMaskBackward>(m, r, c, batch_size);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -1822,7 +1836,7 @@ inline std::shared_ptr<Tensor> causal_mask(const std::shared_ptr<Tensor>& a) {
         cuda::causal_mask(a->data_ptr<float>(), out->data_ptr<float>(), batch_size, r);
         if (req_grad) {
             auto grad_fn = std::make_shared<CausalMaskBackward>(r, c, batch_size);
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -1832,7 +1846,7 @@ inline std::shared_ptr<Tensor> causal_mask(const std::shared_ptr<Tensor>& a) {
         MetalBackend::get().causal_mask(a->data_ptr<float>(), out->data_ptr<float>(), batch_size, r);
         if (req_grad) {
             auto grad_fn = std::make_shared<CausalMaskBackward>(r, c, batch_size);
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -1860,7 +1874,7 @@ inline std::shared_ptr<Tensor> causal_mask(const std::shared_ptr<Tensor>& a) {
 
     if (req_grad) {
         auto grad_fn = std::make_shared<CausalMaskBackward>(r, c, batch_size);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -1987,7 +2001,7 @@ inline std::shared_ptr<Tensor> mean(const std::shared_ptr<Tensor>& a, int axis) 
 
     if (req_grad) {
         auto grad_fn = std::make_shared<MeanBackward>(a->shape, a->strides, axis, r, c, batch_size, ndim, nout);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -2023,7 +2037,7 @@ inline std::shared_ptr<Tensor> add_scalar(const std::shared_ptr<Tensor>& a, floa
 
     if (req_grad) {
         auto grad_fn = std::make_shared<AddScalarBackward>();
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -2056,7 +2070,7 @@ inline std::shared_ptr<Tensor> sub_scalar(const std::shared_ptr<Tensor>& a, floa
 
     if (req_grad) {
         auto grad_fn = std::make_shared<SubScalarBackward>();
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -2104,7 +2118,7 @@ inline std::shared_ptr<Tensor> mul_scalar(const std::shared_ptr<Tensor>& a, floa
 
     if (req_grad) {
         auto grad_fn = std::make_shared<MulScalarBackward>(s);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -2152,7 +2166,7 @@ inline std::shared_ptr<Tensor> div_scalar(const std::shared_ptr<Tensor>& a, floa
 
     if (req_grad) {
         auto grad_fn = std::make_shared<DivScalarBackward>(s);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -2201,7 +2215,7 @@ inline std::shared_ptr<Tensor> rsub_scalar(float s, const std::shared_ptr<Tensor
 
     if (req_grad) {
         auto grad_fn = std::make_shared<RsubScalarBackward>();
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -2257,7 +2271,7 @@ inline std::shared_ptr<Tensor> rdiv_scalar(float s, const std::shared_ptr<Tensor
 
     if (req_grad) {
         auto grad_fn = std::make_shared<RdivScalarBackward>(a, s);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -2316,7 +2330,7 @@ inline std::shared_ptr<Tensor> slice(const std::shared_ptr<Tensor>& x, int dim, 
 
     if (x->requires_grad) {
         auto grad_fn = std::make_shared<SliceBackward>(x, dim, start, end);
-        grad_fn->add_next_edge(get_grad_edge(x).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(x).function);
         out->grad_fn = grad_fn;
     }
 
@@ -2399,7 +2413,7 @@ inline std::shared_ptr<Tensor> softmax(const std::shared_ptr<Tensor>& a, int axi
         cuda::softmax_forward(a->data_ptr<float>(), out->data_ptr<float>(), batch_size * r, c);
         if (req_grad) {
             auto grad_fn = std::make_shared<SoftmaxBackward>(out, r, c, batch_size, ndim);
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
         return out;
@@ -2412,7 +2426,7 @@ inline std::shared_ptr<Tensor> softmax(const std::shared_ptr<Tensor>& a, int axi
         auto out_res = out_cpu->to(a->device);
         if (req_grad) {
             auto grad_fn = std::make_shared<SoftmaxBackward>(out_res, r, c, batch_size, ndim);
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
             out_res->grad_fn = grad_fn;
         }
         return out_res;
@@ -2440,7 +2454,7 @@ inline std::shared_ptr<Tensor> softmax(const std::shared_ptr<Tensor>& a, int axi
 
     if (req_grad) {
         auto grad_fn = std::make_shared<SoftmaxBackward>(out, r, c, batch_size, ndim);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
     return out;
@@ -2548,7 +2562,7 @@ inline std::shared_ptr<Tensor> std_dev(const std::shared_ptr<Tensor>& a, int axi
         auto out_res = out_cpu->to(a->device);
         if (req_grad) {
             auto grad_fn = std::make_shared<StdDevBackward>(a, axis, r, c, batch_size);
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
             out_res->grad_fn = grad_fn;
         }
         return out_res;
@@ -2594,7 +2608,7 @@ inline std::shared_ptr<Tensor> std_dev(const std::shared_ptr<Tensor>& a, int axi
 
     if (req_grad) {
         auto grad_fn = std::make_shared<StdDevBackward>(a, axis, r, c, batch_size);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -2680,7 +2694,7 @@ inline std::shared_ptr<Tensor> sum(const std::shared_ptr<Tensor>& a, int axis) {
         auto out_res = out_cpu->to(a->device);
         if (req_grad) {
             auto grad_fn = std::make_shared<SumBackward>(a->shape, axis, r, c, batch_size, ndim);
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
             out_res->grad_fn = grad_fn;
         }
         return out_res;
@@ -2717,7 +2731,7 @@ inline std::shared_ptr<Tensor> sum(const std::shared_ptr<Tensor>& a, int axis) {
 
     if (req_grad) {
         auto grad_fn = std::make_shared<SumBackward>(a->shape, axis, r, c, batch_size, ndim);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -2762,7 +2776,7 @@ inline std::shared_ptr<Tensor> transpose(const std::shared_ptr<Tensor>& a, int d
 
     if (a->requires_grad) {
         auto grad_fn = std::make_shared<TransposeBackward>(d0, d1);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -2861,7 +2875,7 @@ inline std::shared_ptr<Tensor> var(const std::shared_ptr<Tensor>& a, int axis) {
         auto out_res = out_cpu->to(a->device);
         if (req_grad) {
             auto grad_fn = std::make_shared<VarBackward>(a, axis, r, c, batch_size);
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
             out_res->grad_fn = grad_fn;
         }
         return out_res;
@@ -2907,7 +2921,7 @@ inline std::shared_ptr<Tensor> var(const std::shared_ptr<Tensor>& a, int axis) {
 
     if (req_grad) {
         auto grad_fn = std::make_shared<VarBackward>(a, axis, r, c, batch_size);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -2937,7 +2951,7 @@ inline std::shared_ptr<Tensor> view(const std::shared_ptr<Tensor>& a, const std:
 
     if (a->requires_grad) {
         auto grad_fn = std::make_shared<ViewBackward>(a->shape);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -2950,7 +2964,7 @@ inline std::shared_ptr<Tensor> reshape(const std::shared_ptr<Tensor>& a, const s
 
     if (a->requires_grad) {
         auto grad_fn = std::make_shared<ViewBackward>(a->shape);
-        grad_fn->add_next_edge(get_grad_edge(a).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
 
@@ -3073,7 +3087,7 @@ inline std::shared_ptr<Tensor> im2col(const std::shared_ptr<Tensor>& x, int kH, 
         auto out_res = out_cpu->to(x->device);
         if (x->requires_grad) {
             auto grad_fn = std::make_shared<Im2ColBackward>(x, kH, kW, padH, padW, strideH, strideW);
-            grad_fn->add_next_edge(get_grad_edge(x).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(x).function);
             out_res->grad_fn = grad_fn;
         }
         return out_res;
@@ -3102,7 +3116,7 @@ inline std::shared_ptr<Tensor> im2col(const std::shared_ptr<Tensor>& x, int kH, 
 
     if (xc->requires_grad) {
         auto grad_fn = std::make_shared<Im2ColBackward>(xc, kH, kW, padH, padW, strideH, strideW);
-        grad_fn->add_next_edge(get_grad_edge(xc).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(xc).function);
         out->grad_fn = grad_fn;
     }
     
@@ -3291,8 +3305,8 @@ inline std::shared_ptr<Tensor> manual_matmul(const std::shared_ptr<Tensor>& _a, 
                 _a, _b, r1, c1, r2, c2, batch_size, n1, n2, nout, nout_batch,
                 strides_a_broad, strides_b_broad, out_shape
             );
-            grad_fn->add_next_edge(get_grad_edge(_a).function, 0);
-            grad_fn->add_next_edge(get_grad_edge(_b).function, 1);
+            grad_fn->add_next_edge(get_grad_edge(_a).function);
+            grad_fn->add_next_edge(get_grad_edge(_b).function);
             out_res->grad_fn = grad_fn;
         }
         return out_res;
@@ -3349,8 +3363,8 @@ cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
             a, b, r1, c1, r2, c2, batch_size, n1, n2, nout, nout_batch,
             strides_a_broad, strides_b_broad, out_shape
         );
-        grad_fn->add_next_edge(get_grad_edge(_a).function, 0);
-        grad_fn->add_next_edge(get_grad_edge(_b).function, 1);
+        grad_fn->add_next_edge(get_grad_edge(_a).function);
+        grad_fn->add_next_edge(get_grad_edge(_b).function);
         out->grad_fn = grad_fn;
     }
 
@@ -3391,8 +3405,8 @@ inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const st
                 a, b, r1, c1, r2, c2, batch_size, n1, n2, nout, nout_batch,
                 strides_a_broad, strides_b_broad, out->shape
             );
-            grad_fn->add_next_edge(get_grad_edge(a).function, 0);
-            grad_fn->add_next_edge(get_grad_edge(b).function, 1);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
+            grad_fn->add_next_edge(get_grad_edge(b).function);
             out->grad_fn = grad_fn;
         }
         return out;

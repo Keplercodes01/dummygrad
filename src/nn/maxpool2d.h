@@ -70,7 +70,7 @@ inline std::shared_ptr<Tensor> max_pool2d(const std::shared_ptr<Tensor>& x, int 
         if (xc->requires_grad) {
             auto grad_fn_cpu = std::static_pointer_cast<MaxPool2dBackward>(out_cpu->grad_fn);
             auto grad_fn = std::make_shared<MaxPool2dBackward>(xc, grad_fn_cpu->indices->to(xc->device));
-            grad_fn->add_next_edge(get_grad_edge(xc).function, 0);
+            grad_fn->add_next_edge(get_grad_edge(xc).function);
             out_res->grad_fn = grad_fn;
         }
         return out_res;
@@ -114,7 +114,7 @@ inline std::shared_ptr<Tensor> max_pool2d(const std::shared_ptr<Tensor>& x, int 
 
     if (xc->requires_grad) {
         auto grad_fn = std::make_shared<MaxPool2dBackward>(xc, indices);
-        grad_fn->add_next_edge(get_grad_edge(xc).function, 0);
+        grad_fn->add_next_edge(get_grad_edge(xc).function);
         out->grad_fn = grad_fn;
     }
     

@@ -11,3 +11,24 @@ Storage::Storage(size_t total_elements, Device d, DType type)
 Storage::~Storage() {
     if(data) free_memory(device, data, total_bytes);
 }
+
+Storage::Storage(Storage&& other) noexcept
+    : data(other.data), device(other.device), dtype(other.dtype),
+      total_bytes(other.total_bytes), tpu_handle(std::move(other.tpu_handle)) {
+    other.data = nullptr;
+    other.total_bytes = 0;
+}
+
+Storage& Storage::operator=(Storage&& other) noexcept {
+    if (this != &other) {
+        if (data) free_memory(device, data, total_bytes);
+        data = other.data;
+        device = other.device;
+        dtype = other.dtype;
+        total_bytes = other.total_bytes;
+        tpu_handle = std::move(other.tpu_handle);
+        other.data = nullptr;
+        other.total_bytes = 0;
+    }
+    return *this;
+}

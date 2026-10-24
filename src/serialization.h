@@ -167,42 +167,67 @@ inline std::vector<SafeTensorEntry> parse_safetensors_header(const std::string& 
         entry.name = key;
 
         // Parse dtype
-        size_t dt_pos = entry_str.find("\"dtype\":");
+        size_t dt_pos = entry_str.find("\"dtype\"");
         if (dt_pos != std::string::npos) {
-            size_t v_start = entry_str.find('"', dt_pos + 8);
-            size_t v_end = entry_str.find('"', v_start + 1);
-            if (v_start != std::string::npos && v_end != std::string::npos) {
-                entry.dtype = safetensors_str_to_dtype(entry_str.substr(v_start + 1, v_end - v_start - 1));
+            size_t colon = entry_str.find(':', dt_pos + 7);
+            if (colon != std::string::npos) {
+                size_t v_start = entry_str.find('"', colon + 1);
+                if (v_start != std::string::npos) {
+                    size_t v_end = entry_str.find('"', v_start + 1);
+                    if (v_end != std::string::npos) {
+                        entry.dtype = safetensors_str_to_dtype(entry_str.substr(v_start + 1, v_end - v_start - 1));
+                    }
+                }
             }
         }
 
         // Parse shape array
-        size_t sh_pos = entry_str.find("\"shape\":[");
-        if (sh_pos != std::string::npos) {
-            size_t s_end = entry_str.find(']', sh_pos);
-            std::string s_str = entry_str.substr(sh_pos + 9, s_end - sh_pos - 9);
-            std::stringstream s_stream(s_str);
-            std::string num_str;
-            while (std::getline(s_stream, num_str, ',')) {
-                if (!num_str.empty()) {
-                    entry.shape.push_back(std::stoll(num_str));
+        size_t sh_key = entry_str.find("\"shape\"");
+        if (sh_key != std::string::npos) {
+            size_t sh_bracket = entry_str.find('[', sh_key);
+            if (sh_bracket != std::string::npos) {
+                size_t s_end = entry_str.find(']', sh_bracket);
+                if (s_end != std::string::npos) {
+                    std::string s_str = entry_str.substr(sh_bracket + 1, s_end - sh_bracket - 1);
+                    std::stringstream s_stream(s_str);
+                    std::string num_str;
+                    while (std::getline(s_stream, num_str, ',')) {
+                        size_t first = num_str.find_first_not_of(" \t\n\r");
+                        if (first != std::string::npos) {
+                            size_t last = num_str.find_last_not_of(" \t\n\r");
+                            entry.shape.push_back(std::stoll(num_str.substr(first, last - first + 1)));
+                        }
+                    }
                 }
             }
         }
 
         // Parse data_offsets
-        size_t off_pos = entry_str.find("\"data_offsets\":[");
-        if (off_pos != std::string::npos) {
-            size_t off_end = entry_str.find(']', off_pos);
-            std::string off_str = entry_str.substr(off_pos + 16, off_end - off_pos - 16);
-            size_t comma = off_str.find(',');
-            if (comma != std::string::npos) {
-                entry.offset_start = std::stoull(off_str.substr(0, comma));
-                entry.offset_end = std::stoull(off_str.substr(comma + 1));
+        size_t off_key = entry_str.find("\"data_offsets\"");
+        if (off_key != std::string::npos) {
+            size_t off_bracket = entry_str.find('[', off_key);
+            if (off_bracket != std::string::npos) {
+                size_t off_end = entry_str.find(']', off_bracket);
+                if (off_end != std::string::npos) {
+                    std::string off_str = entry_str.substr(off_bracket + 1, off_end - off_bracket - 1);
+                    size_t comma = off_str.find(',');
+                    if (comma != std::string::npos) {
+                        std::string s1 = off_str.substr(0, comma);
+                        std::string s2 = off_str.substr(comma + 1);
+                        size_t f1 = s1.find_first_not_of(" \t\n\r");
+                        size_t l1 = s1.find_last_not_of(" \t\n\r");
+                        size_t f2 = s2.find_first_not_of(" \t\n\r");
+                        size_t l2 = s2.find_last_not_of(" \t\n\r");
+                        if (f1 != std::string::npos && f2 != std::string::npos) {
+                            entry.offset_start = std::stoull(s1.substr(f1, l1 - f1 + 1));
+                            entry.offset_end = std::stoull(s2.substr(f2, l2 - f2 + 1));
+                        }
+                    }
+                }
             }
         }
 
-        if (!entry.name.empty() && !entry.shape.empty()) {
+        if (!entry.name.empty()) {
             entries.push_back(entry);
         }
     }

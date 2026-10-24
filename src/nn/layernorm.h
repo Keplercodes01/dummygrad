@@ -125,13 +125,14 @@ public:
         }
         int r = (ndim >= 2) ? x->shape[ndim - 2] : 1;
         int batch_size = x->size() / (r * c);
+        bool req_grad = (x && x->requires_grad) || (gamma && gamma->requires_grad) || (beta && beta->requires_grad);
 
 #ifdef USE_CUDA
         if (x->device == Device::CUDA) {
             if (gamma->device != Device::CUDA) gamma = gamma->to(Device::CUDA);
             if (beta->device != Device::CUDA) beta = beta->to(Device::CUDA);
 
-            auto out = std::make_shared<Tensor>(x->shape, x->device, x->dtype, x->requires_grad);
+            auto out = std::make_shared<Tensor>(x->shape, x->device, x->dtype, req_grad);
             auto inv_std = std::make_shared<Tensor>(std::vector<int64_t>{batch_size * r}, x->device, x->dtype, false);
             auto mean = std::make_shared<Tensor>(std::vector<int64_t>{batch_size * r}, x->device, x->dtype, false);
             auto xmu = std::make_shared<Tensor>(x->shape, x->device, x->dtype, false);
@@ -140,11 +141,11 @@ public:
                                     out->data_ptr<float>(), mean->data_ptr<float>(), inv_std->data_ptr<float>(),
                                     batch_size * r, c, eps);
 
-            if (x->requires_grad) {
+            if (req_grad) {
                 auto grad_fn = std::make_shared<FusedLayerNormBackward>(x, gamma, inv_std, mean, xmu, r, c, batch_size);
-                grad_fn->add_next_edge(get_grad_edge(x).function, 0);
-                grad_fn->add_next_edge(get_grad_edge(gamma).function, 1);
-                grad_fn->add_next_edge(get_grad_edge(beta).function, 2);
+                grad_fn->add_next_edge(get_grad_edge(x).function);
+                grad_fn->add_next_edge(get_grad_edge(gamma).function);
+                grad_fn->add_next_edge(get_grad_edge(beta).function);
                 out->grad_fn = grad_fn;
             }
             return out;
@@ -155,12 +156,15 @@ public:
             auto x_cpu = x->to(Device::CPU);
             auto gamma_cpu = gamma->to(Device::CPU);
             auto beta_cpu = beta->to(Device::CPU);
+            x_cpu->requires_grad = x->requires_grad;
+            gamma_cpu->requires_grad = gamma->requires_grad;
+            beta_cpu->requires_grad = beta->requires_grad;
             LayerNorm ln_cpu(gamma->shape[0], eps);
             ln_cpu.gamma = gamma_cpu;
             ln_cpu.beta = beta_cpu;
             auto out_cpu = ln_cpu.forward(x_cpu);
             auto out_res = out_cpu->to(x->device);
-            if (x->requires_grad) {
+            if (req_grad && out_cpu->grad_fn) {
                 auto grad_fn = std::make_shared<FusedLayerNormBackward>(
                     x, gamma,
                     std::static_pointer_cast<FusedLayerNormBackward>(out_cpu->grad_fn)->inv_std->to(x->device),
@@ -168,15 +172,15 @@ public:
                     std::static_pointer_cast<FusedLayerNormBackward>(out_cpu->grad_fn)->xmu->to(x->device),
                     r, c, batch_size
                 );
-                grad_fn->add_next_edge(get_grad_edge(x).function, 0);
-                grad_fn->add_next_edge(get_grad_edge(gamma).function, 1);
-                grad_fn->add_next_edge(get_grad_edge(beta).function, 2);
+                grad_fn->add_next_edge(get_grad_edge(x).function);
+                grad_fn->add_next_edge(get_grad_edge(gamma).function);
+                grad_fn->add_next_edge(get_grad_edge(beta).function);
                 out_res->grad_fn = grad_fn;
             }
             return out_res;
         }
 
-        auto out = std::make_shared<Tensor>(x->shape, x->device, x->dtype, x->requires_grad);
+        auto out = std::make_shared<Tensor>(x->shape, x->device, x->dtype, req_grad);
         auto inv_std = std::make_shared<Tensor>(std::vector<int64_t>{batch_size * r}, x->device, x->dtype, false);
         auto mean = std::make_shared<Tensor>(std::vector<int64_t>{batch_size * r}, x->device, x->dtype, false);
         auto xmu = std::make_shared<Tensor>(x->shape, x->device, x->dtype, false);
@@ -215,11 +219,11 @@ public:
             }
         }
 
-        if (x->requires_grad) {
+        if (req_grad) {
             auto grad_fn = std::make_shared<FusedLayerNormBackward>(x, gamma, inv_std, mean, xmu, r, c, batch_size);
-            grad_fn->add_next_edge(get_grad_edge(x).function, 0);
-            grad_fn->add_next_edge(get_grad_edge(gamma).function, 1);
-            grad_fn->add_next_edge(get_grad_edge(beta).function, 2);
+            grad_fn->add_next_edge(get_grad_edge(x).function);
+            grad_fn->add_next_edge(get_grad_edge(gamma).function);
+            grad_fn->add_next_edge(get_grad_edge(beta).function);
             out->grad_fn = grad_fn;
         }
 

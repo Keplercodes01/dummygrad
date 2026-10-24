@@ -33,19 +33,23 @@ public:
 
     template<typename T = float>
     T* data_ptr() {
+        if (!storage || !storage->data) return nullptr;
+        char* base = static_cast<char*>(storage->data) + global_offset * dtype_size(dtype);
         if constexpr (std::is_void_v<T>) {
-            return static_cast<char*>(storage->data) + global_offset * dtype_size(dtype);
+            return base;
         } else {
-            return static_cast<T*>(storage->data) + global_offset;
+            return reinterpret_cast<T*>(base);
         }
     }
 
     template<typename T = float>
     const T* data_ptr() const {
+        if (!storage || !storage->data) return nullptr;
+        const char* base = static_cast<const char*>(storage->data) + global_offset * dtype_size(dtype);
         if constexpr (std::is_void_v<T>) {
-            return static_cast<const char*>(storage->data) + global_offset * dtype_size(dtype);
+            return base;
         } else {
-            return static_cast<const T*>(storage->data) + global_offset;
+            return reinterpret_cast<const T*>(base);
         }
     }
     template<typename T> T data_at(int64_t i) const {
