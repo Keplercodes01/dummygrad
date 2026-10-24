@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(dummygrad LANGUAGES CXX)
+project(dummygrad VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -60,6 +60,7 @@ target_include_directories(dummygrad_engine PUBLIC
     src/models
 )
 target_link_libraries(dummygrad_engine PRIVATE ${CMAKE_DL_LIBS})
+target_compile_definitions(dummygrad_engine PUBLIC DUMMYGRAD_VERSION="${PROJECT_VERSION}")
 
 # The autograd engine runs backward on a worker thread pool
 find_package(Threads REQUIRED)

@@ -10,6 +10,22 @@ No Python. No bindings. No GIL. No multi-layer dispatcher overhead. Just raw, fr
 
 ---
 
+## What's New in v0.2.0
+
+The correctness release. Highlights below; full details in [CHANGELOG.md](CHANGELOG.md).
+
+- **Correct CUDA training.** Strided copies on the GPU now honor strides (transposed tensors, including the tied LM head, were wrong), softmax and LayerNorm reduce across the whole block for rows wider than 32, and flash-attention backward always produces correct weight gradients.
+- **Correct attention everywhere.** Grouped-query attention no longer reads scrambled K/V heads, and strided gradients flowing through RoPE and tied embeddings are handled on every backend.
+- **A safer autograd engine.** No more gradient corruption in residual connections, and no use-after-free races in the multithreaded backward pass — including when a backward node throws.
+- **Multi-GPU fixes.** Backward runs on each replica's own GPU, and the CUDA caching allocator keeps a separate pool per device.
+- **CUDA RoPE kernels** and FP16/BF16-safe strided copies.
+- **A real test suite.** `test_engine` checks every op and layer against finite differences, compares CUDA with CPU, stress-tests the engine, and trains a small transformer end to end.
+- **One-click Colab.** Build, test and train on a free GPU from [`notebooks/dummygrad_colab.ipynb`](notebooks/dummygrad_colab.ipynb).
+
+> **Upgrading from 0.1:** checkpoints still load, but models using CUDA, grouped-query attention or tied embeddings were trained with incorrect activations or gradients — retrain rather than fine-tune.
+
+---
+
 ## Architecture & Performance Highlights
 
 ```
@@ -20,7 +36,7 @@ No Python. No bindings. No GIL. No multi-layer dispatcher overhead. Just raw, fr
 ├────────────────────────────────────────────────────────┤
 │  Memory: Static Arena (0 ns) + CUDACachingAllocator    │
 ├────────────────────────────────────────────────────────┤
-│  Attention: Tiled FlashAttention (Fwd + Bwd, O(N) Mem) │
+│  Attention: Fused FlashAttention (Fwd + Bwd, O(N) Mem) │
 ├────────────────────────────────────────────────────────┤
 │  Compute: cuBLAS Tensor Cores (TF32 / FP16 / BF16)     │
 ├────────────────────────────────────────────────────────┤
@@ -31,8 +47,8 @@ No Python. No bindings. No GIL. No multi-layer dispatcher overhead. Just raw, fr
 ```
 
 - **Zero-Overhead Dispatch**: Pure C++ inline execution drops op launch overhead from PyTorch's $\sim 3\text{ }\mu\text{s}$ down to sub-$100\text{ ns}$.
-- **Hardware Tensor Cores (cuBLAS)**: Full hardware saturation across `Float32` (with TF32 Tensor Cores), `Float16`, and `BFloat16` using thread-safe per-device cuBLAS handles and row-major transpose identities.
-- **Tiled FlashAttention**: Custom CUDA forward and backward attention kernels using online softmax, scaling to head dimensions up to 512 in strictly $O(N)$ memory.
+- **Hardware Tensor Cores (cuBLAS)**: Matrix multiplies in `Float32` (with TF32 Tensor Cores), `Float16`, and `BFloat16` using thread-safe per-device cuBLAS handles and row-major transpose identities.
+- **FlashAttention**: Custom CUDA forward and backward attention kernels using online softmax, scaling to head dimensions up to 512 in strictly $O(N)$ memory.
 - **Single-Pass Fused Kernels**:
   - **LayerNorm**: Parallel reductions for row mean and variance; fused affine scaling and backward passes.
   - **AdamW**: Updates parameters, gradients, momentum $m$, and variance $v$ in a single memory pass with Rule-of-5 resource safety.
@@ -153,15 +169,19 @@ int main() {
     int num_gpus = 4;
 
     // Spin up model replicas across all GPUs in a single native C++ process
+    // The factory runs with `rank` already selected as the current CUDA device
     MultiGPURunner<ModernTransformer> runner(num_gpus, [](int rank) {
-        return ModernTransformer(32000, 2048, 512, 8, 4, 2);
+        ModernTransformer model(32000, 2048, 512, 8, 4, 2);
+        model.cuda();
+        return model;
     });
 
     // Execute parallel steps with peer gradient synchronization
     runner.parallel_step([](int rank, ModernTransformer& model) {
-        // Each worker executes on its designated CUDA device rank
-        auto inputs = std::make_shared<Tensor>(std::vector<int64_t>{2, 32}, Device::CUDA, DType::Float32, false);
-        auto targets = std::make_shared<Tensor>(std::vector<int64_t>{2, 32}, Device::CUDA, DType::Float32, false);
+        // Each worker executes on its designated CUDA device rank.
+        // Token ids are stored as floats; load this rank's shard of the batch here.
+        auto inputs  = zeros({2, 32}, Device::CUDA);
+        auto targets = ones({2, 32}, Device::CUDA);
 
         auto logits = model.forward(inputs);
         auto loss = fused_cross_entropy(logits, targets);
@@ -331,12 +351,27 @@ auto prefix_scores = masking::prefix_causal_mask(scores, 256);
 
 // 3. ALiBi Positional Bias
 auto alibi = masking::alibi_bias(12, 1024); // [1, 12, 1024, 1024]
-auto logits = model.forward(input_ids, nullptr, alibi);
+auto logits = gpt.forward(input_ids, /*pos_ids=*/nullptr, /*mask=*/alibi); // GPT takes an additive mask
 
 // 4. Sequence Packing / Sample Multiplexing (LLaMA 3 block-diagonal mask)
 auto doc_mask = masking::document_causal_mask(doc_ids);
-auto out = model.forward(input_ids, nullptr, doc_mask);
+auto out = gpt.forward(input_ids, /*pos_ids=*/nullptr, /*mask=*/doc_mask);
 ```
+
+---
+
+## Status & Known Limitations
+
+dummygrad is pre-1.0: the core training path (CPU and CUDA, FP32) is covered by `test_engine`; other paths are less exercised.
+
+- **Strided inputs in forward ops.** Most forward kernels assume contiguous inputs. `matmul`, `reshape` and the attention layers densify their inputs, but e.g. `relu(transpose(x))` does not — call `make_contiguous` after a `transpose` you feed into elementwise or reduction ops.
+- **Half precision on CUDA.** FP16/BF16 are supported by `matmul` and data movement; elementwise, normalization and attention kernels are FP32.
+- **Flash attention** is limited to head dimensions ≤ 512 and computes one query row per block (not yet tiled).
+- **Embeddings** are computed as a one-hot matmul, which costs `O(tokens × vocab × d_model)`.
+- **Multi-GPU gradient aggregation** currently reduces through host memory.
+- **Metal and TPU backends** are not covered by the test suite.
+
+Bug reports with a failing `test_engine` case are the fastest way to get something fixed.
 
 ---
 

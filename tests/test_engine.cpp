@@ -556,7 +556,11 @@ int main() {
     manual_seed(0);
     Results r;
     bool has_cuda = cuda_available();
-    std::cout << "dummygrad test suite (CUDA " << (has_cuda ? "available" : "not available") << ")\n\n";
+#ifndef DUMMYGRAD_VERSION
+#define DUMMYGRAD_VERSION "dev"
+#endif
+    std::cout << "dummygrad " << DUMMYGRAD_VERSION << " test suite (CUDA "
+              << (has_cuda ? "available" : "not available") << ")\n\n";
 
     auto tests = build_grad_tests();
     std::vector<std::vector<float>> probes;
