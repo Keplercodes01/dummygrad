@@ -1,10 +1,11 @@
 #pragma once
 #include "tensor.h"
 #include "functional.h"
+#include "module.h"
 #include "init.h"
 
 // Token / Positional Embedding Layer
-class Embedding {
+class Embedding : public Module {
 public:
     std::shared_ptr<Tensor> weight;
     int num_embeddings;
@@ -33,12 +34,5 @@ public:
         return out;
     }
 
-    std::vector<std::shared_ptr<Tensor>> parameters() const {
-        return {weight};
-    }
-
-    void to(Device device, DType dtype = DType::Float32) {
-        weight = weight->to(device, dtype);
-        weight->requires_grad = true;
-    }
+    void visit(ModuleVisitor& v) override { v.parameter("weight", weight); }
 };

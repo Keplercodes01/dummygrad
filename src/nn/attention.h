@@ -41,7 +41,7 @@ struct FlashAttentionBackward : public Node {
 #endif
 
 // Single-Head Self-Attention
-class SelfAttention {
+class SelfAttention : public Module {
 public:    
     Linear W_q;
     Linear W_k;
@@ -113,19 +113,10 @@ public:
         return out;
     }
 
-    std::vector<std::shared_ptr<Tensor>> parameters() const {
-        auto p = W_q.parameters();
-        auto pk = W_k.parameters();
-        auto pv = W_v.parameters();
-        p.insert(p.end(), pk.begin(), pk.end());
-        p.insert(p.end(), pv.begin(), pv.end());
-        return p;
-    }
-
-    void to(Device device, DType dtype = DType::Float32) {
-        W_q.to(device, dtype);
-        W_k.to(device, dtype);
-        W_v.to(device, dtype);
+    void visit(ModuleVisitor& v) override {
+        v.module("W_q", W_q);
+        v.module("W_k", W_k);
+        v.module("W_v", W_v);
     }
 };
 
@@ -187,7 +178,7 @@ struct GQARepeatBackward : public Node {
 };
 
 // Multi-Head Self-Attention (Supports MHA, GQA, and MQA)
-class MultiHeadAttention {
+class MultiHeadAttention : public Module {
 public:
     Linear W_q;
     Linear W_k;
@@ -348,21 +339,10 @@ public:
         return out;
     }
 
-    std::vector<std::shared_ptr<Tensor>> parameters() const {
-        auto p = W_q.parameters();
-        auto pk = W_k.parameters();
-        auto pv = W_v.parameters();
-        auto po = W_o.parameters();
-        p.insert(p.end(), pk.begin(), pk.end());
-        p.insert(p.end(), pv.begin(), pv.end());
-        p.insert(p.end(), po.begin(), po.end());
-        return p;
-    }
-
-    void to(Device device, DType dtype = DType::Float32) {
-        W_q.to(device, dtype);
-        W_k.to(device, dtype);
-        W_v.to(device, dtype);
-        W_o.to(device, dtype);
+    void visit(ModuleVisitor& v) override {
+        v.module("W_q", W_q);
+        v.module("W_k", W_k);
+        v.module("W_v", W_v);
+        v.module("W_o", W_o);
     }
 };

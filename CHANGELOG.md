@@ -10,6 +10,16 @@ All notable changes to dummygrad are documented here. Versions follow [Semantic 
 - **`DetectAnomalyGuard`** / `set_detect_anomaly`: backward throws at the first NaN/Inf gradient and names the backward function that produced it.
 - **`examples/custom_op.cpp`** and a README guide to writing your own ops: forward, backward `Node`, graph edges, and verification with `gradcheck`. Built and run by CTest.
 - `needs_grad(t)`: whether an op should record a graph edge for `t` (false inside `NoGradGuard`).
+- **`Module` base class** (`nn/module.h`): a module declares its parameters, buffers and children in `visit()`, and gets `parameters()`, `named_parameters()`, `state_dict()`, `to()`, `train()`/`eval()`, `requires_grad_()`, `zero_grad()`, `num_parameters()`, `save_safetensors()` and `load_safetensors()`. Every built-in layer and model is now a `Module`; their hand-written copies of these methods (about 380 lines) are gone. Checkpoint tensor names are unchanged.
+
+### Fixed
+- **`GPT` was not causal.** `TransformerBlock` passed `causal` into `MultiHeadAttention`'s `n_kv_heads` parameter, so every GPT layer attended to future tokens and used a single shared K/V head. GPT is now causal with full multi-head attention; GPT checkpoints from earlier versions have the wrong `W_k`/`W_v` shapes and will not load (and were trained on a model that could see the future).
+- `MARS::rollout` built a full autograd graph at every step and cleared `requires_grad` on the caller's seed tensor; it now runs under `NoGradGuard` and leaves its input untouched.
+
+### Changed
+- **Loading checkpoints is strict by default.** Missing, unexpected and wrong-shape tensors raise an error listing them, instead of being silently skipped (a renamed layer previously meant training from random initialization unnoticed). Pass `strict=false` to load a subset; shape mismatches always raise.
+- Loading copies values into the existing parameter tensors instead of swapping their storage, so tensor identity (and optimizer state attached to it) survives a load, and shapes are checked.
+- `to()` preserves `requires_grad`, so frozen parameters stay frozen; previously every move re-enabled gradients. Tied tensors stay tied across moves.
 
 ## [0.3.0] - 2026-10-24
 

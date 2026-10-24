@@ -35,7 +35,7 @@ struct MARSConfig {
     bool causal = true;      // Causal masking for strictly autoregressive prediction
 };
 
-class MARS {
+class MARS : public Module {
 public:
     MARSConfig config;
 
@@ -203,6 +203,9 @@ public:
         if (!seed_frames) throw std::runtime_error("rollout: null seed_frames");
         if (n_steps <= 0) return seed_frames;
 
+        // Rollout is inference: record no graph, and never touch the caller's seed tensor
+        NoGradGuard no_grad;
+
         bool is_2d = (seed_frames->ndim() == 2);
         auto current_traj = is_2d ? reshape(seed_frames, {1, seed_frames->shape[0], seed_frames->shape[1]}) : seed_frames;
 
@@ -221,12 +224,6 @@ public:
             // Slice out the final predicted frame: [B, 1, action_dim]
             auto next_frame = slice(preds, 1, T_in - 1, T_in);
 
-            // Detach to prevent autograd graph accumulation and memory explosion during rollout
-            next_frame->requires_grad = false;
-            next_frame->grad_fn = nullptr;
-            current_traj->requires_grad = false;
-            current_traj->grad_fn = nullptr;
-
             // Concatenate along the temporal sequence dimension (axis 0 in concat for 3D tensors)
             current_traj = concat(current_traj, next_frame, 0);
         }
@@ -238,107 +235,11 @@ public:
         return current_traj;
     }
 
-    // Parameter collection for optimizers
-    std::vector<std::shared_ptr<Tensor>> parameters() const {
-        std::vector<std::shared_ptr<Tensor>> params;
-
-        auto enc_p = action_encoder.parameters();
-        params.insert(params.end(), enc_p.begin(), enc_p.end());
-
-        auto pos_p = pos_emb.parameters();
-        params.insert(params.end(), pos_p.begin(), pos_p.end());
-
-        for (const auto& block : blocks) {
-            auto bp = block->parameters();
-            params.insert(params.end(), bp.begin(), bp.end());
-        }
-
-        auto lnp = ln_f.parameters();
-        params.insert(params.end(), lnp.begin(), lnp.end());
-
-        auto head_p = action_head.parameters();
-        params.insert(params.end(), head_p.begin(), head_p.end());
-
-        return params;
+    void visit(ModuleVisitor& v) override {
+        v.module("action_encoder", action_encoder);
+        v.module("pos_emb", pos_emb);
+        for (size_t i = 0; i < blocks.size(); ++i) v.module("blocks." + std::to_string(i), *blocks[i]);
+        v.module("ln_f", ln_f);
+        v.module("action_head", action_head);
     }
-
-    // Named parameters for zero-copy SafeTensors export & PyTorch state_dict interoperability
-    std::unordered_map<std::string, std::shared_ptr<Tensor>> named_parameters() const {
-        std::unordered_map<std::string, std::shared_ptr<Tensor>> named;
-
-        named["action_encoder.weight"] = action_encoder.W;
-        named["action_encoder.bias"] = action_encoder.b;
-
-        named["pos_emb.weight"] = pos_emb.weight;
-
-        for (size_t i = 0; i < blocks.size(); i++) {
-            std::string prefix = "blocks." + std::to_string(i) + ".";
-            named[prefix + "ln1.gamma"] = blocks[i]->ln1.gamma;
-            named[prefix + "ln1.beta"] = blocks[i]->ln1.beta;
-
-            named[prefix + "attn.W_q.weight"] = blocks[i]->attn.W_q.W;
-            named[prefix + "attn.W_q.bias"] = blocks[i]->attn.W_q.b;
-            named[prefix + "attn.W_k.weight"] = blocks[i]->attn.W_k.W;
-            named[prefix + "attn.W_k.bias"] = blocks[i]->attn.W_k.b;
-            named[prefix + "attn.W_v.weight"] = blocks[i]->attn.W_v.W;
-            named[prefix + "attn.W_v.bias"] = blocks[i]->attn.W_v.b;
-            named[prefix + "attn.W_o.weight"] = blocks[i]->attn.W_o.W;
-            named[prefix + "attn.W_o.bias"] = blocks[i]->attn.W_o.b;
-
-            named[prefix + "ln2.gamma"] = blocks[i]->ln2.gamma;
-            named[prefix + "ln2.beta"] = blocks[i]->ln2.beta;
-
-            named[prefix + "ffn.fc1.weight"] = blocks[i]->ffn.fc1.W;
-            named[prefix + "ffn.fc1.bias"] = blocks[i]->ffn.fc1.b;
-            named[prefix + "ffn.fc2.weight"] = blocks[i]->ffn.fc2.W;
-            named[prefix + "ffn.fc2.bias"] = blocks[i]->ffn.fc2.b;
-        }
-
-        named["ln_f.gamma"] = ln_f.gamma;
-        named["ln_f.beta"] = ln_f.beta;
-
-        named["action_head.weight"] = action_head.W;
-        named["action_head.bias"] = action_head.b;
-
-        return named;
-    }
-
-    // Save model weights directly to Hugging Face SafeTensors
-    void save_safetensors(const std::string& filepath) const {
-        io::save_safetensors(filepath, named_parameters());
-    }
-
-    // Load model weights directly from SafeTensors checkpoint
-    void load_safetensors(const std::string& filepath) {
-        auto loaded = io::load_safetensors(filepath, action_encoder.W->device);
-        auto named = named_parameters();
-        for (const auto& [name, src_tensor] : loaded) {
-            auto it = named.find(name);
-            if (it != named.end() && it->second && src_tensor) {
-                auto dst_tensor = it->second;
-                if (dst_tensor->size() == src_tensor->size()) {
-                    auto converted = (src_tensor->device != dst_tensor->device || src_tensor->dtype != dst_tensor->dtype)
-                                     ? src_tensor->to(dst_tensor->device, dst_tensor->dtype) : src_tensor;
-                    dst_tensor->storage = converted->storage;
-                    dst_tensor->strides = converted->strides;
-                    dst_tensor->global_offset = converted->global_offset;
-                }
-            }
-        }
-    }
-
-    // Transfer all model parameters to target device (CPU, CUDA, MPS, TPU)
-    void to(Device dev, DType dtype = DType::Float32) {
-        action_encoder.to(dev, dtype);
-        pos_emb.to(dev, dtype);
-        for (auto& block : blocks) {
-            block->to(dev, dtype);
-        }
-        ln_f.to(dev, dtype);
-        action_head.to(dev, dtype);
-    }
-
-    void cuda() { to(Device::CUDA); }
-    void mps()  { to(Device::MPS); }
-    void cpu()  { to(Device::CPU); }
 };

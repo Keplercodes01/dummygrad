@@ -1,6 +1,7 @@
 #pragma once
 #include "tensor.h"
 #include "functional.h"
+#include "module.h"
 #include <cmath>
 
 
@@ -100,7 +101,7 @@ struct FusedLayerNormBackward : public Node {
     }
 };
 
-class LayerNorm {
+class LayerNorm : public Module {
 public:
     std::shared_ptr<Tensor> gamma;
     std::shared_ptr<Tensor> beta;
@@ -231,12 +232,8 @@ public:
         return out;
     }
 
-    std::vector<std::shared_ptr<Tensor>> parameters() const { return {gamma, beta}; }
-
-    void to(Device device, DType dtype = DType::Float32) {
-        gamma = gamma->to(device, dtype);
-        beta = beta->to(device, dtype);
-        gamma->requires_grad = true;
-        beta->requires_grad = true;
+    void visit(ModuleVisitor& v) override {
+        v.parameter("gamma", gamma);
+        v.parameter("beta", beta);
     }
 };
