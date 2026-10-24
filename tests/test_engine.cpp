@@ -247,6 +247,29 @@ static std::string parity_check(const GradTest& t, const std::vector<float>& pro
 // Gradient test catalogue
 // ---------------------------------------------------------------------------
 
+using UnaryFn = std::function<TensorPtr(const TensorPtr&)>;
+
+// Single-input ops exercised with strided (transposed) inputs, by both the gradient checks
+// and the forward-equivalence test.
+static std::vector<std::pair<std::string, UnaryFn>> strided_unary_ops() {
+    return {
+        {"relu", [](const TensorPtr& t) { return relu(t); }},
+        {"leaky_relu", [](const TensorPtr& t) { return leaky_relu(t, 0.1f); }},
+        {"tanh", [](const TensorPtr& t) { return tanh(t); }},
+        {"sigmoid", [](const TensorPtr& t) { return sigmoid(t); }},
+        {"gelu", [](const TensorPtr& t) { return gelu(t); }},
+        {"silu", [](const TensorPtr& t) { return silu(t); }},
+        {"softmax", [](const TensorPtr& t) { return softmax(t); }},
+        {"sum_last", [](const TensorPtr& t) { return sum(t, -1); }},
+        {"sum_rows", [](const TensorPtr& t) { return sum(t, -2); }},
+        {"mean_axis0", [](const TensorPtr& t) { return mean(t, 0); }},
+        {"mean_axis1", [](const TensorPtr& t) { return mean(t, 1); }},
+        {"var_axis1", [](const TensorPtr& t) { return var(t, 1); }},
+        {"std_dev_axis0", [](const TensorPtr& t) { return std_dev(t, 0); }},
+        {"scalar_ops", [](const TensorPtr& t) { return add_scalar(mul_scalar(t, 1.5f), 0.25f); }},
+    };
+}
+
 static std::vector<GradTest> build_grad_tests() {
     std::vector<GradTest> tests;
     auto add_test = [&](std::string name, std::vector<LeafSpec> leaves, ForwardFn fn) {
@@ -480,24 +503,7 @@ static std::vector<GradTest> build_grad_tests() {
     }
 
     // --- Strided inputs: every op must read transposed / sliced views correctly ---
-    using UnaryFn = std::function<TensorPtr(const TensorPtr&)>;
-    std::vector<std::pair<std::string, UnaryFn>> unary = {
-        {"relu", [](const TensorPtr& t) { return relu(t); }},
-        {"leaky_relu", [](const TensorPtr& t) { return leaky_relu(t, 0.1f); }},
-        {"tanh", [](const TensorPtr& t) { return tanh(t); }},
-        {"sigmoid", [](const TensorPtr& t) { return sigmoid(t); }},
-        {"gelu", [](const TensorPtr& t) { return gelu(t); }},
-        {"silu", [](const TensorPtr& t) { return silu(t); }},
-        {"softmax", [](const TensorPtr& t) { return softmax(t); }},
-        {"sum_last", [](const TensorPtr& t) { return sum(t, -1); }},
-        {"sum_rows", [](const TensorPtr& t) { return sum(t, -2); }},
-        {"mean_axis0", [](const TensorPtr& t) { return mean(t, 0); }},
-        {"mean_axis1", [](const TensorPtr& t) { return mean(t, 1); }},
-        {"var_axis1", [](const TensorPtr& t) { return var(t, 1); }},
-        {"std_dev_axis0", [](const TensorPtr& t) { return std_dev(t, 0); }},
-        {"scalar_ops", [](const TensorPtr& t) { return add_scalar(mul_scalar(t, 1.5f), 0.25f); }},
-    };
-    for (const auto& entry : unary) {
+    for (const auto& entry : strided_unary_ops()) {
         UnaryFn f = entry.second;
         add_test("strided/" + entry.first, {leaf({4, 3}, -1, 1, 0.1f)},
                  [f](const Leaves& L, Device) { return f(transpose(L[0], 0, 1)); });
@@ -570,6 +576,21 @@ static std::string expect_all(const TensorPtr& t, float expected, const std::str
 }
 
 static TensorPtr scalar_sum(const TensorPtr& t) { return sum(sum(t, -1), -2); }
+
+// A gradient check only proves backward matches forward; this checks the forward itself:
+// an op applied to a strided view must give exactly what it gives on a dense copy.
+static std::string strided_forward_matches_dense() {
+    auto x = upload(random_values(12, -1, 1, 0.1f), {4, 3}, Device::CPU, false);
+    auto view = transpose(x, 0, 1);
+    auto dense = make_contiguous(view);
+    for (const auto& entry : strided_unary_ops()) {
+        auto err = compare(download(entry.second(dense)), download(entry.second(view)), 1e-6f);
+        if (!err.empty()) return entry.first + ": " + err;
+    }
+    auto sliced = slice(upload(random_values(15, -1, 1), {3, 5}, Device::CPU, false), 1, 1, 4);
+    auto err = compare(download(relu(make_contiguous(sliced))), download(relu(sliced)), 1e-6f);
+    return err.empty() ? "" : "relu of slice: " + err;
+}
 
 static std::string engine_retain_graph() {
     auto x = upload({1, 2, 3, 4}, {2, 2}, Device::CPU, true);
@@ -740,6 +761,7 @@ int main() {
     }
 
     std::cout << "\n-- autograd engine\n";
+    run_case(r, "engine/strided_forward_matches_dense", strided_forward_matches_dense);
     run_case(r, "engine/retain_graph", engine_retain_graph);
     run_case(r, "engine/exception_propagates", engine_exception_propagates);
     run_case(r, "engine/concurrent_fanin", engine_concurrent_fanin);
