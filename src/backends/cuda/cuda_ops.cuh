@@ -96,6 +96,15 @@ namespace cuda {
     // Sum of squares over several device buffers, in double precision (for gradient clipping)
     double sum_of_squares(const std::vector<const float*>& buffers, const std::vector<int64_t>& sizes);
 
+    // ---- cuda_attention.cu: tiled attention (FlashAttention-style, deterministic backward) ----
+    // q, k, v, out, dout, dq, dk, dv are [batch * heads, seq_len, head_dim]; lse is [batch * heads, seq_len].
+    // Head dims 16/32/64/128 use the tiled kernels; others fall back to the untiled flash kernels.
+    void attention_forward(const float* q, const float* k, const float* v, float* out, float* lse,
+                           int batch, int heads, int seq_len, int head_dim, bool causal, float scale);
+    void attention_backward(const float* q, const float* k, const float* v, const float* out, const float* dout,
+                            const float* lse, float* dq, float* dk, float* dv,
+                            int batch, int heads, int seq_len, int head_dim, bool causal, float scale);
+
     // Rotary Position Embeddings (RoPE)
     void rope_forward(const float* in, const float* cos_freqs, const float* sin_freqs,
                       float* out, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos);

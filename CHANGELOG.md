@@ -10,6 +10,10 @@ All notable changes to dummygrad are documented here. Versions follow [Semantic 
 - CI compiles the CUDA backend (in NVIDIA's CUDA container) on every change, and smoke-runs the benchmark on CPU.
 - **GPU kernels for the ops that fell back to the CPU** (`cuda_core_ops.cu`): broadcast add/sub/mul/div forward and backward, scalar ops, RMSNorm, fused cross entropy, embedding lookup, GQA head repetition, and the gradient-norm reduction. A training step no longer copies activations or gradients between GPU and CPU. All reductions are deterministic (fixed-order partial sums, no atomics), so GPU results are reproducible too.
 
+- **Tiled attention kernels** (`cuda_attention.cu`): FlashAttention-style forward (K/V tiles in shared memory, online softmax, saved log-sum-exp) and a FlashAttention-2 backward split into a dK/dV pass and a dQ pass, for head dims 16, 32, 64 and 128. The previous kernel recomputed every dot product in every thread and accumulated dK/dV with one atomic per element per query-key pair; the new backward has no atomics and is deterministic. Other head dims keep the untiled kernels.
+- **Backward profiler:** `set_profiling(true)` times every backward node (serialized and synchronized for exact numbers) and `profile_report()` lists time and calls per op; `dg_bench --profile` prints the most expensive backward ops.
+- Matmul with a shared weight (e.g. every `Linear` on `[B, T, D]` input) runs as one GEMM over `[B*T, D]` in forward and backward instead of one GEMM per batch element.
+
 ### Changed
 - **Broadcasting follows NumPy rules** (shapes aligned from the right; each dimension 1 or equal). The previous rule mapped a smaller batch onto contiguous groups of a larger one, which applied `[1, H, S, S]` operands such as ALiBi biases to the wrong heads whenever the batch size was above 1. Incompatible shapes now raise an error instead of reading out of bounds.
 - The four broadcast ops and six scalar ops are each one implementation (`broadcast_binary`, `scalar_op`) instead of separate copies; `add`, `mul`, `cast_n_*`, `*_scalar`, `neg` are thin wrappers.

@@ -5,22 +5,21 @@
 #include "modern_layers.h"
 
 #ifdef USE_CUDA
+// Backward of the CUDA attention kernel; q, k, v, out are contiguous [batch, heads, seq, head_dim]
 struct FlashAttentionBackward : public Node {
-    std::shared_ptr<Tensor> q, k, v, out;
+    std::shared_ptr<Tensor> q, k, v, out, lse;
     int batch_size, num_heads, seq_len, d_k;
     bool causal;
     float scale;
 
-    FlashAttentionBackward(std::shared_ptr<Tensor> q, std::shared_ptr<Tensor> k,
-                           std::shared_ptr<Tensor> v, std::shared_ptr<Tensor> out,
-                           int batch_size, int num_heads, int seq_len, int d_k,
-                           bool causal, float scale)
-        : q(q), k(k), v(v), out(out),
-          batch_size(batch_size), num_heads(num_heads), seq_len(seq_len), d_k(d_k),
-          causal(causal), scale(scale) {}
+    FlashAttentionBackward(std::shared_ptr<Tensor> q, std::shared_ptr<Tensor> k, std::shared_ptr<Tensor> v,
+                           std::shared_ptr<Tensor> out, std::shared_ptr<Tensor> lse,
+                           int batch_size, int num_heads, int seq_len, int d_k, bool causal, float scale)
+        : q(std::move(q)), k(std::move(k)), v(std::move(v)), out(std::move(out)), lse(std::move(lse)),
+          batch_size(batch_size), num_heads(num_heads), seq_len(seq_len), d_k(d_k), causal(causal), scale(scale) {}
 
     void release_variables() override {
-        q = nullptr; k = nullptr; v = nullptr; out = nullptr;
+        q = nullptr; k = nullptr; v = nullptr; out = nullptr; lse = nullptr;
     }
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
@@ -29,12 +28,10 @@ struct FlashAttentionBackward : public Node {
         auto gq = std::make_shared<Tensor>(q->shape, q->device, q->dtype, false);
         auto gk = std::make_shared<Tensor>(k->shape, k->device, k->dtype, false);
         auto gv = std::make_shared<Tensor>(v->shape, v->device, v->dtype, false);
-
-        cuda::flash_attention_backward(q->data_ptr<float>(), k->data_ptr<float>(), v->data_ptr<float>(),
-                                       out->data_ptr<float>(), grad_out->data_ptr<float>(),
-                                       gq->data_ptr<float>(), gk->data_ptr<float>(), gv->data_ptr<float>(),
-                                       batch_size, num_heads, seq_len, d_k, causal, scale);
-
+        cuda::attention_backward(q->data_ptr<float>(), k->data_ptr<float>(), v->data_ptr<float>(),
+                                 out->data_ptr<float>(), grad_out->data_ptr<float>(), lse->data_ptr<float>(),
+                                 gq->data_ptr<float>(), gk->data_ptr<float>(), gv->data_ptr<float>(),
+                                 batch_size, num_heads, seq_len, d_k, causal, scale);
         return {gq, gk, gv};
     }
 };
@@ -80,11 +77,11 @@ public:
             // Q/K/V carry the weights' requires_grad even when the input x does not
             bool qkv_grad = grad_enabled() && (Q->requires_grad || K->requires_grad || V->requires_grad);
             auto out_4d = std::make_shared<Tensor>(Q_4d->shape, Device::CUDA, x->dtype, qkv_grad);
-            cuda::flash_attention_forward(Q_4d->data_ptr<float>(), K_4d->data_ptr<float>(), V_4d->data_ptr<float>(),
-                                          out_4d->data_ptr<float>(),
-                                          B, 1, S, d_k, causal, scale);
+            auto lse = std::make_shared<Tensor>(std::vector<int64_t>{B, 1, S}, Device::CUDA, x->dtype, false);
+            cuda::attention_forward(Q_4d->data_ptr<float>(), K_4d->data_ptr<float>(), V_4d->data_ptr<float>(),
+                                    out_4d->data_ptr<float>(), lse->data_ptr<float>(), B, 1, S, d_k, causal, scale);
             if (qkv_grad) {
-                auto grad_fn = std::make_shared<FlashAttentionBackward>(Q_4d, K_4d, V_4d, out_4d,
+                auto grad_fn = std::make_shared<FlashAttentionBackward>(Q_4d, K_4d, V_4d, out_4d, lse,
                                                                         B, 1, S, d_k, causal, scale);
                 grad_fn->add_next_edge(get_grad_edge(Q).function);
                 grad_fn->add_next_edge(get_grad_edge(K).function);
@@ -272,11 +269,11 @@ public:
             // Q/K/V carry the weights' requires_grad even when the input x does not
             bool qkv_grad = grad_enabled() && (Q_split->requires_grad || K_split->requires_grad || V_split->requires_grad);
             attn_out = std::make_shared<Tensor>(Q_split->shape, Device::CUDA, x->dtype, qkv_grad);
-            cuda::flash_attention_forward(Q_c->data_ptr<float>(), K_c->data_ptr<float>(), V_c->data_ptr<float>(),
-                                          attn_out->data_ptr<float>(),
-                                          B, n_heads, S, d_k, causal, scale);
+            auto lse = std::make_shared<Tensor>(std::vector<int64_t>{B, n_heads, S}, Device::CUDA, x->dtype, false);
+            cuda::attention_forward(Q_c->data_ptr<float>(), K_c->data_ptr<float>(), V_c->data_ptr<float>(),
+                                    attn_out->data_ptr<float>(), lse->data_ptr<float>(), B, n_heads, S, d_k, causal, scale);
             if (qkv_grad) {
-                auto grad_fn = std::make_shared<FlashAttentionBackward>(Q_c, K_c, V_c, attn_out,
+                auto grad_fn = std::make_shared<FlashAttentionBackward>(Q_c, K_c, V_c, attn_out, lse,
                                                                         B, n_heads, S, d_k, causal, scale);
                 grad_fn->add_next_edge(get_grad_edge(Q_split).function);
                 grad_fn->add_next_edge(get_grad_edge(K_split).function);

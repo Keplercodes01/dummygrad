@@ -2,8 +2,9 @@
 // few sizes, timed as forward / backward / optimizer, with host<->device traffic per step.
 // bench/bench_torch.py runs the same architecture in PyTorch for comparison.
 //
-//   ./dg_bench            all configurations
-//   ./dg_bench small      one configuration (tiny, small, medium)
+//   ./dg_bench                  all configurations
+//   ./dg_bench small            one configuration (tiny, small, medium)
+//   ./dg_bench --profile        also print the most expensive backward ops per configuration
 
 #include "dummy_core.h"
 
@@ -37,7 +38,14 @@ static double now_ms() {
 }
 
 int main(int argc, char** argv) {
-    std::string only = argc > 1 ? argv[1] : "";
+    std::string only;
+    bool profile = false;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--profile") profile = true;
+        else only = arg;
+    }
+    std::vector<std::string> profiles;
     Device device = Device::CPU;
 #ifdef USE_CUDA
     int gpus = 0;
@@ -102,6 +110,29 @@ int main(int argc, char** argv) {
                     model.num_parameters() / 1e6, per_step, c.batch * c.seq_len * 1000.0 / per_step,
                     t_fwd / steps, t_bwd / steps, t_opt / steps, copies, mb);
         std::fflush(stdout);
+
+        if (profile) {
+            // Separate pass: profiling serializes and synchronizes backward, which skews the timings above
+            const int profiled_steps = 3;
+            reset_profile();
+            set_profiling(true);
+            for (int s = 0; s < profiled_steps; ++s) {
+                optimizer.zero_grad(params);
+                fused_cross_entropy(model.forward(inputs), targets)->backward();
+            }
+            set_profiling(false);
+            std::string report = "\nBackward ops, " + c.name + " (ms per step):\n";
+            int shown = 0;
+            for (const auto& e : profile_report()) {
+                if (shown++ == 12) break;
+                char line[256];
+                std::snprintf(line, sizeof(line), "  %8.2f ms  %5lld calls  %s\n", e.total_ms / profiled_steps,
+                              (long long)(e.calls / profiled_steps), e.name.c_str());
+                report += line;
+            }
+            profiles.push_back(report);
+        }
     }
+    for (const auto& report : profiles) std::printf("%s", report.c_str());
     return 0;
 }
