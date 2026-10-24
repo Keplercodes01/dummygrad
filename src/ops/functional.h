@@ -680,64 +680,98 @@ inline std::string shape_string(const std::vector<int64_t>& shape) {
     return s + "]";
 }
 
-// x's shape (at least 1-D) and y's shape left-padded with 1s to the same rank
+// Indexing plan for broadcasting y onto x. Shapes are simplified before use: dimensions of size 1
+// are dropped and neighbouring dimensions with the same broadcast status are merged, so a Linear
+// bias [B, T, O] + [1, O] becomes [B*T, O] + [1, O]. Both the CPU loops and the CUDA kernels index
+// with these collapsed shapes.
 struct BroadcastLayout {
-    std::vector<int64_t> x_shape, y_shape;
+    std::vector<int64_t> x_shape, y_shape;  // collapsed, same rank (>= 1)
+    std::vector<int64_t> y_strides;         // 0 where y broadcasts
     int64_t numel = 1;
 
-    int64_t y_offset(int64_t x_idx) const {
-        int64_t off = 0, y_stride = 1;
-        for (int d = (int)x_shape.size() - 1; d >= 0; --d) {
-            int64_t i = x_idx % x_shape[d];
-            x_idx /= x_shape[d];
-            if (y_shape[d] != 1) off += i * y_stride;
-            y_stride *= y_shape[d];
+    // Calls f(x_index, y_index) for every element of x in order. The innermost dimension is a
+    // plain loop and outer dimensions advance like an odometer, so no division per element.
+    template <typename F>
+    void for_each(F&& f) const {
+        int nd = (int)x_shape.size();
+        int64_t inner = x_shape[nd - 1];
+        int64_t inner_y = y_strides[nd - 1];
+        int64_t outer = numel / inner;
+        std::vector<int64_t> idx(nd, 0);
+        int64_t y_base = 0;
+        for (int64_t o = 0; o < outer; ++o) {
+            int64_t xb = o * inner;
+            if (inner_y) {
+                for (int64_t j = 0; j < inner; ++j) f(xb + j, y_base + j);
+            } else {
+                for (int64_t j = 0; j < inner; ++j) f(xb + j, y_base);
+            }
+            for (int d = nd - 2; d >= 0; --d) {
+                y_base += y_strides[d];
+                if (++idx[d] < x_shape[d]) break;
+                y_base -= y_strides[d] * x_shape[d];
+                idx[d] = 0;
+            }
         }
-        return off;
     }
 };
 
 inline BroadcastLayout broadcast_layout(const std::vector<int64_t>& xs, const std::vector<int64_t>& ys, BinaryOp op) {
-    BroadcastLayout l;
-    l.x_shape = xs.empty() ? std::vector<int64_t>{1} : xs;
-    size_t rank = l.x_shape.size();
-    // y may have extra leading dimensions only if they are 1
+    std::vector<int64_t> x = xs.empty() ? std::vector<int64_t>{1} : xs;
+    size_t rank = x.size();
+    // Align y to x's rank; y may have extra leading dimensions only if they are 1
     size_t extra = ys.size() > rank ? ys.size() - rank : 0;
     bool ok = true;
     for (size_t i = 0; i < extra; ++i) ok &= (ys[i] == 1);
-    l.y_shape.assign(rank, 1);
-    for (size_t i = extra; i < ys.size(); ++i) l.y_shape[rank - (ys.size() - i)] = ys[i];
-    for (size_t d = 0; d < rank; ++d) {
-        ok &= (l.y_shape[d] == 1 || l.y_shape[d] == l.x_shape[d]);
-        l.numel *= l.x_shape[d];
-    }
+    std::vector<int64_t> y(rank, 1);
+    for (size_t i = extra; i < ys.size(); ++i) y[rank - (ys.size() - i)] = ys[i];
+    for (size_t d = 0; d < rank; ++d) ok &= (y[d] == 1 || y[d] == x[d]);
     if (!ok) {
         throw std::invalid_argument(std::string(binary_op_name(op)) + ": cannot broadcast shape " + shape_string(ys) +
                                     " onto " + shape_string(xs));
+    }
+
+    BroadcastLayout l;
+    for (size_t d = 0; d < rank; ++d) {
+        l.numel *= x[d];
+        if (x[d] == 1) continue;  // size-1 dimensions don't affect indexing
+        bool broadcast = (y[d] == 1);
+        if (!l.x_shape.empty() && (l.y_shape.back() == 1) == broadcast) {
+            l.x_shape.back() *= x[d];
+            l.y_shape.back() *= y[d];
+        } else {
+            l.x_shape.push_back(x[d]);
+            l.y_shape.push_back(y[d]);
+        }
+    }
+    if (l.x_shape.empty()) {
+        l.x_shape = {1};
+        l.y_shape = {1};
+    }
+    l.y_strides.assign(l.x_shape.size(), 0);
+    int64_t stride = 1;
+    for (int d = (int)l.x_shape.size() - 1; d >= 0; --d) {
+        if (l.y_shape[d] != 1) l.y_strides[d] = stride;
+        stride *= l.y_shape[d];
     }
     return l;
 }
 
 namespace broadcast_detail {
 
-inline float apply(BinaryOp op, float a, float b) {
-    switch (op) {
-        case BinaryOp::Add: return a + b;
-        case BinaryOp::Sub: return a - b;
-        case BinaryOp::Mul: return a * b;
-        default: return a / b;
-    }
-}
-
 inline void forward_host(BinaryOp op, const float* x, const float* y, float* out, const BroadcastLayout& l) {
-    for (int64_t i = 0; i < l.numel; ++i) out[i] = apply(op, x[i], y[l.y_offset(i)]);
+    switch (op) {
+        case BinaryOp::Add: l.for_each([&](int64_t i, int64_t yo) { out[i] = x[i] + y[yo]; }); break;
+        case BinaryOp::Sub: l.for_each([&](int64_t i, int64_t yo) { out[i] = x[i] - y[yo]; }); break;
+        case BinaryOp::Mul: l.for_each([&](int64_t i, int64_t yo) { out[i] = x[i] * y[yo]; }); break;
+        default: l.for_each([&](int64_t i, int64_t yo) { out[i] = x[i] / y[yo]; }); break;
+    }
 }
 
 // gx and/or gy may be null. gy accumulates in x order, so the result is deterministic.
 inline void backward_host(BinaryOp op, const float* g, const float* x, const float* y, float* gx, float* gy,
                           const BroadcastLayout& l) {
-    for (int64_t i = 0; i < l.numel; ++i) {
-        int64_t yo = l.y_offset(i);
+    l.for_each([&](int64_t i, int64_t yo) {
         float d = g[i];
         if (gx) gx[i] = (op == BinaryOp::Mul) ? d * y[yo] : (op == BinaryOp::Div) ? d / y[yo] : d;
         if (gy) {
@@ -748,7 +782,7 @@ inline void backward_host(BinaryOp op, const float* g, const float* x, const flo
                 default: gy[yo] -= d * x[i] / (y[yo] * y[yo]); break;
             }
         }
-    }
+    });
 }
 
 }  // namespace broadcast_detail
