@@ -2,7 +2,9 @@
 
 All notable changes to dummygrad are documented here. Versions follow [Semantic Versioning](https://semver.org/); while the major version is 0, minor releases may change behavior.
 
-## [Unreleased]
+## [0.4.0] - 2026-10-24
+
+The workflow release: everything around the model that day-to-day research needs. Write and verify custom ops, build models from modules, train with resumable checkpoints, data loaders and metric logs, and get bitwise-reproducible gradients.
 
 ### Added
 - **`dummygrad::gradcheck`** (`testing.h`, included by `dummy_core.h`): checks the gradients of any function of tensors — a custom op, a layer, a whole block — against finite differences and reports the first mismatch. `test_engine` now runs its CPU gradient checks through it.
