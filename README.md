@@ -15,6 +15,12 @@ No Python. No bindings. No GIL. No multi-layer dispatcher overhead. Just raw, fr
 
 Full details for every release are in [CHANGELOG.md](CHANGELOG.md).
 
+### v0.5.1
+- **Faster than PyTorch at every size we benchmark.** On a T4: 2.9 vs 8.6 ms (0.4M params), 23.9 vs 27.6 ms (3.9M), 103.6 vs 107.7 ms (23M).
+- **Attention on cuBLAS** for sequences up to 2048 tokens, any head dimension: backward went from 17 to 6.6 ms on the 23M model. Longer sequences keep the memory-efficient tiled kernels.
+- **GPT is bitwise reproducible on the GPU too:** LayerNorm backward no longer uses atomics.
+- **Fixed:** LayerNorm on CUDA could silently replace its parameters, so the optimizer stopped updating them.
+
 ### v0.5.0: the speed release
 - **Faster than PyTorch on small models, at parity on larger ones.** On a T4, a ModernTransformer training step takes 3.5 ms vs PyTorch's 9.2 ms (0.4M params), 23.6 vs 27.1 ms (3.9M), and 112.6 vs 108.6 ms (23M). See [Performance](#performance).
 - **Everything stays on the GPU.** New kernels for broadcast and scalar ops, RMSNorm, cross entropy, embedding lookup, GQA and gradient clipping removed 1.5 GB of host-device copies per step.
@@ -207,7 +213,7 @@ set(CMAKE_CXX_STANDARD 17)
 include(FetchContent)
 FetchContent_Declare(dummygrad
     GIT_REPOSITORY https://github.com/Keplercodes01/dummygrad.git
-    GIT_TAG        v0.5.0)
+    GIT_TAG        v0.5.1)
 FetchContent_MakeAvailable(dummygrad)
 
 add_executable(my_app main.cpp)

@@ -2,7 +2,7 @@
 
 All notable changes to dummygrad are documented here. Versions follow [Semantic Versioning](https://semver.org/); while the major version is 0, minor releases may change behavior.
 
-## [Unreleased]
+## [0.5.1] - 2026-10-25
 
 Backward-pass tuning. On a T4, the medium ModernTransformer step (23M parameters) went from 112.6 to 103.6 ms and is now 4% faster than eager PyTorch (107.7 ms); attention backward went from 17 to 6.6 ms and AccumulateGrad from about 4 to 1.1 ms per step.
 
