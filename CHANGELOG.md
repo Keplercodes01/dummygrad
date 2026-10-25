@@ -4,6 +4,8 @@ All notable changes to dummygrad are documented here. Versions follow [Semantic 
 
 ## [Unreleased]
 
+Backward-pass tuning. On a T4, the medium ModernTransformer step (23M parameters) went from 112.6 to 103.6 ms and is now 4% faster than eager PyTorch (107.7 ms); attention backward went from 17 to 6.6 ms and AccumulateGrad from about 4 to 1.1 ms per step.
+
 ### Changed
 - **Attention runs on cuBLAS for sequences up to 2048 tokens** (`cuda_attention.cu`). The [seq, seq] score matrices are materialized a chunk of heads at a time (at most 256 MB of scratch) and every product is a strided-batched GEMM: forward is S = QK^T, softmax, PV, and backward recomputes S and dO V^T and runs dV = P^T dO, dK = dS^T Q, dQ = dS K. The tiled kernels ran attention backward at about 8% of T4 fp32 peak; at these lengths cuBLAS is several times faster. Longer sequences keep the tiled kernels, whose memory is linear in the sequence length. `cuda::set_attention_gemm_max_seq` moves the cutoff (0 forces the tiled kernels). Any head dimension now gets the fast, deterministic path at these lengths, not just 16/32/64/128.
 - **LayerNorm backward on CUDA is deterministic.** gamma/beta gradients were accumulated with one atomic per element per row; they are now fixed-order partial sums like the other kernels, so GPT-style models are bitwise reproducible on the GPU too. LayerNorm moved to `cuda_core_ops.cu` and was rewritten like RMSNorm.
