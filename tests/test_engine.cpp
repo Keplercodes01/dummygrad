@@ -381,8 +381,9 @@ static std::vector<GradTest> build_grad_tests() {
     }
 
     // Multi-head attention. Leaves: x, then (W, b) for q, k, v, o. Weights scale with 1/sqrt(d_model)
-    // so the softmax stays smooth. On CUDA, head dims 16/32/64/128 run the tiled kernels (sequence
-    // lengths here cross their tile and block boundaries); other head dims use the untiled ones.
+    // so the softmax stays smooth. On CUDA these short sequences take the GEMM path; main() runs them
+    // again on the tiled kernels (head dims 16/32/64/128, with sequence lengths that cross their tile
+    // and block boundaries) and the untiled ones (other head dims).
     auto attention_test = [&](const std::string& name, int d_model, int n_heads, int n_kv_heads, bool use_rope,
                               int batch, int seq) {
         auto mha = std::make_shared<MultiHeadAttention>(d_model, n_heads, n_kv_heads, true);
@@ -738,6 +739,22 @@ static std::string engine_concurrent_fanin() {
     return "";
 }
 
+// AccumulateGrad adopts a parameter's first gradient instead of copying it. AddBackward hands
+// one tensor to both of its edges, so adopting must never leave two parameters sharing a buffer.
+static std::string engine_adopted_grads_do_not_alias() {
+    auto a = upload({1, 2, 3, 4}, {2, 2}, Device::CPU, true);
+    auto b = upload({5, 6, 7, 8}, {2, 2}, Device::CPU, true);
+    scalar_sum(add(a, b))->backward();
+    if (!a->grad || !b->grad) return "a parameter received no gradient";
+    if (a->grad->storage == b->grad->storage) return "two parameters share one gradient buffer";
+    a->grad->fill_(5.0f);
+    auto err = expect_all(b, 1.0f, "writing a's gradient changed b's");
+    if (!err.empty()) return err;
+    // A second backward accumulates into the adopted buffers
+    scalar_sum(add(a, b))->backward();
+    return expect_all(b, 2.0f, "second backward");
+}
+
 static std::string engine_deep_chain() {
     auto x = upload({1, 2, 3, 4}, {2, 2}, Device::CPU, true);
     TensorPtr y = x;
@@ -918,13 +935,19 @@ static std::vector<std::vector<float>> all_grads(Module& m) {
     return out;
 }
 
-// Gradients meeting at a node are summed in a fixed order, so repeated runs are bitwise equal
-static std::string workflow_deterministic_backward() {
-    ModernTransformer model(16, 8, 16, 2, 2, 1);
+// Gradients meeting at a node are summed in a fixed order and every kernel reduces in a fixed
+// order (no atomics), so repeated runs are bitwise equal on CPU and GPU.
+template <typename Model>
+static std::string deterministic_backward(Model& model, Device dev, int batch, int seq) {
+    if (dev == Device::CUDA) model.cuda();
+    std::vector<float> in(batch * seq), tg(batch * seq);
+    for (int i = 0; i < batch * seq; ++i) {
+        in[i] = (float)((i * 7) % 16);
+        tg[i] = (float)((i * 7 + 1) % 16);
+    }
     auto run = [&]() {
         model.zero_grad();
-        fused_cross_entropy(model.forward(upload({1, 2, 3, 4, 5, 6}, {2, 3}, Device::CPU, false)),
-                            upload({2, 3, 4, 5, 6, 7}, {2, 3}, Device::CPU, false))->backward();
+        fused_cross_entropy(model.forward(upload(in, {batch, seq}, dev, false)), upload(tg, {batch, seq}, dev, false))->backward();
         return all_grads(model);
     };
     auto first = run();
@@ -935,6 +958,24 @@ static std::string workflow_deterministic_backward() {
         }
     }
     return "";
+}
+
+static std::string workflow_deterministic_backward() {
+    ModernTransformer model(16, 8, 16, 2, 2, 1);
+    return deterministic_backward(model, Device::CPU, 2, 3);
+}
+
+// 128 rows, so LayerNorm's gamma/beta reductions take the multi-chunk path
+static std::string workflow_deterministic_backward_cuda_modern() {
+    manual_seed(5);
+    ModernTransformer model(16, 32, 32, 2, 2, 1);
+    return deterministic_backward(model, Device::CUDA, 4, 32);
+}
+
+static std::string workflow_deterministic_backward_cuda_gpt() {
+    manual_seed(5);
+    GPT model(16, 32, 32, 2, 2);
+    return deterministic_backward(model, Device::CUDA, 4, 32);
 }
 
 template <typename Optimizer>
@@ -1215,6 +1256,17 @@ int main() {
         for (size_t i = 0; i < tests.size(); ++i) {
             run_case(r, "cuda/" + tests[i].name, [&] { return parity_check(tests[i], probes[i], Device::CUDA); });
         }
+#ifdef USE_CUDA
+        // The attention tests again with the GEMM path off, so the kernels used past
+        // attention_gemm_max_seq() are checked too
+        int gemm_max_seq = cuda::attention_gemm_max_seq();
+        cuda::set_attention_gemm_max_seq(0);
+        for (size_t i = 0; i < tests.size(); ++i) {
+            if (tests[i].name.find("ttention") == std::string::npos) continue;
+            run_case(r, "cuda_tiled/" + tests[i].name, [&] { return parity_check(tests[i], probes[i], Device::CUDA); });
+        }
+        cuda::set_attention_gemm_max_seq(gemm_max_seq);
+#endif
     }
 
     std::cout << "\n-- autograd engine\n";
@@ -1227,6 +1279,7 @@ int main() {
     run_case(r, "engine/retain_graph", engine_retain_graph);
     run_case(r, "engine/exception_propagates", engine_exception_propagates);
     run_case(r, "engine/concurrent_fanin", engine_concurrent_fanin);
+    run_case(r, "engine/adopted_grads_do_not_alias", engine_adopted_grads_do_not_alias);
     run_case(r, "engine/deep_chain", engine_deep_chain);
 
     std::cout << "\n-- modules\n";
@@ -1239,6 +1292,10 @@ int main() {
 
     std::cout << "\n-- workflow\n";
     run_case(r, "workflow/deterministic_backward", workflow_deterministic_backward);
+    if (has_cuda) {
+        run_case(r, "workflow/deterministic_backward_cuda_modern", workflow_deterministic_backward_cuda_modern);
+        run_case(r, "workflow/deterministic_backward_cuda_gpt", workflow_deterministic_backward_cuda_gpt);
+    }
     run_case(r, "workflow/resume_adam", workflow_resume_adam);
     run_case(r, "workflow/resume_sgd_momentum", workflow_resume_sgd_momentum);
     run_case(r, "workflow/checkpoint_scalars", workflow_checkpoint_scalars);

@@ -180,106 +180,6 @@ __global__ void k_prefix_causal_mask_backward(const float* grad_out, float* grad
     }
 }
 
-__global__ void k_layernorm_forward(const float* __restrict__ x,
-                                    const float* __restrict__ gamma,
-                                    const float* __restrict__ beta,
-                                    float* __restrict__ out,
-                                    float* __restrict__ mean_out,
-                                    float* __restrict__ rstd_out,
-                                    int rows, int cols, float eps) {
-    int row = blockIdx.x;
-    if (row >= rows) return;
-
-    const float* row_x = x + (int64_t)row * cols;
-    float* row_out = out + (int64_t)row * cols;
-
-    float sum = 0.0f;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        sum += row_x[i];
-    }
-    float total_sum = block_reduce_sum(sum);
-    __shared__ float s_mean;
-    if (threadIdx.x == 0) s_mean = total_sum / cols;
-    __syncthreads();
-    float mu = s_mean;
-
-    float var_sum = 0.0f;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        float diff = row_x[i] - mu;
-        var_sum += diff * diff;
-    }
-    float total_var = block_reduce_sum(var_sum);
-    __shared__ float s_rstd;
-    if (threadIdx.x == 0) {
-        s_rstd = rsqrtf(total_var / cols + eps);
-        if (mean_out) mean_out[row] = mu;
-        if (rstd_out) rstd_out[row] = s_rstd;
-    }
-    __syncthreads();
-    float rstd = s_rstd;
-
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        float norm = (row_x[i] - mu) * rstd;
-        float g = gamma ? gamma[i] : 1.0f;
-        float b = beta ? beta[i] : 0.0f;
-        row_out[i] = norm * g + b;
-    }
-}
-
-__global__ void k_layernorm_backward(const float* __restrict__ grad_out,
-                                     const float* __restrict__ x,
-                                     const float* __restrict__ gamma,
-                                     const float* __restrict__ mean_in,
-                                     const float* __restrict__ rstd_in,
-                                     float* __restrict__ grad_x,
-                                     float* __restrict__ grad_gamma,
-                                     float* __restrict__ grad_beta,
-                                     int rows, int cols) {
-    int row = blockIdx.x;
-    if (row >= rows) return;
-
-    const float* row_dout = grad_out + (int64_t)row * cols;
-    const float* row_x = x + (int64_t)row * cols;
-    float* row_dx = grad_x + (int64_t)row * cols;
-
-    float mu = mean_in[row];
-    float rstd = rstd_in[row];
-
-    float sum_dy = 0.0f;
-    float sum_dy_xhat = 0.0f;
-
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        float dy = row_dout[i];
-        float xhat = (row_x[i] - mu) * rstd;
-        float g = gamma ? gamma[i] : 1.0f;
-        float dy_g = dy * g;
-        sum_dy += dy_g;
-        sum_dy_xhat += dy_g * xhat;
-
-        if (grad_gamma) atomicAdd(&grad_gamma[i], dy * xhat);
-        if (grad_beta) atomicAdd(&grad_beta[i], dy);
-    }
-
-    float total_sum_dy = block_reduce_sum(sum_dy);
-    __shared__ float s_sum_dy;
-    if (threadIdx.x == 0) s_sum_dy = total_sum_dy;
-    __syncthreads();
-
-    float total_sum_dy_xhat = block_reduce_sum(sum_dy_xhat);
-    __shared__ float s_sum_dy_xhat;
-    if (threadIdx.x == 0) s_sum_dy_xhat = total_sum_dy_xhat;
-    __syncthreads();
-
-    float f_cols = (float)cols;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        float dy = row_dout[i];
-        float xhat = (row_x[i] - mu) * rstd;
-        float g = gamma ? gamma[i] : 1.0f;
-        float dy_g = dy * g;
-        row_dx[i] = rstd * (dy_g - (s_sum_dy + xhat * s_sum_dy_xhat) / f_cols);
-    }
-}
-
 // Frontier Tiled FlashAttention forward kernel (online softmax, O(1) intermediate GPU memory)
 // Each thread owns head-dim indices d = threadIdx.x + s * blockDim.x. Launches use
 // >= FA_MIN_THREADS threads, so a thread needs at most FA_MAX_DK / FA_MIN_THREADS slots.
@@ -882,29 +782,6 @@ void prefix_causal_mask_backward(const float* grad_out, float* grad_in, int batc
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     k_prefix_causal_mask_backward<<<blocks, threads>>>(grad_out, grad_in, batch * seq_len, seq_len, prefix_len);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void layernorm_forward(const float* x, const float* gamma, const float* beta,
-                       float* out, float* mean, float* rstd,
-                       int rows, int cols, float eps) {
-    int threads = std::min(256, ((cols + 31) / 32) * 32);
-    if (threads < 32) threads = 32;
-    k_layernorm_forward<<<rows, threads>>>(x, gamma, beta, out, mean, rstd, rows, cols, eps);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void layernorm_backward(const float* grad_out, const float* x, const float* gamma,
-                        const float* mean, const float* rstd,
-                        float* grad_x, float* grad_gamma, float* grad_beta,
-                        int rows, int cols) {
-    if (grad_gamma) CUDA_CHECK(cudaMemset(grad_gamma, 0, cols * sizeof(float)));
-    if (grad_beta) CUDA_CHECK(cudaMemset(grad_beta, 0, cols * sizeof(float)));
-    int threads = std::min(256, ((cols + 31) / 32) * 32);
-    if (threads < 32) threads = 32;
-    k_layernorm_backward<<<rows, threads>>>(grad_out, x, gamma, mean, rstd,
-                                            grad_x, grad_gamma, grad_beta,
-                                            rows, cols);
     CUDA_CHECK(cudaGetLastError());
 }
 

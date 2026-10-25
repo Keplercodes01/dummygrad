@@ -647,8 +647,7 @@ dummygrad's advantage is per-op overhead (no Python, no dispatcher), which domin
 dummygrad is pre-1.0: the core training path (CPU and CUDA, FP32) is covered by `test_engine`; other paths are less exercised.
 
 - **Half precision on CUDA.** FP16/BF16 are supported by `matmul` and data movement; elementwise, normalization and attention kernels are FP32, so there is no mixed-precision training yet.
-- **Attention** uses tiled kernels for head dimensions 16, 32, 64 and 128; other head dimensions (up to 512) fall back to slower untiled kernels.
-- **LayerNorm backward on CUDA** still accumulates gamma/beta gradients with atomics, so GPT-style models are not bitwise reproducible on the GPU (ModernTransformer is).
+- **Attention** runs as cuBLAS GEMMs for sequences up to 2048 tokens (any head dimension) and as tiled kernels beyond that for head dimensions 16, 32, 64 and 128. Other head dimensions past 2048 tokens (up to 512) fall back to slower untiled kernels, whose backward uses atomics and is not bitwise reproducible.
 - **Multi-GPU gradient aggregation** currently reduces through host memory.
 - **Metal and TPU kernels** are not covered by the test suite (macOS CI runs the CPU backend).
 

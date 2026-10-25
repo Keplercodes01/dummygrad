@@ -2,6 +2,20 @@
 
 All notable changes to dummygrad are documented here. Versions follow [Semantic Versioning](https://semver.org/); while the major version is 0, minor releases may change behavior.
 
+## [Unreleased]
+
+### Changed
+- **Attention runs on cuBLAS for sequences up to 2048 tokens** (`cuda_attention.cu`). The [seq, seq] score matrices are materialized a chunk of heads at a time (at most 256 MB of scratch) and every product is a strided-batched GEMM: forward is S = QK^T, softmax, PV, and backward recomputes S and dO V^T and runs dV = P^T dO, dK = dS^T Q, dQ = dS K. The tiled kernels ran attention backward at about 8% of T4 fp32 peak; at these lengths cuBLAS is several times faster. Longer sequences keep the tiled kernels, whose memory is linear in the sequence length. `cuda::set_attention_gemm_max_seq` moves the cutoff (0 forces the tiled kernels). Any head dimension now gets the fast, deterministic path at these lengths, not just 16/32/64/128.
+- **LayerNorm backward on CUDA is deterministic.** gamma/beta gradients were accumulated with one atomic per element per row; they are now fixed-order partial sums like the other kernels, so GPT-style models are bitwise reproducible on the GPU too. LayerNorm moved to `cuda_core_ops.cu` and was rewritten like RMSNorm.
+- **LayerNorm saves less for backward.** The CUDA forward allocated an `x - mean` buffer the size of the input that it never filled or read, and kept it alive until backward; backward now recomputes x̂ from x and the per-row mean and inverse std on every device. The redundant zero-fills of the output gradients are gone too.
+- **AccumulateGrad adopts a parameter's first gradient instead of copying it** when nothing else references the gradient buffer, saving one device copy per parameter per step. The engine now hands gradients to the next node by move so that the consumer holds the only reference.
+
+### Fixed
+- **LayerNorm on CUDA no longer replaces its parameters.** With gamma/beta on another device, the CUDA forward reassigned them to new GPU tensors, so an optimizer holding the originals stopped updating the layer. A device mismatch now raises an error, like RMSNorm.
+
+### Added
+- Tests: GPT and ModernTransformer gradients are bitwise identical across repeated runs on CUDA; the attention parity tests also run on the tiled and untiled kernels; adopted gradients never alias between parameters.
+
 ## [0.5.0] - 2026-10-24
 
 The speed release. A training step no longer moves data between GPU and CPU, attention runs on tiled kernels, and the new kernels reduce in a fixed order (no atomics), so ModernTransformer training is reproducible on the GPU. On a T4, a ModernTransformer training step is 2.6x faster than eager PyTorch at 0.4M parameters, 15% faster at 3.9M, and within 4% at 23M (it was 11x slower at the start of this release).

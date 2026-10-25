@@ -1,5 +1,15 @@
-// Tiled scaled-dot-product attention (FlashAttention-style) for q, k, v, out laid out as
-// [batch * heads, seq, head_dim], with an optional causal mask.
+// Scaled-dot-product attention for q, k, v, out laid out as [batch * heads, seq, head_dim], with an
+// optional causal mask. Two implementations; forward reports which one it used and backward follows:
+//
+// GEMM path (seq <= 2048 by default, any head dim): the [seq, seq] score matrices are materialized a
+// chunk of heads at a time and every product runs as a cuBLAS strided-batched GEMM. At these
+// lengths the score matrices are small and cuBLAS runs near peak, several times faster than the
+// tiled kernels. Forward: S = scale * Q K^T, P = softmax(S) in place (saving the log-sum-exp),
+// O = P V. Backward: S and dP = dO V^T are recomputed, turned into P and dS = P * (dP - delta) * scale
+// in place, then dV = P^T dO, dK = dS^T Q, dQ = dS K. cuBLAS and the row kernels reduce in a
+// fixed order, so this path is deterministic too.
+//
+// Tiled path (longer sequences, head dims 16/32/64/128), whose memory stays linear in seq:
 //
 // Forward: each query row is owned by a group of head_dim / 16 threads holding 16-element slices
 // in registers; K/V stream through shared memory in tiles while an online softmax accumulates the
@@ -16,9 +26,11 @@
 
 #include "cuda_ops.cuh"
 #include "cuda_common.h"
+#include "cuda_reduce.cuh"
 #include "allocator.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 
 #ifdef USE_CUDA
@@ -288,30 +300,151 @@ void launch_backward(const float* q, const float* k, const float* v, const float
 
 bool tiled_supported(int D) { return D == 16 || D == 32 || D == 64 || D == 128; }
 
+// ---------------------------------------------------------------------------------------------
+// GEMM path
+// ---------------------------------------------------------------------------------------------
+
+constexpr size_t kGemmScratchBytes = size_t(256) << 20;  // score matrices per chunk of heads
+std::atomic<int> g_gemm_max_seq{2048};
+
+// Heads per chunk so that `buffers` [S, S] float matrices per head fit the scratch budget
+int heads_per_chunk(int bh, int S, int buffers) {
+    size_t per_head = (size_t)buffers * S * S * sizeof(float);
+    return (int)std::max<size_t>(1, std::min<size_t>(bh, kGemmScratchBytes / per_head));
+}
+
+// Row-major strided-batched GEMM: C[b] = alpha * op(A[b]) op(B[b]) with op(A) [m, k], op(B) [k, n]
+// and C [m, n]. A is stored [m, k] ([k, m] if trans_a) and B [k, n] ([n, k] if trans_b). cuBLAS is
+// column-major, so this computes C^T = op(B)^T op(A)^T.
+void gemm_batched(bool trans_a, bool trans_b, int m, int n, int k, float alpha, const float* A, int64_t stride_a,
+                  const float* B, int64_t stride_b, float* C, int64_t stride_c, int batch) {
+    const float beta = 0.0f;
+    CUBLAS_CHECK(cublasSgemmStridedBatched(get_cublas_handle(), trans_b ? CUBLAS_OP_T : CUBLAS_OP_N,
+                                           trans_a ? CUBLAS_OP_T : CUBLAS_OP_N, n, m, k, &alpha, B, trans_b ? k : n,
+                                           stride_b, A, trans_a ? m : k, stride_a, &beta, C, n, stride_c, batch));
+}
+
+int row_threads(int S) { return std::min(256, std::max(32, (S + 31) / 32 * 32)); }
+
+int grid_for(int64_t n, int threads) {
+    return (int)std::max<int64_t>(1, std::min<int64_t>((n + threads - 1) / threads, 1 << 20));  // grid-stride loops
+}
+
+// In place over rows of scaled scores: P = softmax(S) with keys after the query masked to zero
+// when causal; saves each row's log-sum-exp. One block per row (head * S + query).
+__global__ void k_attention_softmax(float* scores, float* lse, int S, bool causal) {
+    int64_t row = blockIdx.x;
+    int i = (int)(row % S);
+    float* r = scores + row * S;
+    int n = causal ? i + 1 : S;
+    float m = -INFINITY;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) m = fmaxf(m, r[j]);
+    float row_max = block_reduce_max(m);
+    __shared__ float s_max, s_inv;
+    if (threadIdx.x == 0) s_max = row_max;
+    __syncthreads();
+    m = s_max;
+    float l = 0.0f;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) l += expf(r[j] - m);
+    float total = block_reduce_sum(l);
+    if (threadIdx.x == 0) {
+        s_inv = 1.0f / total;
+        lse[row] = m + logf(total);
+    }
+    __syncthreads();
+    float inv = s_inv;
+    for (int j = threadIdx.x; j < S; j += blockDim.x) r[j] = (j < n) ? expf(r[j] - m) * inv : 0.0f;
+}
+
+// In place over a chunk of heads: scores -> P = exp(S - lse_i) and dp -> dS = P * (dP - delta_i) * scale,
+// both zero above the diagonal when causal. lse and delta point at the chunk's first row.
+__global__ void k_attention_grad_scores(float* scores, float* dp, const float* lse, const float* delta,
+                                        int64_t n, int S, bool causal, float scale) {
+    for (int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; idx < n; idx += (int64_t)gridDim.x * blockDim.x) {
+        int64_t row = idx / S;
+        int j = (int)(idx - row * S);
+        int i = (int)(row % S);
+        float p = 0.0f, ds = 0.0f;
+        if (!causal || j <= i) {
+            p = expf(scores[idx] - lse[row]);
+            ds = p * (dp[idx] - delta[row]) * scale;
+        }
+        scores[idx] = p;
+        dp[idx] = ds;
+    }
+}
+
+void forward_gemm(const float* q, const float* k, const float* v, float* out, float* lse,
+                  int bh, int S, int D, bool causal, float scale) {
+    int chunk = heads_per_chunk(bh, S, 1);
+    int64_t hs = (int64_t)S * D, ss = (int64_t)S * S;
+    DeviceBuffer scores((size_t)(chunk * ss) * sizeof(float));
+    for (int h0 = 0; h0 < bh; h0 += chunk) {
+        int hc = std::min(chunk, bh - h0);
+        int64_t o = h0 * hs;
+        gemm_batched(false, true, S, S, D, scale, q + o, hs, k + o, hs, scores.f(), ss, hc);
+        k_attention_softmax<<<(unsigned)(hc * S), row_threads(S)>>>(scores.f(), lse + (int64_t)h0 * S, S, causal);
+        CUDA_CHECK(cudaGetLastError());
+        gemm_batched(false, false, S, D, S, 1.0f, scores.f(), ss, v + o, hs, out + o, hs, hc);
+    }
+}
+
+void backward_gemm(const float* q, const float* k, const float* v, const float* dout, const float* lse,
+                   const float* delta, float* dq, float* dk, float* dv, int bh, int S, int D, bool causal, float scale) {
+    int chunk = heads_per_chunk(bh, S, 2);
+    int64_t hs = (int64_t)S * D, ss = (int64_t)S * S;
+    DeviceBuffer scores((size_t)(chunk * ss) * sizeof(float)), dp((size_t)(chunk * ss) * sizeof(float));
+    for (int h0 = 0; h0 < bh; h0 += chunk) {
+        int hc = std::min(chunk, bh - h0);
+        int64_t o = h0 * hs;
+        gemm_batched(false, true, S, S, D, scale, q + o, hs, k + o, hs, scores.f(), ss, hc);
+        gemm_batched(false, true, S, S, D, 1.0f, dout + o, hs, v + o, hs, dp.f(), ss, hc);
+        int64_t n = hc * ss;
+        k_attention_grad_scores<<<grid_for(n, 256), 256>>>(scores.f(), dp.f(), lse + (int64_t)h0 * S,
+                                                          delta + (int64_t)h0 * S, n, S, causal, scale);
+        CUDA_CHECK(cudaGetLastError());
+        gemm_batched(true, false, S, D, S, 1.0f, scores.f(), ss, dout + o, hs, dv + o, hs, hc);  // P^T dO
+        gemm_batched(true, false, S, D, S, 1.0f, dp.f(), ss, q + o, hs, dk + o, hs, hc);         // dS^T Q
+        gemm_batched(false, false, S, D, S, 1.0f, dp.f(), ss, k + o, hs, dq + o, hs, hc);        // dS K
+    }
+}
+
 }  // namespace
 
-void attention_forward(const float* q, const float* k, const float* v, float* out, float* lse,
-                       int batch, int heads, int seq_len, int head_dim, bool causal, float scale) {
+void set_attention_gemm_max_seq(int seq_len) { g_gemm_max_seq = seq_len; }
+int attention_gemm_max_seq() { return g_gemm_max_seq; }
+
+AttentionImpl attention_forward(const float* q, const float* k, const float* v, float* out, float* lse,
+                                int batch, int heads, int seq_len, int head_dim, bool causal, float scale) {
     int bh = batch * heads;
-    if (bh == 0 || seq_len == 0) return;
-    switch (head_dim) {
-        case 16: launch_forward<16>(q, k, v, out, lse, bh, seq_len, causal, scale); break;
-        case 32: launch_forward<32>(q, k, v, out, lse, bh, seq_len, causal, scale); break;
-        case 64: launch_forward<64>(q, k, v, out, lse, bh, seq_len, causal, scale); break;
-        case 128: launch_forward<128>(q, k, v, out, lse, bh, seq_len, causal, scale); break;
-        default:
-            // Untiled kernel for other head sizes; its backward recomputes the statistics itself
+    AttentionImpl impl = seq_len <= g_gemm_max_seq ? AttentionImpl::Gemm
+                       : tiled_supported(head_dim) ? AttentionImpl::Tiled
+                                                   : AttentionImpl::Untiled;
+    if (bh == 0 || seq_len == 0) return impl;
+    switch (impl) {
+        case AttentionImpl::Gemm: forward_gemm(q, k, v, out, lse, bh, seq_len, head_dim, causal, scale); break;
+        case AttentionImpl::Untiled:
+            // Other head sizes at long lengths; writes no lse, its backward recomputes the statistics
             flash_attention_forward(q, k, v, out, batch, heads, seq_len, head_dim, causal, scale);
             break;
+        case AttentionImpl::Tiled:
+            switch (head_dim) {
+                case 16: launch_forward<16>(q, k, v, out, lse, bh, seq_len, causal, scale); break;
+                case 32: launch_forward<32>(q, k, v, out, lse, bh, seq_len, causal, scale); break;
+                case 64: launch_forward<64>(q, k, v, out, lse, bh, seq_len, causal, scale); break;
+                default: launch_forward<128>(q, k, v, out, lse, bh, seq_len, causal, scale); break;
+            }
+            break;
     }
+    return impl;
 }
 
 void attention_backward(const float* q, const float* k, const float* v, const float* out, const float* dout,
                         const float* lse, float* dq, float* dk, float* dv,
-                        int batch, int heads, int seq_len, int head_dim, bool causal, float scale) {
+                        int batch, int heads, int seq_len, int head_dim, bool causal, float scale, AttentionImpl impl) {
     int bh = batch * heads;
     if (bh == 0 || seq_len == 0) return;
-    if (!tiled_supported(head_dim)) {
+    if (impl == AttentionImpl::Untiled) {
         flash_attention_backward(q, k, v, out, dout, dq, dk, dv, batch, heads, seq_len, head_dim, causal, scale);
         return;
     }
@@ -319,6 +452,10 @@ void attention_backward(const float* q, const float* k, const float* v, const fl
     DeviceBuffer delta((size_t)rows * sizeof(float));
     k_attention_delta<<<(unsigned)((rows * 32 + 255) / 256), 256>>>(out, dout, delta.f(), rows, head_dim);
     CUDA_CHECK(cudaGetLastError());
+    if (impl == AttentionImpl::Gemm) {
+        backward_gemm(q, k, v, dout, lse, delta.f(), dq, dk, dv, bh, seq_len, head_dim, causal, scale);
+        return;
+    }
     switch (head_dim) {
         case 16: launch_backward<16>(q, k, v, dout, lse, delta.f(), dq, dk, dv, bh, seq_len, causal, scale); break;
         case 32: launch_backward<32>(q, k, v, dout, lse, delta.f(), dq, dk, dv, bh, seq_len, causal, scale); break;

@@ -42,14 +42,6 @@ namespace cuda {
     void softmax_forward(const float* in, float* out, int rows, int cols);
     void softmax_backward(const float* out, const float* grad_out, float* grad_in, int rows, int cols);
 
-    void layernorm_forward(const float* x, const float* gamma, const float* beta,
-                           float* out, float* mean, float* rstd,
-                           int rows, int cols, float eps);
-    void layernorm_backward(const float* grad_out, const float* x, const float* gamma,
-                            const float* mean, const float* rstd,
-                            float* grad_x, float* grad_gamma, float* grad_beta,
-                            int rows, int cols);
-
     void causal_mask(const float* in, float* out, int batch, int seq_len);
     void causal_mask_backward(const float* grad_out, float* grad_in, int batch, int seq_len);
     void sliding_window_mask(const float* in, float* out, int batch, int seq_len, int window_size);
@@ -77,6 +69,13 @@ namespace cuda {
     void rmsnorm_backward(const float* grad, const float* x, const float* gamma, const float* inv_rms,
                           float* gx, float* ggamma, int64_t rows, int64_t cols);
 
+    // LayerNorm over rows of `cols` elements, saving each row's mean and inverse std for backward.
+    // gx, ggamma and gbeta may be null to skip that gradient.
+    void layernorm_forward(const float* x, const float* gamma, const float* beta, float* out, float* mean,
+                           float* rstd, int64_t rows, int64_t cols, float eps);
+    void layernorm_backward(const float* grad, const float* x, const float* gamma, const float* mean, const float* rstd,
+                            float* gx, float* ggamma, float* gbeta, int64_t rows, int64_t cols);
+
     // Fused cross entropy: logits [rows, vocab], targets = class ids as floats. loss and count are
     // single device floats (mean loss over valid rows, number of valid rows); lse is [rows].
     void cross_entropy_forward(const float* logits, const float* targets, float* loss, float* lse, float* count,
@@ -96,14 +95,21 @@ namespace cuda {
     // Sum of squares over several device buffers, in double precision (for gradient clipping)
     double sum_of_squares(const std::vector<const float*>& buffers, const std::vector<int64_t>& sizes);
 
-    // ---- cuda_attention.cu: tiled attention (FlashAttention-style, deterministic backward) ----
+    // ---- cuda_attention.cu: attention (cuBLAS GEMM path or tiled kernels, deterministic backward) ----
     // q, k, v, out, dout, dq, dk, dv are [batch * heads, seq_len, head_dim]; lse is [batch * heads, seq_len].
-    // Head dims 16/32/64/128 use the tiled kernels; others fall back to the untiled flash kernels.
-    void attention_forward(const float* q, const float* k, const float* v, float* out, float* lse,
-                           int batch, int heads, int seq_len, int head_dim, bool causal, float scale);
+    // seq_len <= attention_gemm_max_seq() runs as batched GEMMs (any head dim); longer sequences use the
+    // tiled kernels for head dims 16/32/64/128 and the untiled flash kernels otherwise. Forward returns
+    // the implementation it used; pass it to backward, which needs the matching saved statistics.
+    enum class AttentionImpl { Gemm, Tiled, Untiled };
+    // Longest sequence that takes the GEMM path (default 2048). The GEMM path materializes [seq, seq]
+    // scores for a chunk of heads (at most 256 MB); 0 forces the tiled kernels, whose memory is linear in seq.
+    void set_attention_gemm_max_seq(int seq_len);
+    int attention_gemm_max_seq();
+    AttentionImpl attention_forward(const float* q, const float* k, const float* v, float* out, float* lse,
+                                    int batch, int heads, int seq_len, int head_dim, bool causal, float scale);
     void attention_backward(const float* q, const float* k, const float* v, const float* out, const float* dout,
                             const float* lse, float* dq, float* dk, float* dv,
-                            int batch, int heads, int seq_len, int head_dim, bool causal, float scale);
+                            int batch, int heads, int seq_len, int head_dim, bool causal, float scale, AttentionImpl impl);
 
     // Rotary Position Embeddings (RoPE)
     void rope_forward(const float* in, const float* cos_freqs, const float* sin_freqs,
