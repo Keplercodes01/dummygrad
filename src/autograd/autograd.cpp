@@ -217,7 +217,9 @@ void AutogradEngine::execute(std::shared_ptr<Node> root, const std::vector<int64
             if (!edge.function) continue;
 
             Node* next_node = edge.function.get();
-            std::shared_ptr<Tensor> grad_to_pass = (i < outgoing.size()) ? outgoing[i] : nullptr;
+            // Moved, not copied: the consumer may run before this loop ends, and AccumulateGrad
+            // adopts a gradient only when it holds the sole reference.
+            std::shared_ptr<Tensor> grad_to_pass = (i < outgoing.size()) ? std::move(outgoing[i]) : nullptr;
 
             bool ready = false;
             {
@@ -225,7 +227,7 @@ void AutogradEngine::execute(std::shared_ptr<Node> root, const std::vector<int64
                 if (grad_to_pass) {
                     auto& next_slots = node_grads[next_node];
                     if (next_slots.size() <= edge.input_slot) next_slots.resize(edge.input_slot + 1);
-                    next_slots[edge.input_slot].push_back(Contribution{curr->sequence_nr, i, grad_to_pass});
+                    next_slots[edge.input_slot].push_back(Contribution{curr->sequence_nr, i, std::move(grad_to_pass)});
                 }
                 ready = (--in_degree[next_node] == 0);
             }

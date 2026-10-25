@@ -1,5 +1,5 @@
 // GPU kernels for the ops a training step needs besides matmul and attention: broadcast binary
-// ops, scalar ops, RMSNorm, fused cross entropy, embedding lookup, GQA head repetition, and
+// ops, scalar ops, RMSNorm, LayerNorm, fused cross entropy, embedding lookup, GQA head repetition, and
 // sums of squares for gradient clipping.
 //
 // Every reduction is deterministic: each output is a fixed-order sum over a fixed partition of
@@ -66,11 +66,15 @@ __global__ void k_sum_partials(const float* partial, float* out, int64_t n_out, 
     }
 }
 
+// Aim for ~128K threads of work, at least 32 terms per chunk, at most 4096 chunks.
+int64_t reduction_splits(int64_t n_out, int64_t K) {
+    return std::min<int64_t>({std::max<int64_t>(1, K / 32), std::max<int64_t>(1, (131072 + n_out - 1) / n_out), 4096});
+}
+
 template <typename Term>
 void reduce_terms(const Term& term, int64_t n_out, int64_t K, float* out) {
     if (n_out <= 0) return;
-    // Aim for ~128K threads of work, at least 32 terms per chunk, at most 4096 chunks.
-    int64_t splits = std::min<int64_t>({std::max<int64_t>(1, K / 32), std::max<int64_t>(1, (131072 + n_out - 1) / n_out), 4096});
+    int64_t splits = reduction_splits(n_out, K);
     if (splits <= 1) {
         k_reduce_partials<<<grid_for(n_out), kThreads>>>(term, n_out, K, 1, out);
         CUDA_CHECK(cudaGetLastError());
@@ -286,6 +290,88 @@ struct RMSNormGradGamma {
 };
 
 // ---------------------------------------------------------------------------------------------
+// LayerNorm over rows of length cols: out = (x - mean) * rstd * gamma + beta
+// ---------------------------------------------------------------------------------------------
+
+int norm_threads(int64_t cols) { return (int)std::min<int64_t>(kThreads, std::max<int64_t>(32, (cols + 31) / 32 * 32)); }
+
+__global__ void k_layernorm_forward(const float* x, const float* gamma, const float* beta, float* out, float* mean,
+                                    float* rstd, int64_t cols, float eps) {
+    int64_t row = blockIdx.x;
+    const float* xr = x + row * cols;
+    float sum = 0.0f;
+    for (int64_t j = threadIdx.x; j < cols; j += blockDim.x) sum += xr[j];
+    float total = block_reduce_sum(sum);
+    __shared__ float s_mean, s_rstd;
+    if (threadIdx.x == 0) s_mean = total / (float)cols;
+    __syncthreads();
+    float mu = s_mean;
+    // Two-pass variance: sum((x - mean)^2) avoids the cancellation of E[x^2] - mean^2
+    float sq = 0.0f;
+    for (int64_t j = threadIdx.x; j < cols; j += blockDim.x) {
+        float d = xr[j] - mu;
+        sq += d * d;
+    }
+    float var_total = block_reduce_sum(sq);
+    if (threadIdx.x == 0) {
+        s_rstd = rsqrtf(var_total / (float)cols + eps);
+        mean[row] = mu;
+        rstd[row] = s_rstd;
+    }
+    __syncthreads();
+    float rs = s_rstd;
+    for (int64_t j = threadIdx.x; j < cols; j += blockDim.x) out[row * cols + j] = (xr[j] - mu) * rs * gamma[j] + beta[j];
+}
+
+// dx = rstd * (u - mean(u) - xhat * mean(u * xhat)),  u = grad * gamma, xhat = (x - mean) * rstd
+__global__ void k_layernorm_backward_x(const float* grad, const float* x, const float* gamma, const float* mean,
+                                       const float* rstd, float* gx, int64_t cols) {
+    int64_t row = blockIdx.x;
+    const float* xr = x + row * cols;
+    const float* gr = grad + row * cols;
+    float mu = mean[row], rs = rstd[row];
+    float sum_u = 0.0f, sum_u_xhat = 0.0f;
+    for (int64_t j = threadIdx.x; j < cols; j += blockDim.x) {
+        float u = gr[j] * gamma[j];
+        sum_u += u;
+        sum_u_xhat += u * (xr[j] - mu) * rs;
+    }
+    float total_u = block_reduce_sum(sum_u);
+    float total_u_xhat = block_reduce_sum(sum_u_xhat);
+    __shared__ float s_mean_u, s_mean_u_xhat;
+    if (threadIdx.x == 0) {
+        s_mean_u = total_u / (float)cols;
+        s_mean_u_xhat = total_u_xhat / (float)cols;
+    }
+    __syncthreads();
+    float mean_u = s_mean_u, mean_u_xhat = s_mean_u_xhat;
+    for (int64_t j = threadIdx.x; j < cols; j += blockDim.x) {
+        float xhat = (xr[j] - mu) * rs;
+        gx[row * cols + j] = rs * (gr[j] * gamma[j] - mean_u - xhat * mean_u_xhat);
+    }
+}
+
+// dgamma[j] = sum over rows of grad * xhat, dbeta[j] = sum over rows of grad. Both come from one
+// pass over grad and x, split over rows like reduce_terms; partials for split s are at s * cols.
+__global__ void k_layernorm_param_partials(const float* grad, const float* x, const float* mean, const float* rstd,
+                                           int64_t rows, int64_t cols, int splits, float* pg, float* pb) {
+    int64_t items = cols * splits;
+    for (int64_t w = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; w < items; w += (int64_t)gridDim.x * blockDim.x) {
+        int64_t j = w % cols;
+        int64_t s = w / cols;
+        int64_t r0 = rows * s / splits, r1 = rows * (s + 1) / splits;
+        float acc_g = 0.0f, acc_b = 0.0f;
+        for (int64_t r = r0; r < r1; ++r) {
+            float g = grad[r * cols + j];
+            acc_g += g * (x[r * cols + j] - mean[r]) * rstd[r];
+            acc_b += g;
+        }
+        if (pg) pg[s * cols + j] = acc_g;
+        if (pb) pb[s * cols + j] = acc_b;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Fused cross entropy over logits [rows, vocab] with class ids stored as floats.
 // ---------------------------------------------------------------------------------------------
 
@@ -488,6 +574,41 @@ void rmsnorm_backward(const float* grad, const float* x, const float* gamma, con
         CUDA_CHECK(cudaGetLastError());
     }
     if (ggamma) reduce_terms(RMSNormGradGamma{grad, x, inv_rms, cols}, cols, rows, ggamma);
+}
+
+void layernorm_forward(const float* x, const float* gamma, const float* beta, float* out, float* mean,
+                       float* rstd, int64_t rows, int64_t cols, float eps) {
+    if (rows == 0) return;
+    k_layernorm_forward<<<(unsigned)rows, norm_threads(cols)>>>(x, gamma, beta, out, mean, rstd, cols, eps);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void layernorm_backward(const float* grad, const float* x, const float* gamma, const float* mean, const float* rstd,
+                        float* gx, float* ggamma, float* gbeta, int64_t rows, int64_t cols) {
+    if (rows == 0) return;
+    if (gx) {
+        k_layernorm_backward_x<<<(unsigned)rows, norm_threads(cols)>>>(grad, x, gamma, mean, rstd, gx, cols);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    if (!ggamma && !gbeta) return;
+    int64_t splits = reduction_splits(cols, rows);
+    if (splits <= 1) {
+        k_layernorm_param_partials<<<grid_for(cols), kThreads>>>(grad, x, mean, rstd, rows, cols, 1, ggamma, gbeta);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    DeviceBuffer pg((size_t)(cols * splits) * sizeof(float)), pb((size_t)(cols * splits) * sizeof(float));
+    k_layernorm_param_partials<<<grid_for(cols * splits), kThreads>>>(grad, x, mean, rstd, rows, cols, (int)splits,
+                                                                      pg.as<float>(), pb.as<float>());
+    CUDA_CHECK(cudaGetLastError());
+    if (ggamma) {
+        k_sum_partials<<<grid_for(cols), kThreads>>>(pg.as<float>(), ggamma, cols, (int)splits);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    if (gbeta) {
+        k_sum_partials<<<grid_for(cols), kThreads>>>(pb.as<float>(), gbeta, cols, (int)splits);
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 void cross_entropy_forward(const float* logits, const float* targets, float* loss, float* lse, float* count,

@@ -634,11 +634,11 @@ Training-step time (forward, backward, AdamW) for the same ModernTransformer arc
 
 | config | params | dummygrad | PyTorch 2.11 | |
 |---|---|---|---|---|
-| tiny (d=128, 2 layers, batch 8x64) | 0.4M | **3.5 ms** | 9.2 ms | 2.6x faster |
-| small (d=256, 4 layers, batch 16x128) | 3.9M | **23.6 ms** | 27.1 ms | 15% faster |
-| medium (d=512, 6 layers, batch 8x256) | 23.1M | 112.6 ms | **108.6 ms** | within 4% |
+| tiny (d=128, 2 layers, batch 8x64) | 0.4M | **2.9 ms** | 8.6 ms | 3.0x faster |
+| small (d=256, 4 layers, batch 16x128) | 3.9M | **23.9 ms** | 27.6 ms | 13% faster |
+| medium (d=512, 6 layers, batch 8x256) | 23.1M | **103.6 ms** | 107.7 ms | 4% faster |
 
-dummygrad's advantage is per-op overhead (no Python, no dispatcher), which dominates small models; at larger sizes both are bound by cuBLAS matrix multiplies. Reproduce it with the [Colab notebook](notebooks/dummygrad_colab.ipynb), or run `./build/dg_bench` and `python bench/bench_torch.py` on your own GPU. `./build/dg_bench --profile` breaks backward time down by op.
+dummygrad's advantage is per-op overhead (no Python, no dispatcher), which dominates small models; at larger sizes both are bound by cuBLAS matrix multiplies (`MatmulBackward` is 47 of medium's 104 ms). Reproduce it with the [Colab notebook](notebooks/dummygrad_colab.ipynb), or run `./build/dg_bench` and `python bench/bench_torch.py` on your own GPU. `./build/dg_bench --profile` breaks backward time down by op.
 
 ---
 
@@ -647,8 +647,7 @@ dummygrad's advantage is per-op overhead (no Python, no dispatcher), which domin
 dummygrad is pre-1.0: the core training path (CPU and CUDA, FP32) is covered by `test_engine`; other paths are less exercised.
 
 - **Half precision on CUDA.** FP16/BF16 are supported by `matmul` and data movement; elementwise, normalization and attention kernels are FP32, so there is no mixed-precision training yet.
-- **Attention** uses tiled kernels for head dimensions 16, 32, 64 and 128; other head dimensions (up to 512) fall back to slower untiled kernels.
-- **LayerNorm backward on CUDA** still accumulates gamma/beta gradients with atomics, so GPT-style models are not bitwise reproducible on the GPU (ModernTransformer is).
+- **Attention** runs as cuBLAS GEMMs for sequences up to 2048 tokens (any head dimension) and as tiled kernels beyond that for head dimensions 16, 32, 64 and 128. Other head dimensions past 2048 tokens (up to 512) fall back to slower untiled kernels, whose backward uses atomics and is not bitwise reproducible.
 - **Multi-GPU gradient aggregation** currently reduces through host memory.
 - **Metal and TPU kernels** are not covered by the test suite (macOS CI runs the CPU backend).
 
