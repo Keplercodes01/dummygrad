@@ -8,19 +8,23 @@
 // mean is not a reliable number there.
 //
 //   ./dg_bench                  all configurations
-//   ./dg_bench small            one configuration (tiny, small, medium)
+//   ./dg_bench small            one configuration (tiny, small, medium, large)
 //   ./dg_bench --profile        also print the most expensive forward and backward ops per configuration
 //   ./dg_bench --fp16           matmuls and attention on fp16 tensor cores (AutocastGuard + GradScaler)
 //   ./dg_bench --bf16           matmuls and attention on bf16 tensor cores (Ampere or newer)
 //   ./dg_bench --worker-threads run backward on the engine's worker pool (the GPU default is the calling thread)
 //   ./dg_bench --seconds 5      time each configuration for at least 5 seconds (default 2)
+//   ./dg_bench --json out.json  also write the results as JSON (bench/compare.py reads it)
 
 #include "dummy_core.h"
+#include "allocator.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -33,6 +37,7 @@ static const std::vector<BenchConfig> kConfigs = {
     {"tiny", 512, 128, 2, 4, 2, 8, 64},
     {"small", 4096, 256, 4, 8, 4, 16, 128},
     {"medium", 8192, 512, 6, 8, 8, 8, 256},
+    {"large", 32000, 768, 12, 12, 4, 8, 512},
 };
 
 static void sync(Device device) {
@@ -60,11 +65,13 @@ int main(int argc, char** argv) {
     std::string only;
     bool profile = false;
     double min_seconds = 2.0;
+    std::string json_path;
     DType compute = DType::Float32;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--profile") profile = true;
         else if (arg == "--seconds" && i + 1 < argc) min_seconds = std::stod(argv[++i]);
+        else if (arg == "--json" && i + 1 < argc) json_path = argv[++i];
         else if (arg == "--fp16") compute = DType::Float16;
         else if (arg == "--bf16") compute = DType::BFloat16;
         else if (arg == "--worker-threads") set_backward_execution(BackwardExecution::ThreadPool);
@@ -82,16 +89,29 @@ int main(int argc, char** argv) {
     if (mode == BackwardExecution::Auto) {
         mode = device == Device::CPU ? BackwardExecution::ThreadPool : BackwardExecution::CallingThread;
     }
+    std::string device_name = "CPU";
+#ifdef USE_CUDA
+    if (device == Device::CUDA) {
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) device_name = prop.name;
+    }
+#endif
     std::printf("dummygrad %s benchmark on %s, %s autocast, backward on %s\n", DUMMYGRAD_VERSION,
-                device == Device::CUDA ? "CUDA" : "CPU", compute_name,
+                device_name.c_str(), compute_name,
                 mode == BackwardExecution::CallingThread ? "the calling thread" : "worker threads");
     std::printf("median of >= %d steps and >= %.0f s per config after %d warmup; p10-p90 is the spread of step times\n\n",
                 min_steps, min_seconds, warmup);
-    std::printf("| config | params | ms/step | p10-p90 | tokens/s | forward | backward | optimizer | steps | copies/step | MB/step |\n");
-    std::printf("|---|---|---|---|---|---|---|---|---|---|---|\n");
+    std::printf("| config | params | ms/step | p10-p90 | tokens/s | forward | backward | optimizer | steps | peak MB | copies/step | MB/step |\n");
+    std::printf("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    std::ostringstream json;
+    json << "{\"framework\": \"dummygrad\", \"version\": \"" << DUMMYGRAD_VERSION << "\", \"device\": \"" << device_name
+         << "\", \"precision\": \"" << compute_name << "\", \"configs\": [";
+    bool first_json = true;
 
     for (const auto& c : kConfigs) {
         if (!only.empty() && only != c.name) continue;
+        // Each configuration starts from an empty cache, so earlier ones don't shape its memory
+        CUDACachingAllocator::get().empty_cache();
         manual_seed(0);
         ModernTransformer model(c.vocab, c.seq_len, c.d_model, c.n_heads, c.n_layers, c.n_kv_heads);
         model.to(device);
@@ -123,7 +143,12 @@ int main(int argc, char** argv) {
         for (int s = 0; s < warmup + max_steps; ++s) {
             bool timed = s >= warmup;
             if (timed && (int)t_step.size() >= min_steps && timed_ms >= min_seconds * 1000.0) break;
-            if (s == warmup) reset_transfer_stats();
+            if (s == warmup) {
+                reset_transfer_stats();
+#ifdef DUMMYGRAD_HAS_MEMORY_STATS
+                reset_peak_memory_stats();
+#endif
+            }
             optimizer.zero_grad(params);
             sync(device);
             double t0 = now_ms();
@@ -150,11 +175,25 @@ int main(int argc, char** argv) {
         double per_step = quantile(t_step, 0.5);
         double copies = (double)(traffic.to_device_count + traffic.to_host_count) / steps;
         double mb = (double)(traffic.to_device_bytes + traffic.to_host_bytes) / steps / 1e6;
-        std::printf("| %s | %.1fM | %.2f | %.2f-%.2f | %.0f | %.2f | %.2f | %.2f | %d | %.0f | %.1f |\n", c.name.c_str(),
-                    model.num_parameters() / 1e6, per_step, quantile(t_step, 0.1), quantile(t_step, 0.9),
-                    c.batch * c.seq_len * 1000.0 / per_step, quantile(t_fwd, 0.5), quantile(t_bwd, 0.5),
-                    quantile(t_opt, 0.5), (int)t_step.size(), copies, mb);
+        // Peak GPU memory held by tensors over the timed steps (parameters, gradients, optimizer
+        // state and activations), like torch.cuda.max_memory_allocated
+        // (0 when built against a version without memory statistics, as a same-session baseline may be)
+        double peak_mb = 0.0;
+#ifdef DUMMYGRAD_HAS_MEMORY_STATS
+        if (device == Device::CUDA) peak_mb = (double)cuda_memory_stats().peak_in_use / 1e6;
+#endif
+        double tokens_per_s = c.batch * c.seq_len * 1000.0 / per_step;
+        std::printf("| %s | %.1fM | %.2f | %.2f-%.2f | %.0f | %.2f | %.2f | %.2f | %d | %.0f | %.0f | %.1f |\n", c.name.c_str(),
+                    model.num_parameters() / 1e6, per_step, quantile(t_step, 0.1), quantile(t_step, 0.9), tokens_per_s,
+                    quantile(t_fwd, 0.5), quantile(t_bwd, 0.5), quantile(t_opt, 0.5), (int)t_step.size(), peak_mb,
+                    copies, mb);
         std::fflush(stdout);
+        json << (first_json ? "" : ", ") << "{\"name\": \"" << c.name << "\", \"params_m\": " << model.num_parameters() / 1e6
+             << ", \"ms\": " << per_step << ", \"p10\": " << quantile(t_step, 0.1) << ", \"p90\": " << quantile(t_step, 0.9)
+             << ", \"forward\": " << quantile(t_fwd, 0.5) << ", \"backward\": " << quantile(t_bwd, 0.5)
+             << ", \"optimizer\": " << quantile(t_opt, 0.5) << ", \"steps\": " << t_step.size()
+             << ", \"tokens_per_s\": " << tokens_per_s << ", \"peak_mb\": " << peak_mb << "}";
+        first_json = false;
 
         if (profile) {
             // Separate pass: profiling synchronizes at every op and serializes backward, which skews
@@ -190,5 +229,9 @@ int main(int argc, char** argv) {
         }
     }
     for (const auto& report : profiles) std::printf("%s", report.c_str());
+    if (!json_path.empty()) {
+        json << "]}\n";
+        std::ofstream(json_path) << json.str();
+    }
     return 0;
 }

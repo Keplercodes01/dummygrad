@@ -1,5 +1,6 @@
 #include "allocator.h"
 #include "metal/metal_backend.h"
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 #ifdef USE_CUDA
@@ -52,18 +53,20 @@ void* CUDACachingAllocator::allocate(size_t bytes) {
     std::lock_guard<std::mutex> lock(mtx);
 
     auto& blocks = free_blocks[dev][alloc_size];
-    if (!blocks.empty()) {
-        void* ptr = blocks.back();
-        blocks.pop_back();
-        return ptr;
-    }
-
     void* ptr = nullptr;
-    cudaError_t err = cudaMalloc(&ptr, alloc_size);
-    if (err != cudaSuccess || !ptr) {
-        throw std::bad_alloc();
+    if (!blocks.empty()) {
+        ptr = blocks.back();
+        blocks.pop_back();
+    } else {
+        cudaError_t err = cudaMalloc(&ptr, alloc_size);
+        if (err != cudaSuccess || !ptr) {
+            throw std::bad_alloc();
+        }
+        ptr_device[ptr] = dev;
+        stats.reserved += alloc_size;
     }
-    ptr_device[ptr] = dev;
+    stats.in_use += alloc_size;
+    stats.peak_in_use = std::max(stats.peak_in_use, stats.in_use);
     return ptr;
 #else
     (void)bytes;
@@ -86,6 +89,7 @@ void CUDACachingAllocator::free(void* ptr, size_t bytes) {
         ptr_device[ptr] = dev;
     }
     free_blocks[dev][alloc_size].push_back(ptr);
+    stats.in_use -= std::min(stats.in_use, alloc_size);
 #else
     (void)bytes;
 #endif
@@ -99,12 +103,16 @@ void CUDACachingAllocator::empty_cache() {
             for (void* ptr : pair.second) {
                 cudaFree(ptr);
                 ptr_device.erase(ptr);
+                stats.reserved -= std::min(stats.reserved, pair.first);
             }
         }
     }
     free_blocks.clear();
 #endif
 }
+
+MemoryStats cuda_memory_stats() { return CUDACachingAllocator::get().memory_stats(); }
+void reset_peak_memory_stats() { CUDACachingAllocator::get().reset_peak(); }
 
 static thread_local bool g_arena_active = false;
 
