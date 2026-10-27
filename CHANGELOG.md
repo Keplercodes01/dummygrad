@@ -2,7 +2,7 @@
 
 All notable changes to dummygrad are documented here. Versions follow [Semantic Versioning](https://semver.org/); while the major version is 0, minor releases may change behavior.
 
-## [Unreleased]
+## [0.6.1] - 2026-10-27
 
 Faster fp16 backward for matmuls. On a T4 (Kaggle), the fp16 medium step goes from 57.2 to 53.8 ms (PyTorch 2.11 fp16: 51.8 ms), and `MatmulBackward` from 16.7 to 13.9 ms. small goes from 22.0 to 21.3 ms.
 

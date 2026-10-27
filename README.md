@@ -16,6 +16,10 @@ No Python. No bindings. No GIL. No multi-layer dispatcher overhead. Just raw, fr
 
 Full details for every release are in [CHANGELOG.md](CHANGELOG.md).
 
+### v0.6.1: faster fp16 backward
+- **fp16 medium step 57.2 → 53.8 ms on a T4** (PyTorch fp16: 51.8 ms). Each matmul's backward reuses the half-precision copies its forward made instead of converting its inputs again, which takes `MatmulBackward` from 16.7 to 13.9 ms. Saved activations are half-size copies too.
+- **Frozen weights cost no gradient work:** when one matmul input doesn't require grad (a frozen base model under LoRA, a fixed input), backward skips that GEMM and doesn't keep the tensor it would have needed.
+
 ### v0.6.0: mixed precision
 - **fp16 training nearly halves step time on larger models.** `AutocastGuard` runs matmuls and attention on tensor cores, and `GradScaler` handles loss scaling. On a T4, the 23M-parameter step goes from 107.6 to 57.2 ms. PyTorch fp16 takes 51.4 ms; dummygrad is faster at 0.4M and 3.9M. See [Mixed precision](#mixed-precision).
 - **Everything else stays fp32**: parameters, gradients, optimizer state, softmax and normalization. Your training code only adds the guard and the scaler.
@@ -226,7 +230,7 @@ set(CMAKE_CXX_STANDARD 17)
 include(FetchContent)
 FetchContent_Declare(dummygrad
     GIT_REPOSITORY https://github.com/Keplercodes01/dummygrad.git
-    GIT_TAG        v0.6.0)
+    GIT_TAG        v0.6.1)
 FetchContent_MakeAvailable(dummygrad)
 
 add_executable(my_app main.cpp)
@@ -316,7 +320,7 @@ TrainingState state = load_checkpoint("ckpt.safetensors", model, &optimizer);   
 
 ### Mixed precision
 
-On CUDA, `AutocastGuard` runs every matmul, and the matrix products inside attention, on fp16 (or bf16) tensor cores. Inputs are rounded to half precision, products accumulate in fp32, and outputs are fp32. The attention softmax, parameters, gradients, optimizer state and every other op stay fp32, so nothing else in your code changes. fp16 needs loss scaling so that small gradients don't round to zero, and `GradScaler` handles it:
+On CUDA, `AutocastGuard` runs every matmul, and the matrix products inside attention, on fp16 (or bf16) tensor cores. Inputs are rounded to half precision, products accumulate in fp32, and outputs are fp32. The attention softmax, parameters, gradients, optimizer state and every other op stay fp32, so nothing else in your code changes. Each matmul's backward reuses the half-precision copies its forward made, so the conversion is paid once. fp16 needs loss scaling so that small gradients don't round to zero, and `GradScaler` handles it:
 
 ```cpp
 GradScaler scaler;                                       // skip it for bf16
@@ -686,11 +690,11 @@ With fp16 mixed precision (`dg_bench --fp16`: `AutocastGuard` + `GradScaler`, ag
 
 | config | dummygrad fp32 | dummygrad fp16 | PyTorch 2.11 fp16 | |
 |---|---|---|---|---|
-| tiny | 4.1 ms | 4.7 ms | 12.4 ms | 2.6x faster |
-| small | 28.2 ms | 22.0 ms | 23.8 ms | 8% faster |
-| medium | 107.6 ms | **57.2 ms** | **51.4 ms** | 11% slower |
+| tiny | 4.1 ms | 5.0 ms | 11.0 ms | 2.2x faster |
+| small | 28.2 ms | 21.3 ms | 23.1 ms | 8% faster |
+| medium | 107.6 ms | **53.8 ms** | **51.8 ms** | 4% slower |
 
-fp16 nearly halves the medium step: `MatmulBackward` drops from 48 to 17 ms. Below about 1M parameters the conversions cost more than the tensor cores save, so stay in fp32 there. PyTorch's autocast also runs elementwise and normalization ops in fp16, which is most of its remaining lead at 23M.
+The fp16 columns are from v0.6.1; the fp32 column is from the v0.6.0 run (v0.6.1 does not change the fp32 path in this model). fp16 halves the medium step: `MatmulBackward` drops from 48 to 14 ms. Below about 1M parameters the conversions cost more than the tensor cores save, so stay in fp32 there. PyTorch's autocast also runs elementwise and normalization ops in fp16, which is most of its remaining lead at 23M.
 
 ---
 
