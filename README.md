@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/Keplercodes01/dummygrad/actions/workflows/ci.yml/badge.svg)](https://github.com/Keplercodes01/dummygrad/actions/workflows/ci.yml)
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Keplercodes01/dummygrad/blob/main/notebooks/dummygrad_colab.ipynb)
+[![Open in Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/Keplercodes01/dummygrad/blob/main/notebooks/dummygrad_colab.ipynb)
 
 A pure C++ deep learning engine engineered for absolute speed, zero abstraction bloat, and minimal codebase maintenance.
 
@@ -95,11 +96,17 @@ Full details for every release are in [CHANGELOG.md](CHANGELOG.md).
 
 ### Try it in your browser (no install)
 
-The fastest way to see dummygrad run is on a free Colab GPU:
+The fastest way to see dummygrad run is on a free GPU in Colab or Kaggle. The same notebook works on both.
 
+**Colab:**
 1. Click the **Open in Colab** badge at the top of this page.
 2. Select **Runtime → Change runtime type → T4 GPU**.
 3. Select **Runtime → Run all**.
+
+**Kaggle** (if Colab is unavailable to you):
+1. Click the **Open in Kaggle** badge at the top of this page.
+2. In the **Settings** panel, set **Accelerator → GPU T4 x2** and turn **Internet** on (Kaggle asks for phone verification once).
+3. Select **Run All**.
 
 The notebook builds dummygrad with CUDA, runs the test suite, the quickstart example, and a transformer training demo — about 5 minutes end to end.
 
