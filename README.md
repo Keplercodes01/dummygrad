@@ -676,6 +676,16 @@ Training-step time (forward, backward, AdamW) for the same ModernTransformer arc
 
 dummygrad's advantage is per-op overhead (no Python, no dispatcher), which dominates small models; at larger sizes both are bound by cuBLAS matrix multiplies (`MatmulBackward` is 47 of medium's 104 ms). Reproduce it with the [Colab notebook](notebooks/dummygrad_colab.ipynb), or run `./build/dg_bench` and `python bench/bench_torch.py` on your own GPU. `./build/dg_bench --profile` breaks backward time down by op.
 
+With fp16 mixed precision (`dg_bench --fp16`: `AutocastGuard` + `GradScaler`, against `torch.autocast` + `GradScaler`), on a Kaggle T4:
+
+| config | dummygrad fp32 | dummygrad fp16 | PyTorch 2.11 fp16 | |
+|---|---|---|---|---|
+| tiny | 4.1 ms | 4.7 ms | 12.4 ms | 2.6x faster |
+| small | 28.2 ms | 22.0 ms | 23.8 ms | 8% faster |
+| medium | 107.6 ms | **57.2 ms** | **51.4 ms** | 11% slower |
+
+fp16 nearly halves the medium step: `MatmulBackward` drops from 48 to 17 ms. Below about 1M parameters the conversions cost more than the tensor cores save, so stay in fp32 there. PyTorch's autocast also runs elementwise and normalization ops in fp16, which is most of its remaining lead at 23M.
+
 ---
 
 ## Status & Known Limitations
