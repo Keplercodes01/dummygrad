@@ -165,7 +165,7 @@ struct RepeatKVBackward : public Node {
 inline std::shared_ptr<Tensor> repeat_kv(const std::shared_ptr<Tensor>& x_in, int64_t group) {
     DG_PROFILE_OP("repeat_kv");
     if (group == 1) return x_in;
-    auto x = contiguous(x_in);
+    auto x = contiguous(float32_input(x_in));
     if (x->ndim() != 4) throw std::invalid_argument("repeat_kv: expected [batch, kv_heads, seq, head_dim]");
     int64_t batch = x->shape[0], kv_heads = x->shape[1], head_elems = x->shape[2] * x->shape[3];
     std::vector<int64_t> out_shape{batch, kv_heads * group, x->shape[2], x->shape[3]};

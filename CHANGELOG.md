@@ -2,6 +2,22 @@
 
 All notable changes to dummygrad are documented here. Versions follow [Semantic Versioning](https://semver.org/); while the major version is 0, minor releases may change behavior.
 
+## [Unreleased]
+
+Groundwork for keeping activations in fp16 under autocast: half-precision tensors now work with every op. Speed is unchanged; the fp16 kernels and the switch come next.
+
+### Added
+- **`cast(x, dtype)`**: differentiable conversion between Float32, Float16 and BFloat16 (nearest-even rounding); the gradient is converted back to the input's dtype.
+- **Every op accepts fp16 and bf16 inputs.** An op without a native half-precision kernel converts such an input to fp32 first (differentiably) and returns fp32, so an unsupported dtype costs a conversion, never precision or an error. Before, passing an fp16 tensor to almost any op threw.
+- CUDA `matmul` and `linear` take Float32, Float16 or BFloat16 inputs: an input already in the GEMM's compute dtype is used as is, others are converted. Each input's gradient comes back in its own dtype.
+- Tests: `cast` rounding and gradients (CPU and CUDA, no host copies on CUDA); 18 ops given fp16 inputs produce bit-identical outputs to fp32 inputs, with the fp32 gradient rounded once to fp16.
+
+### Changed
+- `Tensor::to(dtype)` on a CUDA tensor converts on the GPU. It used to copy to the host, convert there and copy back.
+- CUDA `fill` and `add_inplace` (gradient accumulation) work on fp16 and bf16, summing in fp32 and rounding once.
+- `SliceBackward` copies by element size, so it works in any dtype, and on CUDA builds the gradient on the device with one strided copy. It used to round-trip every GPU gradient through the host.
+- Anomaly detection also checks fp16 and bf16 gradients.
+
 ## [0.7.0] - 2026-10-27
 
 Fused Linear and single-threaded GPU backward. On a T4 (Kaggle), fp16:

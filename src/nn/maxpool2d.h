@@ -49,7 +49,7 @@ struct MaxPool2dBackward : public Node {
 
 inline std::shared_ptr<Tensor> max_pool2d(const std::shared_ptr<Tensor>& x_in, int kH, int kW, int strideH, int strideW) {
     DG_PROFILE_OP("max_pool2d");
-    auto x = contiguous(x_in);
+    auto x = contiguous(float32_input(x_in));
     if (!x) throw std::runtime_error("max_pool2d: input tensor is null");
     if (x->ndim() != 4) throw std::runtime_error("max_pool2d: x must be a 4D tensor (B, C, H, W)");
     if (strideH <= 0 || strideW <= 0) throw std::runtime_error("max_pool2d: strides must be > 0");

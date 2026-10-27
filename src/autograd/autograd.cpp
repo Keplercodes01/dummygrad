@@ -32,9 +32,8 @@ static std::vector<std::shared_ptr<Tensor>> apply_node(Node& node, const std::ve
 static void check_finite_grads(const Node& node, const std::vector<std::shared_ptr<Tensor>>& grads) {
     for (size_t i = 0; i < grads.size(); ++i) {
         const auto& g = grads[i];
-        if (!g || g->dtype != DType::Float32) continue;
-        auto host = make_contiguous(g);
-        if (host->device != Device::CPU) host = host->to(Device::CPU);
+        if (!g || (g->dtype != DType::Float32 && g->dtype != DType::Float16 && g->dtype != DType::BFloat16)) continue;
+        auto host = make_contiguous(g)->to(Device::CPU, DType::Float32);
         const float* p = host->data_ptr<float>();
         for (int64_t k = 0; k < host->size(); ++k) {
             if (!std::isfinite(p[k])) {

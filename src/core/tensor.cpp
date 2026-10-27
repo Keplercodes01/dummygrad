@@ -236,6 +236,16 @@ std::shared_ptr<Tensor> Tensor::to(Device target_device, DType target_dtype, int
         return contiguous_self->to(target_device, target_dtype, device_id);
     }
 
+#ifdef USE_CUDA
+    // Float dtype conversion on the GPU itself, no host round trip
+    auto is_float = [](DType d) { return d == DType::Float32 || d == DType::Float16 || d == DType::BFloat16; };
+    if (this->device == Device::CUDA && target_device == Device::CUDA && is_float(this->dtype) && is_float(target_dtype)) {
+        auto out = std::make_shared<Tensor>(this->shape, Device::CUDA, target_dtype, this->requires_grad);
+        cuda::convert(this->data_ptr<void>(), this->dtype, out->data_ptr<void>(), target_dtype, this->size());
+        return out;
+    }
+#endif
+
     // Step 1: If dtype conversion is needed and tensor is on an accelerator (CUDA/TPU/MPS),
     // stage through CPU to perform the dtype conversion.
     if (this->dtype != target_dtype && this->device != Device::CPU) {

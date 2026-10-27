@@ -5,10 +5,15 @@
 #include "functional.h"
 #include "ops.h"
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 
 #ifdef USE_CUDA
 #include "cuda/cuda_ops.cuh"
+// For the few runtime calls made directly from op headers
+inline void check_cuda(cudaError_t err, const char* what) {
+    if (err != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(err));
+}
 #endif
 #include "metal/metal_backend.h"
 #include "tpu/tpu_runner.h"
@@ -65,6 +70,50 @@ inline std::shared_ptr<Tensor> contiguous(const std::shared_ptr<Tensor>& a) {
 }
 
 // ========================================
+// Dtype conversion
+// ========================================
+inline bool is_float_dtype(DType dtype) {
+    return dtype == DType::Float32 || dtype == DType::Float16 || dtype == DType::BFloat16;
+}
+
+struct CastBackward : public Node {
+    DType input_dtype;
+    explicit CastBackward(DType input_dtype) : input_dtype(input_dtype) {}
+    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0]) return {nullptr};
+        return {grads[0]->to(input_dtype)};
+    }
+};
+
+// Converts between Float32, Float16 and BFloat16 (round to nearest even when narrowing), on the
+// tensor's own device. Differentiable: the gradient is converted back to the input's dtype.
+// Returns the input itself when it already has the dtype.
+inline std::shared_ptr<Tensor> cast(const std::shared_ptr<Tensor>& a, DType dtype) {
+    if (!a) throw std::invalid_argument("cast: null tensor");
+    if (a->dtype == dtype) return a;
+    if (!is_float_dtype(a->dtype) || !is_float_dtype(dtype)) {
+        throw std::invalid_argument("cast: only Float32, Float16 and BFloat16 convert differentiably");
+    }
+    DG_PROFILE_OP("cast");
+    auto out = a->to(a->device, dtype);
+    out->requires_grad = needs_grad(a);
+    if (needs_grad(a)) {
+        auto grad_fn = std::make_shared<CastBackward>(a->dtype);
+        grad_fn->add_next_edge(get_grad_edge(a).function);
+        out->grad_fn = grad_fn;
+    }
+    return out;
+}
+
+// Ops without a native half-precision kernel compute in fp32: they pass their inputs through
+// this, which converts a Float16 or BFloat16 tensor to Float32 (differentiably) and returns
+// anything else untouched. Such an op returns fp32 for a half-precision input: an unsupported
+// dtype costs a conversion, never precision or an error.
+inline std::shared_ptr<Tensor> float32_input(const std::shared_ptr<Tensor>& a) {
+    return (a && (a->dtype == DType::Float16 || a->dtype == DType::BFloat16)) ? cast(a, DType::Float32) : a;
+}
+
+// ========================================
 // From activations.h
 // ========================================
 // --- RELU BACKWARD NODE ---
@@ -102,7 +151,7 @@ struct ReluBackward : public Node {
 // relu
 inline std::shared_ptr<Tensor> relu(const std::shared_ptr<Tensor>& a_in) {
     DG_PROFILE_OP("relu");
-    auto a = contiguous(a_in);
+    auto a = contiguous(float32_input(a_in));
     bool req_grad = grad_enabled() && (a->requires_grad);
     auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
 #ifdef USE_CUDA
@@ -173,7 +222,7 @@ struct TanhBackward : public Node {
 // tanh
 inline std::shared_ptr<Tensor> tanh(const std::shared_ptr<Tensor>& a_in) {
     DG_PROFILE_OP("tanh");
-    auto a = contiguous(a_in);
+    auto a = contiguous(float32_input(a_in));
     bool req_grad = grad_enabled() && (a->requires_grad);
 #ifdef USE_CUDA
     if (a->device == Device::CUDA) {
@@ -254,7 +303,7 @@ struct GeluBackward : public Node {
 // gelu
 inline std::shared_ptr<Tensor> gelu(const std::shared_ptr<Tensor>& a_in) {
     DG_PROFILE_OP("gelu");
-    auto a = contiguous(a_in);
+    auto a = contiguous(float32_input(a_in));
     const float sqrt_2_over_pi = 0.7978845608f;
     const float coeff = 0.044715f;
 
@@ -331,7 +380,7 @@ struct SigmoidBackward : public Node {
 // sigmoid
 inline std::shared_ptr<Tensor> sigmoid(const std::shared_ptr<Tensor>& a_in) {
     DG_PROFILE_OP("sigmoid");
-    auto a = contiguous(a_in);
+    auto a = contiguous(float32_input(a_in));
     bool req_grad = grad_enabled() && (a->requires_grad);
     auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
 #ifdef USE_CUDA
@@ -421,7 +470,7 @@ struct SiluBackward : public Node {
 // silu (Swish)
 inline std::shared_ptr<Tensor> silu(const std::shared_ptr<Tensor>& a_in) {
     DG_PROFILE_OP("silu");
-    auto a = contiguous(a_in);
+    auto a = contiguous(float32_input(a_in));
     bool req_grad = grad_enabled() && (a->requires_grad);
     auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
 #ifdef USE_CUDA
@@ -516,7 +565,7 @@ struct LeakyReluBackward : public Node {
 // leaky_relu
 inline std::shared_ptr<Tensor> leaky_relu(const std::shared_ptr<Tensor>& a_in, float negative_slope = 0.01f) {
     DG_PROFILE_OP("leaky_relu");
-    auto a = contiguous(a_in);
+    auto a = contiguous(float32_input(a_in));
     bool req_grad = grad_enabled() && (a->requires_grad);
     auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
 #ifdef USE_CUDA
@@ -611,7 +660,7 @@ struct BroadcastBackward : public Node {
 // broadcast
 inline std::shared_ptr<Tensor> broadcast(const std::shared_ptr<Tensor>& a_in, int axis, int n) {
     DG_PROFILE_OP("broadcast");
-    auto a = contiguous(a_in);
+    auto a = contiguous(float32_input(a_in));
     int ndim = a->shape.size();
     if (ndim < 2) {
         throw std::invalid_argument("broadcast requires tensor with ndim >= 2");
@@ -874,11 +923,11 @@ inline std::shared_ptr<Tensor> broadcast_binary(BinaryOp op, const std::shared_p
     DG_PROFILE_OP(binary_op_name(op));
     if (!x_in || !y_in) throw std::invalid_argument(std::string(binary_op_name(op)) + ": null tensor");
     if (x_in->device != y_in->device) throw std::invalid_argument(std::string(binary_op_name(op)) + ": tensors are on different devices");
-    if (x_in->dtype != DType::Float32 || y_in->dtype != DType::Float32) {
-        throw std::invalid_argument(std::string(binary_op_name(op)) + ": only Float32 is supported");
+    auto x = contiguous(float32_input(x_in));
+    auto y = contiguous(float32_input(y_in));
+    if (x->dtype != DType::Float32 || y->dtype != DType::Float32) {
+        throw std::invalid_argument(std::string(binary_op_name(op)) + ": tensors must be Float32, Float16 or BFloat16");
     }
-    auto x = contiguous(x_in);
-    auto y = contiguous(y_in);
     BroadcastLayout layout = broadcast_layout(x->shape, y->shape, op);
     Device dev = x->device;
     bool req_grad = needs_grad(x) || needs_grad(y);
@@ -995,8 +1044,8 @@ struct ConcatBackward : public Node {
 inline std::shared_ptr<Tensor> concat(const std::shared_ptr<Tensor>& a_in,
                                        const std::shared_ptr<Tensor>& b_in, int axis) {
     DG_PROFILE_OP("concat");
-    auto a = contiguous(a_in);
-    auto b = contiguous(b_in);
+    auto a = contiguous(float32_input(a_in));
+    auto b = contiguous(float32_input(b_in));
     if (!a || !b) {
         throw std::invalid_argument("concat: input tensors cannot be null");
     }
@@ -1127,8 +1176,8 @@ struct CrossEntropyBackward : public Node {
 // cross_entropy
 inline std::shared_ptr<Tensor> cross_entropy(const std::shared_ptr<Tensor>& pred_in, const std::shared_ptr<Tensor>& target_in) {
     DG_PROFILE_OP("cross_entropy");
-    auto pred = contiguous(pred_in);
-    auto target = contiguous(target_in);
+    auto pred = contiguous(float32_input(pred_in));
+    auto target = contiguous(float32_input(target_in));
     if (pred->shape != target->shape) {
         throw std::runtime_error("The shape of your prediction and target doesn't match man..");
     }
@@ -1220,7 +1269,7 @@ struct FusedCrossEntropyBackward : public Node {
 inline std::shared_ptr<Tensor> fused_cross_entropy(const std::shared_ptr<Tensor>& logits_in,
                                                    const std::shared_ptr<Tensor>& targets_in, int ignore_index = -100) {
     DG_PROFILE_OP("fused_cross_entropy");
-    auto logits = contiguous(logits_in);
+    auto logits = contiguous(float32_input(logits_in));
     if (logits->ndim() < 1) throw std::invalid_argument("fused_cross_entropy: logits must have a class dimension");
     int64_t vocab = logits->shape.back();
     int64_t rows = logits->size() / vocab;
@@ -1332,8 +1381,8 @@ struct MseBackward : public Node {
 // mse
 inline std::shared_ptr<Tensor> mse(const std::shared_ptr<Tensor>& pred_in, const std::shared_ptr<Tensor>& target_in) {
     DG_PROFILE_OP("mse");
-    auto pred = contiguous(pred_in);
-    auto target = contiguous(target_in);
+    auto pred = contiguous(float32_input(pred_in));
+    auto target = contiguous(float32_input(target_in));
     if (pred->shape != target->shape) {
         throw std::runtime_error("The shape of your prediction and target doesn't match man..");
     }
@@ -1427,8 +1476,8 @@ struct L1LossBackward : public Node {
 // l1_loss (MAE - Mean Absolute Error)
 inline std::shared_ptr<Tensor> l1_loss(const std::shared_ptr<Tensor>& pred_in, const std::shared_ptr<Tensor>& target_in) {
     DG_PROFILE_OP("l1_loss");
-    auto pred = contiguous(pred_in);
-    auto target = contiguous(target_in);
+    auto pred = contiguous(float32_input(pred_in));
+    auto target = contiguous(float32_input(target_in));
     if (pred->shape != target->shape) {
         throw std::runtime_error("The shape of your prediction and target doesn't match man..");
     }
@@ -1523,8 +1572,8 @@ struct BoolMaskBackward : public Node {
 // boolean mask
 inline std::shared_ptr<Tensor> bool_mask(const std::shared_ptr<Tensor>& a_in, const std::shared_ptr<Tensor>& m_in) {
     DG_PROFILE_OP("bool_mask");
-    auto a = contiguous(a_in);
-    auto m = contiguous(m_in);
+    auto a = contiguous(float32_input(a_in));
+    auto m = contiguous(float32_input(m_in));
     int ndim = a->shape.size();
     if (ndim < 2) throw std::invalid_argument("bool_mask requires tensor with ndim >= 2");
     int r = a->shape[ndim - 2];
@@ -1609,7 +1658,7 @@ struct CausalMaskBackward : public Node {
 // causal mask
 inline std::shared_ptr<Tensor> causal_mask(const std::shared_ptr<Tensor>& a_in) {
     DG_PROFILE_OP("causal_mask");
-    auto a = contiguous(a_in);
+    auto a = contiguous(float32_input(a_in));
     int ndim = a->shape.size();
     if (ndim < 2) throw std::invalid_argument("causal_mask requires tensor with ndim >= 2");
     int r = a->shape[ndim - 2];
@@ -1733,7 +1782,7 @@ struct MeanBackward : public Node {
 
 inline std::shared_ptr<Tensor> mean(const std::shared_ptr<Tensor>& a_in, int axis) {
     DG_PROFILE_OP("mean");
-    auto a = contiguous(a_in);
+    auto a = contiguous(float32_input(a_in));
     int ndim = a->ndim();
     if (ndim < 2) throw std::invalid_argument("mean requires tensor with ndim >= 2");
     int r = a->shape[ndim - 2];
@@ -1872,8 +1921,8 @@ struct ScalarOpBackward : public Node {
 inline std::shared_ptr<Tensor> scalar_op(ScalarOp op, const std::shared_ptr<Tensor>& a_in, float s) {
     static const char* names[] = {"add_scalar", "sub_scalar", "mul_scalar", "div_scalar", "rsub_scalar", "rdiv_scalar"};
     DG_PROFILE_OP(names[(int)op]);
-    auto a = contiguous(a_in);
-    if (a->dtype != DType::Float32) throw std::invalid_argument("scalar ops: only Float32 is supported");
+    auto a = contiguous(float32_input(a_in));
+    if (a->dtype != DType::Float32) throw std::invalid_argument("scalar ops: tensors must be Float32, Float16 or BFloat16");
     Device dev = a->device;
     auto out = std::make_shared<Tensor>(a->shape, dev, a->dtype, false);
 #ifdef USE_CUDA
@@ -1926,31 +1975,41 @@ struct SliceBackward : public Node {
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
         if (grads.empty() || !grads[0] || !original_tensor) return {nullptr};
-        Device dev = grads[0]->device;
-        auto grad_out = (dev == Device::CPU) ? grads[0] : grads[0]->cpu();  // dense: the engine densifies grads
+        const auto& grad_out = grads[0];  // dense: the engine densifies grads
+        Device dev = grad_out->device;
 
         // Zero gradient for the full input; the sliced window receives grad_out. grad_in is dense,
-        // so the window is `len` consecutive rows of `inner` elements inside each `outer` block.
+        // so the window is `len` consecutive rows of `inner` elements inside each of `outer` blocks:
+        // one strided 2-D copy of `outer` rows, in any dtype.
         const auto& shape = original_tensor->shape;
-        auto grad_in = std::make_shared<Tensor>(shape, Device::CPU, original_tensor->dtype, false);
-        grad_in->fill_(0.0f);
-
+        auto grad_in = std::make_shared<Tensor>(shape, dev, grad_out->dtype, false);
         int64_t outer = 1, inner = 1;
         for (int d = 0; d < dim; ++d) outer *= shape[d];
         for (int d = dim + 1; d < (int)shape.size(); ++d) inner *= shape[d];
         int64_t full = shape[dim], len = end - start;
+        size_t elem = dtype_size(grad_out->dtype);
+        size_t row_bytes = (size_t)(len * inner) * elem, dst_pitch = (size_t)(full * inner) * elem;
+        const char* src = grad_out->data_ptr<char>();
+        char* dst = grad_in->data_ptr<char>() + (size_t)(start * inner) * elem;
 
-        const float* g = grad_out->data_ptr<float>();
-        float* gi = grad_in->data_ptr<float>();
-        for (int64_t o = 0; o < outer; ++o) {
-            for (int64_t s = 0; s < len; ++s) {
-                const float* src = g + (o * len + s) * inner;
-                float* dst = gi + (o * full + start + s) * inner;
-                for (int64_t k = 0; k < inner; ++k) dst[k] = src[k];
+#ifdef USE_CUDA
+        if (dev == Device::CUDA) {
+            check_cuda(cudaMemsetAsync(grad_in->data_ptr<void>(), 0, grad_in->size() * elem), "slice backward");
+            if (row_bytes > 0 && outer > 0) {
+                check_cuda(cudaMemcpy2DAsync(dst, dst_pitch, src, row_bytes, row_bytes, (size_t)outer,
+                                             cudaMemcpyDeviceToDevice), "slice backward");
             }
+            return {grad_in};
         }
-
-        return {(dev == Device::CPU) ? grad_in : grad_in->to(dev)};
+#endif
+        if (dev != Device::CPU) {
+            // Other accelerators: assemble on the host
+            auto host = SliceBackward(original_tensor, dim, start, end).apply({grad_out->cpu()});
+            return {host[0]->to(dev)};
+        }
+        std::memset(grad_in->data_ptr<void>(), 0, grad_in->size() * elem);
+        for (int64_t o = 0; o < outer; ++o) std::memcpy(dst + o * dst_pitch, src + o * row_bytes, row_bytes);
+        return {grad_in};
     }
 };
 
@@ -2037,7 +2096,7 @@ struct SoftmaxBackward : public Node {
 
 inline std::shared_ptr<Tensor> softmax(const std::shared_ptr<Tensor>& a_in, int axis = -1) {
     DG_PROFILE_OP("softmax");
-    auto a = contiguous(a_in);
+    auto a = contiguous(float32_input(a_in));
     int ndim = a->shape.size();
     if (ndim < 1) throw std::runtime_error("softmax: tensor must be at least 1D");
     if (axis < 0) axis = ndim + axis;
@@ -2184,7 +2243,7 @@ struct StdDevBackward : public Node {
 // standard deviation
 inline std::shared_ptr<Tensor> std_dev(const std::shared_ptr<Tensor>& a_in, int axis) {
     DG_PROFILE_OP("std_dev");
-    auto a = contiguous(a_in);
+    auto a = contiguous(float32_input(a_in));
     int ndim = a->shape.size();
     if (ndim < 2) throw std::runtime_error("std_dev: tensor must be at least 2D");
     if (axis != 0 && axis != 1) throw std::runtime_error("std_dev: axis must be 0 or 1");
@@ -2316,7 +2375,7 @@ struct SumBackward : public Node {
 // sum
 inline std::shared_ptr<Tensor> sum(const std::shared_ptr<Tensor>& a_in, int axis) {
     DG_PROFILE_OP("sum");
-    auto a = contiguous(a_in);
+    auto a = contiguous(float32_input(a_in));
     int ndim = a->shape.size();
     if (ndim < 2) throw std::runtime_error("sum: tensor must be at least 2D");
     if (axis < 0) axis = ndim + axis;
@@ -2503,7 +2562,7 @@ struct VarBackward : public Node {
 // variance
 inline std::shared_ptr<Tensor> var(const std::shared_ptr<Tensor>& a_in, int axis) {
     DG_PROFILE_OP("var");
-    auto a = contiguous(a_in);
+    auto a = contiguous(float32_input(a_in));
     int ndim = a->shape.size();
     if (ndim < 2) throw std::runtime_error("var: tensor must be at least 2D");
     if (axis != 0 && axis != 1) throw std::runtime_error("var: axis must be 0 or 1");
@@ -2734,7 +2793,7 @@ struct Im2ColBackward : public Node {
 
 inline std::shared_ptr<Tensor> im2col(const std::shared_ptr<Tensor>& x_in, int kH, int kW, int padH, int padW, int strideH, int strideW) {
     DG_PROFILE_OP("im2col");
-    auto x = contiguous(x_in);
+    auto x = contiguous(float32_input(x_in));
     if (x->ndim() != 4) throw std::runtime_error("im2col requires 4D tensor (B, C, H, W)");
 
     if (x->device != Device::CPU) {
@@ -3036,16 +3095,18 @@ cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
 // sum of the output gradient.
 struct CudaMatmulBackward : public Node {
     std::vector<int64_t> a_shape, b_shape, bias_shape;
+    DType a_dtype, b_dtype;        // the inputs' dtypes, which their gradients take
     std::shared_ptr<Tensor> a, b;  // saved GEMM operands; null when no gradient needs them
     bool grad_a, grad_b, grad_bias;
     DType compute;  // GEMM precision the forward ran with (autocast)
 
-    CudaMatmulBackward(std::vector<int64_t> a_shape, std::vector<int64_t> b_shape,
+    CudaMatmulBackward(std::vector<int64_t> a_shape, std::vector<int64_t> b_shape, DType a_dtype, DType b_dtype,
                        std::shared_ptr<Tensor> a, std::shared_ptr<Tensor> b,
                        bool grad_a, bool grad_b, DType compute,
                        std::vector<int64_t> bias_shape = {}, bool grad_bias = false)
         : a_shape(std::move(a_shape)), b_shape(std::move(b_shape)), bias_shape(std::move(bias_shape)),
-          a(std::move(a)), b(std::move(b)), grad_a(grad_a), grad_b(grad_b), grad_bias(grad_bias), compute(compute) {}
+          a_dtype(a_dtype), b_dtype(b_dtype), a(std::move(a)), b(std::move(b)),
+          grad_a(grad_a), grad_b(grad_b), grad_bias(grad_bias), compute(compute) {}
 
     // MatmulBackward is the CPU node's label too, so profiles stay comparable across devices
     std::string name() const override { return bias_shape.empty() ? "MatmulBackward" : "LinearBackward"; }
@@ -3064,12 +3125,16 @@ struct CudaMatmulBackward : public Node {
         std::shared_ptr<Tensor> da, db;
         cuda::matmul_backward(a_shape, b_shape, a, b, grads[0], grad_a ? &da : nullptr, grad_b ? &db : nullptr,
                               compute);
+        // The GEMMs write fp32; a half-precision input gets its gradient in its own dtype
+        if (da) da = da->to(Device::CUDA, a_dtype);
+        if (db) db = db->to(Device::CUDA, b_dtype);
         if (bias_shape.empty()) return {da, db};
         std::shared_ptr<Tensor> dbias;
         if (grad_bias) {
             int64_t cols = b_shape.back();
             dbias = std::make_shared<Tensor>(bias_shape, Device::CUDA, DType::Float32, false);
-            cuda::bias_grad(grads[0]->data_ptr<float>(), dbias->data_ptr<float>(), grads[0]->size() / cols, cols);
+            auto g = grads[0]->to(Device::CUDA, DType::Float32);
+            cuda::bias_grad(g->data_ptr<float>(), dbias->data_ptr<float>(), g->size() / cols, cols);
         }
         return {da, db, dbias};
     }
@@ -3090,7 +3155,7 @@ inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const st
         auto out = cuda::matmul(a, b, compute, grad_b ? &saved_a : nullptr, grad_a ? &saved_b : nullptr);
         out->requires_grad = grad_a || grad_b;
         if (grad_a || grad_b) {
-            auto grad_fn = std::make_shared<CudaMatmulBackward>(a->shape, b->shape, std::move(saved_a),
+            auto grad_fn = std::make_shared<CudaMatmulBackward>(a->shape, b->shape, a->dtype, b->dtype, std::move(saved_a),
                                                                 std::move(saved_b), grad_a, grad_b, compute);
             grad_fn->add_next_edge(get_grad_edge(a).function);
             grad_fn->add_next_edge(get_grad_edge(b).function);
@@ -3099,7 +3164,7 @@ inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const st
         return out;
     }
 #endif
-    return manual_matmul(a, b);
+    return manual_matmul(float32_input(a), float32_input(b));
 }
 
 // y = x @ w + b: x [..., in], w [in, out], b [out] or [1, out], or null for no bias. On CUDA the
@@ -3120,18 +3185,20 @@ inline std::shared_ptr<Tensor> linear(const std::shared_ptr<Tensor>& x, const st
     }
 #ifdef USE_CUDA
     if (x->device == Device::CUDA) {
+        // The bias epilogue adds an fp32 bias to the fp32 output
+        auto bias = float32_input(b);
         DType compute = autocast_dtype();
-        bool grad_x = needs_grad(x), grad_w = needs_grad(w), grad_b = needs_grad(b);
+        bool grad_x = needs_grad(x), grad_w = needs_grad(w), grad_b = needs_grad(bias);
         // As in matmul: dx needs only w and dw only x
         std::shared_ptr<Tensor> saved_x, saved_w;
-        auto out = cuda::linear(x, w, b, compute, grad_w ? &saved_x : nullptr, grad_x ? &saved_w : nullptr);
+        auto out = cuda::linear(x, w, bias, compute, grad_w ? &saved_x : nullptr, grad_x ? &saved_w : nullptr);
         out->requires_grad = grad_x || grad_w || grad_b;
         if (out->requires_grad) {
-            auto grad_fn = std::make_shared<CudaMatmulBackward>(x->shape, w->shape, std::move(saved_x), std::move(saved_w),
-                                                                grad_x, grad_w, compute, b->shape, grad_b);
+            auto grad_fn = std::make_shared<CudaMatmulBackward>(x->shape, w->shape, x->dtype, w->dtype, std::move(saved_x),
+                                                                std::move(saved_w), grad_x, grad_w, compute, bias->shape, grad_b);
             grad_fn->add_next_edge(get_grad_edge(x).function);
             grad_fn->add_next_edge(get_grad_edge(w).function);
-            grad_fn->add_next_edge(get_grad_edge(b).function);
+            grad_fn->add_next_edge(get_grad_edge(bias).function);
             out->grad_fn = grad_fn;
         }
         return out;

@@ -110,7 +110,7 @@ public:
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x_in) {
         DG_PROFILE_OP("rms_norm");
         if (!x_in) throw std::runtime_error("RMSNorm: input tensor is null");
-        auto x = contiguous(x_in);
+        auto x = contiguous(float32_input(x_in));
         if (x->ndim() < 1) throw std::runtime_error("RMSNorm: input tensor must be at least 1D");
         int64_t cols = x->shape.back();
         if (cols != gamma->shape[0]) {
@@ -276,9 +276,9 @@ inline std::shared_ptr<Tensor> apply_rotary_emb(
     int start_pos = 0
 ) {
     DG_PROFILE_OP("rope");
-    auto x = contiguous(x_in);
-    auto cos_freqs = contiguous(cos_freqs_in);
-    auto sin_freqs = contiguous(sin_freqs_in);
+    auto x = contiguous(float32_input(x_in));
+    auto cos_freqs = contiguous(float32_input(cos_freqs_in));
+    auto sin_freqs = contiguous(float32_input(sin_freqs_in));
     if (!x || !cos_freqs || !sin_freqs) throw std::runtime_error("apply_rotary_emb: null tensor passed");
     int ndim = x->ndim();
     if (ndim < 2) throw std::runtime_error("apply_rotary_emb: tensor must be at least 2D (seq_len, head_dim)");

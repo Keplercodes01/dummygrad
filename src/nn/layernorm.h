@@ -127,7 +127,7 @@ public:
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x_in) {
         DG_PROFILE_OP("layer_norm");
         if (!x_in) throw std::runtime_error("LayerNorm: input tensor is null");
-        auto x = contiguous(x_in);
+        auto x = contiguous(float32_input(x_in));
         if (x->ndim() < 1) throw std::runtime_error("LayerNorm: input tensor must be at least 1D");
         int64_t cols = x->shape.back();
         if (cols != gamma->shape[0]) {
