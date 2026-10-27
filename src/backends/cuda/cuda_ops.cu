@@ -1,6 +1,7 @@
 #include "cuda_ops.cuh"
 #include "cuda_common.h"
 #include "cuda_reduce.cuh"
+#include "cuda_dtype.cuh"
 #include "profiler.h"
 #include "allocator.h"
 #include <cublasLt.h>
@@ -18,14 +19,23 @@ namespace cuda {
 // CUDA Kernels
 // -------------------------------------------------------------
 
-__global__ void k_fill(float* data, float val, int64_t size) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) data[idx] = val;
+template <typename T>
+__global__ void k_fill(T* data, float val, int64_t size) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) data[idx] = from_float<T>(val);
 }
 
-__global__ void k_add_inplace(float* dst, const float* src, int64_t size) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) dst[idx] += src[idx];
+// Half-precision sums are formed in fp32 and rounded once
+template <typename T>
+__global__ void k_add_inplace(T* dst, const T* src, int64_t size) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) dst[idx] = from_float<T>(to_float(dst[idx]) + to_float(src[idx]));
+}
+
+template <typename In, typename Out>
+__global__ void k_convert(const In* in, Out* out, int64_t n) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) out[idx] = from_float<Out>(to_float(in[idx]));
 }
 
 __global__ void k_relu_forward(const float* in, float* out, int64_t size) {
@@ -479,17 +489,39 @@ __global__ void k_adamw_step(float* param, const float* grad, float* m, float* v
 
 void fill(Tensor& tensor, float value) {
     int64_t size = tensor.size();
+    if (size == 0) return;
     int threads = 256;
-    int blocks = (size + threads - 1) / threads;
-    k_fill<<<blocks, threads>>>(tensor.data_ptr<float>(), value, size);
+    int blocks = (int)((size + threads - 1) / threads);
+    DG_CUDA_DISPATCH_FLOAT(tensor.dtype, "cuda::fill", {
+        k_fill<scalar_t><<<blocks, threads>>>(static_cast<scalar_t*>(tensor.data_ptr<void>()), value, size);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 
 void add_inplace(Tensor& dst, const Tensor& src) {
+    if (dst.dtype != src.dtype) throw std::runtime_error("cuda::add_inplace requires identical dtypes");
+    if (dst.size() != src.size()) throw std::runtime_error("cuda::add_inplace requires identical sizes");
     int64_t size = dst.size();
+    if (size == 0) return;
     int threads = 256;
-    int blocks = (size + threads - 1) / threads;
-    k_add_inplace<<<blocks, threads>>>(dst.data_ptr<float>(), src.data_ptr<float>(), size);
+    int blocks = (int)((size + threads - 1) / threads);
+    DG_CUDA_DISPATCH_FLOAT(dst.dtype, "cuda::add_inplace", {
+        k_add_inplace<scalar_t><<<blocks, threads>>>(static_cast<scalar_t*>(dst.data_ptr<void>()),
+                                                     static_cast<const scalar_t*>(src.data_ptr<void>()), size);
+    });
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void convert(const void* in, DType in_dtype, void* out, DType out_dtype, int64_t n) {
+    if (n == 0) return;
+    int threads = 256;
+    int blocks = (int)((n + threads - 1) / threads);
+    DG_CUDA_DISPATCH_FLOAT(in_dtype, "cuda::convert", {
+        using In = scalar_t;
+        DG_CUDA_DISPATCH_FLOAT(out_dtype, "cuda::convert", {
+            k_convert<In, scalar_t><<<blocks, threads>>>(static_cast<const In*>(in), static_cast<scalar_t*>(out), n);
+        });
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -872,30 +904,12 @@ void adamw_step(float* param, const float* grad, float* m, float* v,
 // type and run on tensor cores, accumulating and writing fp32.
 // -------------------------------------------------------------
 
-__global__ void k_float_to_half(const float* in, __half* out, int64_t n) {
-    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) out[idx] = __float2half_rn(in[idx]);
-}
-
-__global__ void k_float_to_bfloat16(const float* in, __nv_bfloat16* out, int64_t n) {
-    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) out[idx] = __float2bfloat16_rn(in[idx]);
-}
-
 void cast_from_float(const float* in, void* out, int64_t n, DType dtype) {
     DG_PROFILE_OP("autocast_cast");
     if (dtype != DType::Float16 && dtype != DType::BFloat16) {
         throw std::runtime_error("cuda::cast_from_float: target dtype must be Float16 or BFloat16");
     }
-    if (n == 0) return;
-    int threads = 256;
-    int blocks = (int)((n + threads - 1) / threads);
-    if (dtype == DType::Float16) {
-        k_float_to_half<<<blocks, threads>>>(in, static_cast<__half*>(out), n);
-    } else {
-        k_float_to_bfloat16<<<blocks, threads>>>(in, static_cast<__nv_bfloat16*>(out), n);
-    }
-    CUDA_CHECK(cudaGetLastError());
+    convert(in, DType::Float32, out, dtype, n);
 }
 
 static void check_compute_dtype(DType compute, const char* who) {
@@ -904,11 +918,13 @@ static void check_compute_dtype(DType compute, const char* who) {
     }
 }
 
-// A contiguous fp32 tensor as a GEMM operand: itself for Float32 compute, else a rounded copy
+// A contiguous tensor as a GEMM operand of the compute dtype: itself when it already has that
+// dtype, else a converted copy (rounded to nearest even when narrowing)
 static std::shared_ptr<Tensor> gemm_operand(const std::shared_ptr<Tensor>& t, DType compute) {
-    if (compute == DType::Float32) return t;
+    if (t->dtype == compute) return t;
+    DG_PROFILE_OP("autocast_cast");
     auto out = std::make_shared<Tensor>(t->shape, Device::CUDA, compute, false);
-    cast_from_float(t->data_ptr<float>(), out->data_ptr<void>(), t->size(), compute);
+    convert(t->data_ptr<void>(), t->dtype, out->data_ptr<void>(), compute, t->size());
     return out;
 }
 
@@ -1018,8 +1034,8 @@ static bool gemm_bias(int m, int n, int k, const void* A, const void* B, const f
 }
 
 static void check_matmul_inputs(const Tensor& a, const Tensor& b, const char* who) {
-    if (a.dtype != DType::Float32 || b.dtype != DType::Float32) {
-        throw std::runtime_error(std::string(who) + ": tensors must be Float32 (use AutocastGuard for fp16/bf16 compute)");
+    if (!is_float_dtype(a.dtype) || !is_float_dtype(b.dtype)) {
+        throw std::runtime_error(std::string(who) + ": tensors must be Float32, Float16 or BFloat16");
     }
 }
 
@@ -1104,14 +1120,13 @@ std::shared_ptr<Tensor> linear(const std::shared_ptr<Tensor>& x, const std::shar
 }
 
 // A backward GEMM operand: contiguous and of the compute dtype. matmul's saved operands already
-// are, so they pass through untouched; plain fp32 tensors are densified and rounded here.
+// are, so they pass through untouched; other tensors are densified and converted here.
 static std::shared_ptr<Tensor> backward_operand(const std::shared_ptr<Tensor>& t, DType compute) {
     if (!t) return nullptr;
-    if (t->dtype != DType::Float32 && t->dtype != compute) {
-        throw std::runtime_error("cuda::matmul_backward: operands must be Float32 or the compute dtype");
+    if (!is_float_dtype(t->dtype)) {
+        throw std::runtime_error("cuda::matmul_backward: operands must be Float32, Float16 or BFloat16");
     }
-    auto c = make_contiguous(t);
-    return c->dtype == compute ? c : gemm_operand(c, compute);
+    return gemm_operand(make_contiguous(t), compute);
 }
 
 static int64_t shape_numel(const std::vector<int64_t>& shape) {
@@ -1126,7 +1141,9 @@ void matmul_backward(const std::vector<int64_t>& a_shape, const std::vector<int6
                      std::shared_ptr<Tensor>* grad_a, std::shared_ptr<Tensor>* grad_b, DType compute) {
     if (!grad_out || (!grad_a && !grad_b)) return;
     check_compute_dtype(compute, "cuda::matmul_backward");
-    if (grad_out->dtype != DType::Float32) throw std::runtime_error("cuda::matmul_backward: gradient must be Float32");
+    if (!is_float_dtype(grad_out->dtype)) {
+        throw std::runtime_error("cuda::matmul_backward: gradient must be Float32, Float16 or BFloat16");
+    }
     if ((grad_a && !b) || (grad_b && !a)) {
         throw std::runtime_error("cuda::matmul_backward: grad_a needs operand b and grad_b needs operand a");
     }

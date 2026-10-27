@@ -13,9 +13,10 @@ namespace cuda {
     void copy_from_vector(Tensor& tensor, const std::vector<float>& values);
     void make_contiguous(Tensor& dst, const Tensor& src);
 
-    // cuBLAS matrix multiplication (batched, whole-operand broadcasting) on Float32 tensors.
-    // compute is the GEMM input precision: Float32, or Float16/BFloat16 on tensor cores with fp32
-    // accumulation (see AutocastGuard). Outputs and gradients are always Float32.
+    // cuBLAS matrix multiplication (batched, whole-operand broadcasting). Inputs may be Float32,
+    // Float16 or BFloat16; compute is the GEMM input precision they are converted to (an input
+    // already in it is used as is): Float32, or Float16/BFloat16 on tensor cores with fp32
+    // accumulation (see AutocastGuard). Outputs and the gradients matmul_backward writes are Float32.
     // saved_a / saved_b, when given, receive the operands the GEMM consumed (contiguous, already
     // rounded to compute) so that matmul_backward needs neither a cast nor a densifying copy.
     std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b,
@@ -45,6 +46,8 @@ namespace cuda {
 
     // Rounds n device floats to Float16 or BFloat16 (nearest even) into out
     void cast_from_float(const float* in, void* out, int64_t n, DType dtype);
+    // Converts n device elements between Float32, Float16 and BFloat16 (nearest even when narrowing)
+    void convert(const void* in, DType in_dtype, void* out, DType out_dtype, int64_t n);
 
     // Fused elementwise activations
     void relu_forward(const float* in, float* out, int64_t size);

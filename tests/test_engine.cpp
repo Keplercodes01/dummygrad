@@ -1312,6 +1312,107 @@ static std::string dtype_typed_access_checked() {
     return download(back) == std::vector<float>{1, 2} ? "" : "fp32 -> fp16 -> fp32 changed exact values";
 }
 
+// A half-precision tensor's values as fp32 on the host
+static std::vector<float> download_float(const TensorPtr& t) { return download(t->to(Device::CPU, DType::Float32)); }
+
+// fp32 values rounded to fp16 and back, through the CPU reference conversion
+static std::vector<float> round_to_half(std::vector<float> v) {
+    for (auto& x : v) x = half_bits_to_float(float_to_half_bits(x));
+    return v;
+}
+
+// cast: exact round trips, nearest-even rounding matching the CPU reference, the gradient converted
+// back to the input's dtype, and on CUDA a conversion that never touches the host
+static std::string dtype_cast_op(Device dev) {
+    auto v = random_values(64, -3, 3);
+    v.push_back(65519.0f);   // rounds up past fp16's largest finite value: inf
+    v.push_back(1.0e-6f);    // fp16 subnormal
+    auto x = upload(v, {(int64_t)v.size()}, dev, true);
+    reset_transfer_stats();
+    auto h = cast(x, DType::Float16);
+    auto stats = transfer_stats();
+    if (dev == Device::CUDA && stats.to_host_count + stats.to_device_count != 0) return "a CUDA cast copied through the host";
+    if (h->dtype != DType::Float16 || h->device != dev) return "cast produced the wrong dtype or device";
+    if (download_float(h) != round_to_half(v)) return "fp32 -> fp16 does not match the reference rounding";
+    if (cast(x, DType::Float32) != x) return "a same-dtype cast did not return its input";
+
+    // Gradient: d/dx sum(cast(cast(x, fp16), fp32) * w) is w rounded to fp16 by the inner cast's backward
+    auto w = random_values((int64_t)v.size(), -2, 2);
+    auto loss = scalar_sum(reshape(mul(cast(h, DType::Float32), upload(w, x->shape, dev, false)), {1, (int64_t)v.size()}));
+    loss->backward();
+    if (!x->grad || x->grad->dtype != DType::Float32) return "the gradient of an fp32 input is not fp32";
+    if (download(x->grad) != round_to_half(w)) return "the gradient was not converted through fp16";
+
+    auto b = cast(upload({1.0f, -2.5f, 3.0f}, {3}, dev, false), DType::BFloat16);
+    if (download_float(b) != std::vector<float>{1.0f, -2.5f, 3.0f}) return "fp32 -> bf16 changed exact values";
+    if (download_float(cast(b, DType::Float16)) != std::vector<float>{1.0f, -2.5f, 3.0f}) return "bf16 -> fp16 changed exact values";
+    return "";
+}
+
+// Ops without a native half-precision kernel run an fp16 input in fp32: the output is fp32 and
+// bit-identical to the same values given in fp32, and the input's gradient is fp16, equal to the
+// fp32 gradient rounded once. Inputs are multiples of 1/64, exact in fp16.
+static std::string dtype_half_inputs_fall_back(Device dev) {
+    using Op = std::function<TensorPtr(const TensorPtr&)>;
+    manual_seed(11);
+    auto c = upload(random_values(8, -1, 1), {1, 8}, dev, false);
+    auto target = upload(random_values(32, -1, 1), {4, 8}, dev, false);
+    auto labels = upload({1, 7, 0, 3}, {4}, dev, false);
+    auto wv = random_values(40, -1, 1);
+    auto w = upload(wv, {8, 5}, dev, true), wb = upload(random_values(5, -1, 1), {1, 5}, dev, true);
+    RMSNorm rms(8);
+    LayerNorm ln(8);
+    if (dev == Device::CUDA) {
+        rms.cuda();
+        ln.cuda();
+    }
+    const std::vector<std::pair<const char*, Op>> ops = {
+        {"relu", [](const TensorPtr& x) { return relu(x); }},
+        {"gelu", [](const TensorPtr& x) { return gelu(x); }},
+        {"silu", [](const TensorPtr& x) { return silu(x); }},
+        {"sigmoid", [](const TensorPtr& x) { return sigmoid(x); }},
+        {"tanh", [](const TensorPtr& x) { return tanh(x); }},
+        {"leaky_relu", [](const TensorPtr& x) { return leaky_relu(x, 0.1f); }},
+        {"softmax", [](const TensorPtr& x) { return softmax(x, -1); }},
+        {"mul_scalar", [](const TensorPtr& x) { return mul_scalar(x, 3.0f); }},
+        {"add", [&](const TensorPtr& x) { return add(x, c); }},
+        {"mul", [&](const TensorPtr& x) { return mul(x, c); }},
+        {"sum", [](const TensorPtr& x) { return sum(x, -1); }},
+        {"mean", [](const TensorPtr& x) { return mean(x, -1); }},
+        {"mse", [&](const TensorPtr& x) { return mse(x, target); }},
+        {"fused_cross_entropy", [&](const TensorPtr& x) { return fused_cross_entropy(x, labels); }},
+        {"rms_norm", [&](const TensorPtr& x) { return rms.forward(x); }},
+        {"layer_norm", [&](const TensorPtr& x) { return ln.forward(x); }},
+        {"matmul", [&](const TensorPtr& x) { return matmul(x, w); }},
+        {"linear", [&](const TensorPtr& x) { return linear(x, w, wb); }},
+    };
+    std::vector<float> xv(32);
+    for (int i = 0; i < 32; ++i) xv[i] = (float)((i * 37) % 128 - 64) / 64.0f + (i % 2 ? 1.0f / 128 : -1.0f / 128);
+    for (const auto& [name, op] : ops) {
+        auto x32 = upload(xv, {4, 8}, dev, true);
+        auto x16 = upload(xv, {4, 8}, dev, false)->to(dev, DType::Float16);
+        x16->requires_grad = true;
+        auto y32 = op(x32), y16 = op(x16);
+        std::string label = std::string(name) + ": ";
+        if (y16->dtype != DType::Float32) return label + "an fp16 input did not give an fp32 output";
+        if (download(y16) != download(y32)) return label + "the output differs from the fp32 input's";
+        auto reduce = [](const TensorPtr& y) {
+            auto flat = reshape(y, {1, (int64_t)y->size()});
+            return scalar_sum(mul(flat, flat));
+        };
+        w->grad = nullptr;
+        reduce(y32)->backward();
+        auto g32 = download(x32->grad);
+        auto w_grad = w->grad ? download(w->grad) : std::vector<float>{};
+        w->grad = nullptr;
+        reduce(y16)->backward();
+        if (!x16->grad || x16->grad->dtype != DType::Float16) return label + "the fp16 input's gradient is not fp16";
+        if (download_float(x16->grad) != round_to_half(g32)) return label + "the fp16 gradient is not the fp32 one rounded";
+        if (w->grad && download(w->grad) != w_grad) return label + "the fp32 weight's gradient changed";
+    }
+    return "";
+}
+
 static std::string amp_autocast_guard() {
     if (autocast_dtype() != DType::Float32) return "autocast is on by default";
     {
@@ -1768,6 +1869,12 @@ int main() {
     run_case(r, "amp/half_conversion", dtype_half_conversion);
     run_case(r, "amp/typed_access_checked", dtype_typed_access_checked);
     run_case(r, "amp/autocast_guard", amp_autocast_guard);
+    run_case(r, "amp/cast_op_cpu", [] { return dtype_cast_op(Device::CPU); });
+    run_case(r, "amp/half_inputs_fall_back_cpu", [] { return dtype_half_inputs_fall_back(Device::CPU); });
+    if (has_cuda) {
+        run_case(r, "amp/cast_op_cuda", [] { return dtype_cast_op(Device::CUDA); });
+        run_case(r, "amp/half_inputs_fall_back_cuda", [] { return dtype_half_inputs_fall_back(Device::CUDA); });
+    }
     run_case(r, "amp/grad_scaler", amp_grad_scaler);
 #ifdef USE_CUDA
     if (has_cuda) {
