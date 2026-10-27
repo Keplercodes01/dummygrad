@@ -2,7 +2,7 @@
 
 All notable changes to dummygrad are documented here. Versions follow [Semantic Versioning](https://semver.org/); while the major version is 0, minor releases may change behavior.
 
-## [Unreleased]
+## [0.6.0] - 2026-10-27
 
 Mixed-precision training: matmuls and attention on fp16/bf16 tensor cores. On a T4 (Kaggle), fp16 cuts the medium ModernTransformer step (23M parameters) from 107.6 to 57.2 ms; `MatmulBackward` goes from 48.3 to 16.7 ms and attention backward from 6.9 to 4.5 ms.
 

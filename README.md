@@ -16,6 +16,12 @@ No Python. No bindings. No GIL. No multi-layer dispatcher overhead. Just raw, fr
 
 Full details for every release are in [CHANGELOG.md](CHANGELOG.md).
 
+### v0.6.0: mixed precision
+- **fp16 training nearly halves step time on larger models.** `AutocastGuard` runs matmuls and attention on tensor cores, and `GradScaler` handles loss scaling. On a T4, the 23M-parameter step goes from 107.6 to 57.2 ms. PyTorch fp16 takes 51.4 ms; dummygrad is faster at 0.4M and 3.9M. See [Mixed precision](#mixed-precision).
+- **Everything else stays fp32**: parameters, gradients, optimizer state, softmax and normalization. Your training code only adds the guard and the scaler.
+- **Safer dtypes:** reading an fp16 tensor as `float` now throws instead of silently computing garbage, and CPU fp16 conversion rounds correctly.
+- **Runs on Kaggle too:** the notebook works on Kaggle's free T4s as well as Colab.
+
 ### v0.5.1
 - **Faster than PyTorch at every size we benchmark.** On a T4: 2.9 vs 8.6 ms (0.4M params), 23.9 vs 27.6 ms (3.9M), 103.6 vs 107.7 ms (23M).
 - **Attention on cuBLAS** for sequences up to 2048 tokens, any head dimension: backward went from 17 to 6.6 ms on the 23M model. Longer sequences keep the memory-efficient tiled kernels.
@@ -220,7 +226,7 @@ set(CMAKE_CXX_STANDARD 17)
 include(FetchContent)
 FetchContent_Declare(dummygrad
     GIT_REPOSITORY https://github.com/Keplercodes01/dummygrad.git
-    GIT_TAG        v0.5.1)
+    GIT_TAG        v0.6.0)
 FetchContent_MakeAvailable(dummygrad)
 
 add_executable(my_app main.cpp)
