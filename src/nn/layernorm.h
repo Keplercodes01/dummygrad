@@ -125,6 +125,7 @@ public:
     }
 
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x_in) {
+        DG_PROFILE_OP("layer_norm");
         if (!x_in) throw std::runtime_error("LayerNorm: input tensor is null");
         auto x = contiguous(x_in);
         if (x->ndim() < 1) throw std::runtime_error("LayerNorm: input tensor must be at least 1D");

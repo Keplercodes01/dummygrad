@@ -39,6 +39,7 @@ struct SquaredReluBackward : public Node {
 };
 
 std::shared_ptr<Tensor> squared_relu(const std::shared_ptr<Tensor>& x_in) {
+    DG_PROFILE_OP("squared_relu");  // named entry in profile_report(ProfilePhase::Forward)
     auto x = contiguous(x_in);  // the loop below indexes raw memory
     auto xs = x->cpu();
     auto y = std::make_shared<Tensor>(x->shape, Device::CPU, DType::Float32, false);

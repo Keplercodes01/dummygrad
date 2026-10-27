@@ -24,6 +24,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 using TensorPtr = std::shared_ptr<Tensor>;
@@ -676,17 +677,67 @@ static std::string broadcast_semantics() {
     return "incompatible shapes were accepted";
 }
 
+// Forward ops and backward nodes land in separate phases; ops a backward node runs internally are
+// part of that node, not forward entries; a nested op's time is not counted again by its caller
 static std::string engine_profiler() {
+    auto find = [](ProfilePhase phase, const std::string& name) -> ProfileEntry {
+        for (const auto& e : profile_report(phase)) {
+            if (e.name == name) return e;
+        }
+        return ProfileEntry{};
+    };
     auto x = upload({1, 2, 3, 4}, {2, 2}, Device::CPU, true);
     reset_profile();
     set_profiling(true);
     scalar_sum(mul_scalar(relu(x), 2.0f))->backward();
     set_profiling(false);
-    auto report = profile_report();
-    bool saw_scalar = false;
-    for (const auto& e : report) saw_scalar |= (e.name == "ScalarOpBackward(mul)" && e.calls == 1);
+    if (find(ProfilePhase::Backward, "ScalarOpBackward(mul)").calls != 1) return "ScalarOpBackward(mul) was not recorded once";
+    if (find(ProfilePhase::Forward, "mul_scalar").calls != 1) return "forward mul_scalar was not recorded once";
+    if (find(ProfilePhase::Forward, "relu").calls != 1) return "forward relu was not recorded once";
+    if (find(ProfilePhase::Forward, "sum").calls != 2) return "forward sum was not recorded twice";
+    for (const auto& e : profile_report(ProfilePhase::Forward)) {
+        if (e.phase != ProfilePhase::Forward) return "profile_report(Forward) returned a backward entry";
+    }
+    if (profile_report().size() != profile_report(ProfilePhase::Forward).size() + profile_report(ProfilePhase::Backward).size()) {
+        return "profile_report() is not the union of both phases";
+    }
+
+    // An op called from inside a backward node belongs to that node
+    struct OpInsideBackward : public Node {
+        std::string name() const override { return "OpInsideBackward"; }
+        std::vector<TensorPtr> apply(const std::vector<TensorPtr>& grads) override {
+            DG_PROFILE_OP("op_inside_backward");
+            return {grads[0]};
+        }
+    };
     reset_profile();
-    return saw_scalar ? "" : "profile_report() did not record ScalarOpBackward(mul)";
+    set_profiling(true);
+    auto y = mul_scalar(x, 1.0f);
+    auto node = std::make_shared<OpInsideBackward>();
+    node->add_next_edge(get_grad_edge(x).function);
+    y->grad_fn = node;
+    scalar_sum(y)->backward();
+    set_profiling(false);
+    if (find(ProfilePhase::Backward, "OpInsideBackward").calls != 1) return "the custom backward node was not recorded";
+    if (find(ProfilePhase::Forward, "op_inside_backward").calls != 0) return "an op inside a backward node got a forward entry";
+
+    // Self time: the outer op's entry excludes the inner op it called
+    reset_profile();
+    set_profiling(true);
+    {
+        DG_PROFILE_OP("outer_op");
+        {
+            DG_PROFILE_OP("inner_op");
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        }
+    }
+    set_profiling(false);
+    auto outer = find(ProfilePhase::Forward, "outer_op"), inner = find(ProfilePhase::Forward, "inner_op");
+    reset_profile();
+    if (outer.calls != 1 || inner.calls != 1) return "nested ops were not recorded once each";
+    if (inner.total_ms < 40.0) return "the inner op's time is shorter than its sleep";
+    if (outer.total_ms >= inner.total_ms) return "the outer op's entry includes the inner op's time";
+    return "";
 }
 
 static std::string engine_retain_graph() {

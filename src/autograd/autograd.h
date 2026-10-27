@@ -1,6 +1,7 @@
 #pragma once
 #include "node.h"
 #include "tensor.h"
+#include "profiler.h"
 #include <vector>
 #include <memory>
 #include <queue>
@@ -26,19 +27,7 @@ struct DetectAnomalyGuard {
     DetectAnomalyGuard& operator=(const DetectAnomalyGuard&) = delete;
 };
 
-// Backward profiling: when enabled, the engine runs backward nodes one at a time and synchronizes
-// the GPU around each, so every node's time is exact, and accumulates time and call counts per
-// node name (Node::name()). This serializes backward, so enable it only to find where time goes.
-struct ProfileEntry {
-    std::string name;
-    int64_t calls = 0;
-    double total_ms = 0.0;
-};
-void set_profiling(bool enabled);
-bool profiling_enabled();
-void reset_profile();
-// Entries sorted by total time, largest first
-std::vector<ProfileEntry> profile_report();
+// Profiling (set_profiling, profile_report) for forward ops and backward nodes: see profiler.h
 
 class AutogradEngine {
 private:

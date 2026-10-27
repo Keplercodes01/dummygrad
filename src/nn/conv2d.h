@@ -4,6 +4,7 @@
 
 inline std::shared_ptr<Tensor> conv2d(const std::shared_ptr<Tensor>& x, const std::shared_ptr<Tensor>& weight, 
                                       int stride_h, int stride_w, int pad_h, int pad_w) {
+    DG_PROFILE_OP("conv2d");
     if (!x || !weight) throw std::runtime_error("conv2d: input or weight is null");
     if (x->ndim() != 4) throw std::runtime_error("conv2d: x must be a 4D tensor (B, C_in, H, W)");
     if (weight->ndim() != 4) throw std::runtime_error("conv2d: weight must be a 4D tensor (C_out, C_in, kH, kW)");

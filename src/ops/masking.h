@@ -73,6 +73,7 @@ struct SlidingWindowMaskBackward : public Node {
 // Applies Sliding Window Attention mask to scores tensor [..., seq_len, seq_len]
 // Tokens attend only to the past window_size tokens: i - window_size <= j <= i
 inline std::shared_ptr<Tensor> sliding_window_mask(const std::shared_ptr<Tensor>& scores_in, int window_size) {
+    DG_PROFILE_OP("sliding_window_mask");
     auto scores = contiguous(scores_in);
     int ndim = scores->shape.size();
     if (ndim < 2) {
@@ -171,6 +172,7 @@ struct PrefixCausalMaskBackward : public Node {
 
 // Applies Prefix-Causal mask: bidirectional inside prefix [0, prefix_len), causal afterwards
 inline std::shared_ptr<Tensor> prefix_causal_mask(const std::shared_ptr<Tensor>& scores_in, int prefix_len) {
+    DG_PROFILE_OP("prefix_causal_mask");
     auto scores = contiguous(scores_in);
     int ndim = scores->shape.size();
     if (ndim < 2) {
