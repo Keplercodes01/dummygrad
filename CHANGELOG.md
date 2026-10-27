@@ -4,6 +4,8 @@ All notable changes to dummygrad are documented here. Versions follow [Semantic 
 
 ## [Unreleased]
 
+Faster fp16 backward for matmuls. On a T4 (Kaggle), the fp16 medium step goes from 57.2 to 53.8 ms (PyTorch 2.11 fp16: 51.8 ms), and `MatmulBackward` from 16.7 to 13.9 ms. small goes from 22.0 to 21.3 ms.
+
 ### Changed
 - **CUDA matmul backward reuses the forward's operands.** The backward node keeps the forward GEMM's inputs (contiguous, already rounded to fp16/bf16 under autocast), so backward no longer re-casts or re-densifies A and B; only dC is rounded, once for both products. Under fp16 autocast a saved activation is a half-size copy, and its fp32 original can be freed as soon as nothing else holds it. In fp32, a transposed operand (the tied LM head) is kept as the dense copy the forward already made, instead of being copied again in backward.
 - **Frozen matmul operands skip their gradient.** When only one input of a CUDA matmul requires grad (a fixed input, a frozen weight in LoRA-style fine-tuning), backward runs only that input's GEMM and keeps only the operand it needs. Previously both gradients were computed and the unused one discarded.
