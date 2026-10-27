@@ -1149,10 +1149,274 @@ static std::string workflow_metrics_logger() {
 }
 
 // ---------------------------------------------------------------------------
+// Mixed precision
+// ---------------------------------------------------------------------------
+
+static std::string hex16(uint16_t v) {
+    char buf[8];
+    std::snprintf(buf, sizeof(buf), "0x%04x", v);
+    return buf;
+}
+
+static bool half_is_nan(uint16_t h) { return (h & 0x7c00) == 0x7c00 && (h & 0x03ff) != 0; }
+
+static std::string dtype_half_conversion() {
+    struct Case { float in; uint16_t out; const char* what; };
+    const Case cases[] = {
+        {0.0f, 0x0000, "zero"},
+        {-0.0f, 0x8000, "negative zero"},
+        {1.0f, 0x3c00, "one"},
+        {-2.0f, 0xc000, "minus two"},
+        {1.0f + std::ldexp(1.0f, -11), 0x3c00, "tie between 1 and 1+2^-10 rounds to even (down)"},
+        {1.0f + 3 * std::ldexp(1.0f, -11), 0x3c02, "tie between 1+2^-10 and 1+2^-9 rounds to even (up)"},
+        {1.0f + std::ldexp(1.0f, -11) + std::ldexp(1.0f, -20), 0x3c01, "just above a tie rounds up"},
+        {65504.0f, 0x7bff, "largest finite"},
+        {65519.0f, 0x7bff, "below the overflow tie"},
+        {65520.0f, 0x7c00, "overflow tie rounds to inf"},
+        {70000.0f, 0x7c00, "overflow is inf, not NaN"},
+        {-1e30f, 0xfc00, "large negative is -inf"},
+        {INFINITY, 0x7c00, "inf"},
+        {-INFINITY, 0xfc00, "-inf"},
+        {std::ldexp(1.0f, -14), 0x0400, "smallest normal"},
+        {std::ldexp(1.0f, -24), 0x0001, "smallest subnormal"},
+        {std::ldexp(1.0f, -25), 0x0000, "half the smallest subnormal ties to zero"},
+        {1.5f * std::ldexp(1.0f, -24), 0x0002, "subnormal tie rounds to even"},
+        {std::ldexp(1023.0f, -24), 0x03ff, "largest subnormal"},
+        {std::ldexp(1023.5f, -24), 0x0400, "subnormal rounding carries into the smallest normal"},
+        {-std::ldexp(3.0f, -24), 0x8003, "negative subnormal"},
+    };
+    for (const auto& c : cases) {
+        uint16_t got = float_to_half_bits(c.in);
+        if (got != c.out) return std::string(c.what) + ": got " + hex16(got) + ", expected " + hex16(c.out);
+    }
+    if (!half_is_nan(float_to_half_bits(NAN))) return "NaN did not stay NaN";
+    // Every fp16 value survives a round trip through float exactly
+    for (uint32_t h = 0; h <= 0xffff; ++h) {
+        float f = half_bits_to_float((uint16_t)h);
+        uint16_t back = float_to_half_bits(f);
+        if (half_is_nan((uint16_t)h) ? !half_is_nan(back) : back != h) {
+            return "round trip of " + hex16((uint16_t)h) + " gave " + hex16(back);
+        }
+    }
+    return "";
+}
+
+static std::string dtype_typed_access_checked() {
+    auto h = std::make_shared<Tensor>(std::vector<int64_t>{4}, Device::CPU, DType::Float16, false);
+    try {
+        (void)h->data_ptr<float>();
+        return "an fp16 tensor was readable as float";
+    } catch (const std::runtime_error&) {
+    }
+    if (!h->data_ptr<float16>() || !h->data_ptr<void>() || !h->data_ptr<uint16_t>()) return "matching or raw access failed";
+    auto f = upload({1, 2}, {2}, Device::CPU, false);
+    try {
+        (void)f->data_ptr<bfloat16>();
+        return "a float tensor was readable as bf16";
+    } catch (const std::runtime_error&) {
+    }
+    // Conversion between dtypes still works, and rounds to nearest even
+    auto back = f->to(DType::Float16)->to(DType::Float32);
+    return download(back) == std::vector<float>{1, 2} ? "" : "fp32 -> fp16 -> fp32 changed exact values";
+}
+
+static std::string amp_autocast_guard() {
+    if (autocast_dtype() != DType::Float32) return "autocast is on by default";
+    {
+        AutocastGuard outer(DType::Float16);
+        {
+            AutocastGuard inner(DType::Float32);
+            if (autocast_dtype() != DType::Float32) return "nested guard did not set its dtype";
+        }
+        if (autocast_dtype() != DType::Float16) return "nested guard did not restore the outer dtype";
+        // CPU matmuls ignore autocast: still exact fp32
+        auto x = upload({1.0f + std::ldexp(1.0f, -20), 1}, {1, 2}, Device::CPU, false);
+        auto w = upload({1, 0}, {2, 1}, Device::CPU, false);
+        if (download(matmul(x, w))[0] != 1.0f + std::ldexp(1.0f, -20)) return "a CPU matmul was rounded under autocast";
+    }
+    if (autocast_dtype() != DType::Float32) return "guard did not restore fp32";
+    try {
+        AutocastGuard bad(DType::Int8);
+        return "Int8 autocast was accepted";
+    } catch (const std::runtime_error&) {
+    }
+    return autocast_dtype() == DType::Float32 ? "" : "a rejected guard changed the dtype";
+}
+
+static std::string amp_grad_scaler() {
+    auto p = upload({1, 1}, {1, 2}, Device::CPU, true);
+    SGD opt(1.0f);
+    GradScaler scaler(8.0f, 2.0f, 0.5f, /*growth_interval=*/2);
+
+    // scale() multiplies the loss, so backward produces gradients scaled by 8
+    auto loss = scalar_sum(mul_scalar(p, 0.5f));
+    scaler.scale(loss)->backward();
+    if (download(p->grad) != std::vector<float>{4, 4}) return "scaled gradient is not 8 * 0.5";
+    scaler.unscale({p});
+    scaler.unscale({p});  // a second unscale in the same step does nothing
+    if (download(p->grad) != std::vector<float>{0.5f, 0.5f}) return "unscale did not divide the gradient by the scale exactly once";
+    if (!scaler.step(opt, {p}) || download(p) != std::vector<float>{0.5f, 0.5f}) return "a clean step did not run the optimizer";
+    scaler.update();
+    if (scaler.get_scale() != 8.0f) return "scale changed before growth_interval clean steps";
+
+    // An overflowed gradient skips the step and halves the scale
+    p->grad = upload({INFINITY, 1}, {1, 2}, Device::CPU, false);
+    if (scaler.step(opt, {p})) return "a step with an inf gradient ran";
+    if (!scaler.found_inf() || download(p) != std::vector<float>{0.5f, 0.5f}) return "a skipped step changed the parameter";
+    scaler.update();
+    if (scaler.get_scale() != 4.0f || scaler.skipped_steps() != 1) return "scale did not back off to 4 after overflow";
+
+    // Two clean steps in a row double it
+    for (int i = 0; i < 2; ++i) {
+        p->grad = upload({0, 0}, {1, 2}, Device::CPU, false);
+        scaler.step(opt, {p});
+        scaler.update();
+    }
+    if (scaler.get_scale() != 8.0f) return "scale did not grow after growth_interval clean steps";
+
+    p->grad = upload({NAN, 0}, {1, 2}, Device::CPU, false);
+    scaler.step(opt, {p});
+    try {
+        scaler.update();
+        scaler.update();
+        return "update() twice without a step was accepted";
+    } catch (const std::runtime_error&) {
+    }
+
+    // Checkpoint round trip through TrainingState
+    TrainingState state;
+    scaler.save_to(state);
+    GradScaler restored;
+    restored.load_from(state);
+    if (restored.get_scale() != scaler.get_scale() || restored.skipped_steps() != 2) return "scaler state did not round-trip";
+    GradScaler untouched(1024.0f);
+    untouched.load_from(TrainingState{});
+    if (untouched.get_scale() != 1024.0f) return "loading a state without scaler entries changed the scale";
+
+    // Disabled: a pass-through
+    GradScaler off(8.0f, 2.0f, 0.5f, 2000, /*enabled=*/false);
+    auto l = scalar_sum(p);
+    return off.scale(l) == l ? "" : "a disabled scaler changed the loss";
+}
+
+#ifdef USE_CUDA
+static bool cuda_has_bf16_tensor_cores() {
+    int dev = 0, major = 0;
+    return cudaGetDevice(&dev) == cudaSuccess &&
+           cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && major >= 8;
+}
+
+// fp16/bf16 matmuls against the fp32 result: forward and both gradients, for a plain, a batched,
+// a shared-weight (folded) and a broadcast-a (accumulated per batch) product
+static std::string amp_matmul_parity(DType compute) {
+    struct Shape { std::vector<int64_t> a, b; };
+    const Shape shapes[] = {
+        {{48, 64}, {64, 40}},
+        {{3, 32, 64}, {3, 64, 24}},
+        {{4, 16, 64}, {64, 32}},
+        {{16, 64}, {4, 64, 32}},
+    };
+    for (const auto& s : shapes) {
+        auto av = random_values(numel(s.a), -1, 1), bv = random_values(numel(s.b), -1, 1);
+        auto run = [&](DType dt, std::vector<float>& out, std::vector<float>& ga, std::vector<float>& gb) {
+            auto a = upload(av, s.a, Device::CUDA, true), b = upload(bv, s.b, Device::CUDA, true);
+            TensorPtr y;
+            {
+                AutocastGuard autocast(dt);
+                y = matmul(a, b);
+            }
+            if (y->dtype != DType::Float32) throw std::runtime_error("autocast matmul output is not Float32");
+            // Backward runs outside the guard: it must use the dtype the forward ran with
+            scalar_sum(reshape(mul(y, y), {1, (int64_t)y->size()}))->backward();
+            out = download(y);
+            ga = download(a->grad);
+            gb = download(b->grad);
+        };
+        std::vector<float> y32, ga32, gb32, y16, ga16, gb16;
+        run(DType::Float32, y32, ga32, gb32);
+        run(compute, y16, ga16, gb16);
+        auto compare = [&](const std::vector<float>& ref, const std::vector<float>& got, const char* what) -> std::string {
+            float scale = 0.0f, worst = 0.0f;
+            for (size_t i = 0; i < ref.size(); ++i) {
+                scale = std::max(scale, std::fabs(ref[i]));
+                worst = std::max(worst, std::fabs(ref[i] - got[i]));
+            }
+            // 8 mantissa bits (bf16) or 11 (fp16) per operand; 2% of the largest value covers both
+            if (!(worst <= 2e-2f * scale + 1e-4f)) return std::string(what) + " differs from fp32 by " + std::to_string(worst);
+            if (worst == 0.0f) return std::string(what) + " is bit-identical to fp32: autocast had no effect";
+            return "";
+        };
+        std::string label = "a" + std::to_string(s.a.size()) + "d x b" + std::to_string(s.b.size()) + "d: ";
+        for (auto err : {compare(y32, y16, "output"), compare(ga32, ga16, "grad a"), compare(gb32, gb16, "grad b")}) {
+            if (!err.empty()) return label + err;
+        }
+    }
+    return "";
+}
+
+// Attention under autocast against fp32: output, lse and the three gradients on the GEMM path,
+// causal and not, with a sequence length that is not a multiple of 8. The tiled kernels ignore
+// autocast, so there the results must be bit-identical.
+static std::string amp_attention_parity(DType compute) {
+    const int B = 2, H = 3, S = 40, D = 32;
+    const int64_t n = (int64_t)B * H * S * D;
+    const float scale = 1.0f / std::sqrt((float)D);
+    auto qv = random_values(n, -1, 1), kv = random_values(n, -1, 1), vv = random_values(n, -1, 1);
+    auto dov = random_values(n, -1, 1);
+    std::vector<int64_t> shape{B, H, S, D};
+    struct Result { std::vector<float> out, lse, dq, dk, dv; };
+    auto run = [&](DType dt, bool causal) {
+        auto q = upload(qv, shape, Device::CUDA, false), k = upload(kv, shape, Device::CUDA, false);
+        auto v = upload(vv, shape, Device::CUDA, false), dout = upload(dov, shape, Device::CUDA, false);
+        auto out = std::make_shared<Tensor>(shape, Device::CUDA, DType::Float32, false);
+        auto lse = std::make_shared<Tensor>(std::vector<int64_t>{B, H, S}, Device::CUDA, DType::Float32, false);
+        auto dq = std::make_shared<Tensor>(shape, Device::CUDA, DType::Float32, false);
+        auto dk = std::make_shared<Tensor>(shape, Device::CUDA, DType::Float32, false);
+        auto dv = std::make_shared<Tensor>(shape, Device::CUDA, DType::Float32, false);
+        auto impl = cuda::attention_forward(q->data_ptr<float>(), k->data_ptr<float>(), v->data_ptr<float>(),
+                                            out->data_ptr<float>(), lse->data_ptr<float>(), B, H, S, D, causal, scale, dt);
+        cuda::attention_backward(q->data_ptr<float>(), k->data_ptr<float>(), v->data_ptr<float>(), out->data_ptr<float>(),
+                                 dout->data_ptr<float>(), lse->data_ptr<float>(), dq->data_ptr<float>(),
+                                 dk->data_ptr<float>(), dv->data_ptr<float>(), B, H, S, D, causal, scale, impl, dt);
+        return Result{download(out), download(lse), download(dq), download(dk), download(dv)};
+    };
+    auto compare = [](const std::vector<float>& ref, const std::vector<float>& got, const std::string& what) -> std::string {
+        float scale_ref = 0.0f, worst = 0.0f;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            scale_ref = std::max(scale_ref, std::fabs(ref[i]));
+            worst = std::max(worst, std::fabs(ref[i] - got[i]));
+        }
+        if (!(worst <= 2e-2f * scale_ref + 1e-4f)) return what + " differs from fp32 by " + std::to_string(worst);
+        if (worst == 0.0f) return what + " is bit-identical to fp32: autocast had no effect";
+        return "";
+    };
+    for (bool causal : {false, true}) {
+        std::string label = causal ? "causal " : "full ";
+        Result ref = run(DType::Float32, causal), half = run(compute, causal);
+        for (auto err : {compare(ref.out, half.out, label + "output"), compare(ref.lse, half.lse, label + "lse"),
+                         compare(ref.dq, half.dq, label + "dq"), compare(ref.dk, half.dk, label + "dk"),
+                         compare(ref.dv, half.dv, label + "dv")}) {
+            if (!err.empty()) return err;
+        }
+    }
+    int gemm_max_seq = cuda::attention_gemm_max_seq();
+    cuda::set_attention_gemm_max_seq(0);
+    Result tiled32 = run(DType::Float32, true), tiled_half = run(compute, true);
+    cuda::set_attention_gemm_max_seq(gemm_max_seq);
+    if (tiled32.out != tiled_half.out || tiled32.dq != tiled_half.dq || tiled32.dk != tiled_half.dk ||
+        tiled32.dv != tiled_half.dv) {
+        return "the tiled kernels changed under autocast; they compute in fp32";
+    }
+    return "";
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // End-to-end training
 // ---------------------------------------------------------------------------
 
-static std::string train_tiny_transformer(Device dev) {
+// compute != Float32 runs the matmuls under autocast (CUDA only); Float16 adds loss scaling
+static std::string train_tiny_transformer(Device dev, DType compute = DType::Float32) {
     manual_seed(42);
     const int V = 16, T = 8, B = 4;
     ModernTransformer model(V, 16, 32, 4, 2, 2);  // GQA: 4 query heads share 2 kv heads
@@ -1162,6 +1426,7 @@ static std::string train_tiny_transformer(Device dev) {
         if (params[i]->device != dev) return "parameter " + std::to_string(i) + " is not on " + device_name(dev);
     }
     Adam opt(1e-2f, 0.9f, 0.999f, 1e-8f, 0.0f);
+    GradScaler scaler(65536.0f, 2.0f, 0.5f, 2000, compute == DType::Float16);
 
     // Next-token task: token i is always followed by token i + 1
     std::vector<float> in(B * T), tg(B * T);
@@ -1171,16 +1436,25 @@ static std::string train_tiny_transformer(Device dev) {
     }
 
     float first = 0.0f, last = 0.0f;
+    bool grads_checked = false;
     for (int step = 0; step < 60; ++step) {
         opt.zero_grad(params);
         auto inputs = upload(in, {B, T}, dev, false);
         auto targets = upload(tg, {B, T}, dev, false);
-        auto logits = model.forward(inputs);
-        if (logits->device != dev) return std::string("logits computed on the wrong device");
-        auto loss = fused_cross_entropy(logits, targets);
-        loss->backward();
+        TensorPtr loss;
+        {
+            AutocastGuard autocast(compute);
+            auto logits = model.forward(inputs);
+            if (logits->device != dev) return std::string("logits computed on the wrong device");
+            loss = fused_cross_entropy(logits, targets);
+        }
+        scaler.scale(loss)->backward();
+        scaler.unscale(params);
 
-        if (step == 0) {
+        // Every parameter must get a finite, nonzero gradient. With loss scaling the first steps
+        // may overflow and be skipped by design, so check the first step that was not.
+        if (!grads_checked && !scaler.found_inf()) {
+            grads_checked = true;
             for (size_t i = 0; i < params.size(); ++i) {
                 if (!params[i]->grad) return "parameter " + std::to_string(i) + " received no gradient";
                 if (params[i]->grad->device != dev) return "gradient of parameter " + std::to_string(i) + " is not on " + device_name(dev);
@@ -1191,7 +1465,8 @@ static std::string train_tiny_transformer(Device dev) {
                 }
             }
         }
-        opt.step(params);
+        scaler.step(opt, params);
+        scaler.update();
 
         float l = download(loss)[0];
         if (!std::isfinite(l)) return "loss became " + std::to_string(l) + " at step " + std::to_string(step);
@@ -1201,7 +1476,11 @@ static std::string train_tiny_transformer(Device dev) {
     if (!(last < 0.5f * first)) {
         return "loss did not decrease enough: " + std::to_string(first) + " -> " + std::to_string(last);
     }
-    std::cout << "        loss " << first << " -> " << last << "\n";
+    if (!grads_checked) return "every step overflowed";
+    if (scaler.skipped_steps() > 5) return std::to_string(scaler.skipped_steps()) + " of 60 steps overflowed";
+    std::cout << "        loss " << first << " -> " << last;
+    if (scaler.enabled()) std::cout << " (scale " << scaler.get_scale() << ", " << scaler.skipped_steps() << " skipped)";
+    std::cout << "\n";
     return "";
 }
 
@@ -1304,11 +1583,31 @@ int main() {
     run_case(r, "workflow/token_dataset", workflow_token_dataset);
     run_case(r, "workflow/metrics_logger", workflow_metrics_logger);
 
+    std::cout << "\n-- mixed precision\n";
+    run_case(r, "amp/half_conversion", dtype_half_conversion);
+    run_case(r, "amp/typed_access_checked", dtype_typed_access_checked);
+    run_case(r, "amp/autocast_guard", amp_autocast_guard);
+    run_case(r, "amp/grad_scaler", amp_grad_scaler);
+#ifdef USE_CUDA
+    if (has_cuda) {
+        run_case(r, "amp/matmul_parity_fp16_cuda", [] { return amp_matmul_parity(DType::Float16); });
+        run_case(r, "amp/attention_parity_fp16_cuda", [] { return amp_attention_parity(DType::Float16); });
+        if (cuda_has_bf16_tensor_cores()) {
+            run_case(r, "amp/matmul_parity_bf16_cuda", [] { return amp_matmul_parity(DType::BFloat16); });
+            run_case(r, "amp/attention_parity_bf16_cuda", [] { return amp_attention_parity(DType::BFloat16); });
+        } else {
+            std::cout << "[SKIP] amp/*_parity_bf16_cuda (needs compute capability 8.0+)\n";
+        }
+    }
+#endif
+
     std::cout << "\n-- end-to-end training\n";
     run_case(r, "train/tiny_transformer_cpu", [] { return train_tiny_transformer(Device::CPU); });
     if (has_cuda) {
         run_case(r, std::string("train/tiny_transformer_") + device_name(Device::CUDA),
                  [] { return train_tiny_transformer(Device::CUDA); });
+        run_case(r, "train/tiny_transformer_cuda_fp16",
+                 [] { return train_tiny_transformer(Device::CUDA, DType::Float16); });
     }
 
     std::cout << "\n" << r.passed << " passed, " << r.failures.size() << " failed\n";

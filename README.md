@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/Keplercodes01/dummygrad/actions/workflows/ci.yml/badge.svg)](https://github.com/Keplercodes01/dummygrad/actions/workflows/ci.yml)
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Keplercodes01/dummygrad/blob/main/notebooks/dummygrad_colab.ipynb)
+[![Open in Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/Keplercodes01/dummygrad/blob/main/notebooks/dummygrad_colab.ipynb)
 
 A pure C++ deep learning engine engineered for absolute speed, zero abstraction bloat, and minimal codebase maintenance.
 
@@ -95,11 +96,17 @@ Full details for every release are in [CHANGELOG.md](CHANGELOG.md).
 
 ### Try it in your browser (no install)
 
-The fastest way to see dummygrad run is on a free Colab GPU:
+The fastest way to see dummygrad run is on a free GPU in Colab or Kaggle. The same notebook works on both.
 
+**Colab:**
 1. Click the **Open in Colab** badge at the top of this page.
 2. Select **Runtime → Change runtime type → T4 GPU**.
 3. Select **Runtime → Run all**.
+
+**Kaggle** (if Colab is unavailable to you):
+1. Click the **Open in Kaggle** badge at the top of this page.
+2. In the **Settings** panel, set **Accelerator → GPU T4 x2** and turn **Internet** on (Kaggle asks for phone verification once).
+3. Select **Run All**.
 
 The notebook builds dummygrad with CUDA, runs the test suite, the quickstart example, and a transformer training demo — about 5 minutes end to end.
 
@@ -300,6 +307,29 @@ TrainingState state = load_checkpoint("ckpt.safetensors", model, &optimizer);   
 - **`TokenDataset`** reads token streams (`from_file` for raw uint16/int32 ids, `from_bytes` for byte-level text), samples random windows with `sample()`, and walks the whole stream for evaluation with `windows()`.
 - **Optimizers:** `Adam` (AdamW, decoupled weight decay) and `SGD` (momentum, weight decay). Their state lives on each parameter's device and follows the model if you move it.
 - **`MetricsLogger`** writes long-format CSV, so any metric can be logged at any step. Load it with `pandas.read_csv(path).pivot(index="step", columns="metric", values="value")`.
+
+### Mixed precision
+
+On CUDA, `AutocastGuard` runs every matmul, and the matrix products inside attention, on fp16 (or bf16) tensor cores. Inputs are rounded to half precision, products accumulate in fp32, and outputs are fp32. The attention softmax, parameters, gradients, optimizer state and every other op stay fp32, so nothing else in your code changes. fp16 needs loss scaling so that small gradients don't round to zero, and `GradScaler` handles it:
+
+```cpp
+GradScaler scaler;                                       // skip it for bf16
+for (int64_t step = 0; step < steps; ++step) {
+    optimizer.zero_grad(params);
+    std::shared_ptr<Tensor> loss;
+    {
+        AutocastGuard autocast(DType::Float16);          // matmuls in here run on tensor cores
+        loss = fused_cross_entropy(model.forward(b.inputs), b.targets);
+    }
+    scaler.scale(loss)->backward();                      // backward reuses each matmul's forward precision
+    scaler.unscale(params);                              // true gradients, e.g. for clipping
+    clip_grad_norm_(params, 1.0f);
+    scaler.step(optimizer, params);                      // skipped if a gradient overflowed
+    scaler.update();
+}
+```
+
+The scaler follows PyTorch's `GradScaler`: it starts at 65536, halves on overflow and doubles after 2000 clean steps. `scaler.skipped_steps()` counts skipped steps, and `scaler.save_to(state)` / `scaler.load_from(state)` carry it through `TrainingState` checkpoints. Use `dg_bench --fp16` to measure the speedup on your GPU.
 
 ### Writing your own ops
 
@@ -646,13 +676,23 @@ Training-step time (forward, backward, AdamW) for the same ModernTransformer arc
 
 dummygrad's advantage is per-op overhead (no Python, no dispatcher), which dominates small models; at larger sizes both are bound by cuBLAS matrix multiplies (`MatmulBackward` is 47 of medium's 104 ms). Reproduce it with the [Colab notebook](notebooks/dummygrad_colab.ipynb), or run `./build/dg_bench` and `python bench/bench_torch.py` on your own GPU. `./build/dg_bench --profile` breaks backward time down by op.
 
+With fp16 mixed precision (`dg_bench --fp16`: `AutocastGuard` + `GradScaler`, against `torch.autocast` + `GradScaler`), on a Kaggle T4:
+
+| config | dummygrad fp32 | dummygrad fp16 | PyTorch 2.11 fp16 | |
+|---|---|---|---|---|
+| tiny | 4.1 ms | 4.7 ms | 12.4 ms | 2.6x faster |
+| small | 28.2 ms | 22.0 ms | 23.8 ms | 8% faster |
+| medium | 107.6 ms | **57.2 ms** | **51.4 ms** | 11% slower |
+
+fp16 nearly halves the medium step: `MatmulBackward` drops from 48 to 17 ms. Below about 1M parameters the conversions cost more than the tensor cores save, so stay in fp32 there. PyTorch's autocast also runs elementwise and normalization ops in fp16, which is most of its remaining lead at 23M.
+
 ---
 
 ## Status & Known Limitations
 
 dummygrad is pre-1.0: the core training path (CPU and CUDA, FP32) is covered by `test_engine`; other paths are less exercised.
 
-- **Half precision on CUDA.** FP16/BF16 are supported by `matmul` and data movement; elementwise, normalization and attention kernels are FP32, so there is no mixed-precision training yet.
+- **Mixed precision covers matrix products.** Under `AutocastGuard`, CUDA matmuls and attention (on its cuBLAS path, up to 2048 tokens) run on fp16/bf16 tensor cores. Normalization and elementwise kernels, the softmax, and attention beyond 2048 tokens stay fp32. Tensors are always stored in fp32; non-fp32 tensors are only for storage and conversion. bf16 needs an Ampere or newer GPU.
 - **Attention** runs as cuBLAS GEMMs for sequences up to 2048 tokens (any head dimension) and as tiled kernels beyond that for head dimensions 16, 32, 64 and 128. Other head dimensions past 2048 tokens (up to 512) fall back to slower untiled kernels, whose backward uses atomics and is not bitwise reproducible.
 - **Multi-GPU gradient aggregation** currently reduces through host memory.
 - **Metal and TPU kernels** are not covered by the test suite (macOS CI runs the CPU backend).

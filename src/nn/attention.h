@@ -12,14 +12,15 @@ struct FlashAttentionBackward : public Node {
     bool causal;
     float scale;
     cuda::AttentionImpl impl;  // what the forward ran, so backward reads matching statistics
+    DType compute;             // GEMM precision the forward ran with (autocast)
 
     FlashAttentionBackward(std::shared_ptr<Tensor> q, std::shared_ptr<Tensor> k, std::shared_ptr<Tensor> v,
                            std::shared_ptr<Tensor> out, std::shared_ptr<Tensor> lse,
                            int batch_size, int num_heads, int seq_len, int d_k, bool causal, float scale,
-                           cuda::AttentionImpl impl)
+                           cuda::AttentionImpl impl, DType compute)
         : q(std::move(q)), k(std::move(k)), v(std::move(v)), out(std::move(out)), lse(std::move(lse)),
           batch_size(batch_size), num_heads(num_heads), seq_len(seq_len), d_k(d_k), causal(causal), scale(scale),
-          impl(impl) {}
+          impl(impl), compute(compute) {}
 
     void release_variables() override {
         q = nullptr; k = nullptr; v = nullptr; out = nullptr; lse = nullptr;
@@ -34,7 +35,7 @@ struct FlashAttentionBackward : public Node {
         cuda::attention_backward(q->data_ptr<float>(), k->data_ptr<float>(), v->data_ptr<float>(),
                                  out->data_ptr<float>(), grad_out->data_ptr<float>(), lse->data_ptr<float>(),
                                  gq->data_ptr<float>(), gk->data_ptr<float>(), gv->data_ptr<float>(),
-                                 batch_size, num_heads, seq_len, d_k, causal, scale, impl);
+                                 batch_size, num_heads, seq_len, d_k, causal, scale, impl, compute);
         return {gq, gk, gv};
     }
 };
@@ -81,11 +82,13 @@ public:
             bool qkv_grad = grad_enabled() && (Q->requires_grad || K->requires_grad || V->requires_grad);
             auto out_4d = std::make_shared<Tensor>(Q_4d->shape, Device::CUDA, x->dtype, qkv_grad);
             auto lse = std::make_shared<Tensor>(std::vector<int64_t>{B, 1, S}, Device::CUDA, x->dtype, false);
+            DType compute = autocast_dtype();
             auto impl = cuda::attention_forward(Q_4d->data_ptr<float>(), K_4d->data_ptr<float>(), V_4d->data_ptr<float>(),
-                                                out_4d->data_ptr<float>(), lse->data_ptr<float>(), B, 1, S, d_k, causal, scale);
+                                                out_4d->data_ptr<float>(), lse->data_ptr<float>(), B, 1, S, d_k, causal, scale,
+                                                compute);
             if (qkv_grad) {
                 auto grad_fn = std::make_shared<FlashAttentionBackward>(Q_4d, K_4d, V_4d, out_4d, lse,
-                                                                        B, 1, S, d_k, causal, scale, impl);
+                                                                        B, 1, S, d_k, causal, scale, impl, compute);
                 grad_fn->add_next_edge(get_grad_edge(Q).function);
                 grad_fn->add_next_edge(get_grad_edge(K).function);
                 grad_fn->add_next_edge(get_grad_edge(V).function);
@@ -273,12 +276,13 @@ public:
             bool qkv_grad = grad_enabled() && (Q_split->requires_grad || K_split->requires_grad || V_split->requires_grad);
             attn_out = std::make_shared<Tensor>(Q_split->shape, Device::CUDA, x->dtype, qkv_grad);
             auto lse = std::make_shared<Tensor>(std::vector<int64_t>{B, n_heads, S}, Device::CUDA, x->dtype, false);
+            DType compute = autocast_dtype();
             auto impl = cuda::attention_forward(Q_c->data_ptr<float>(), K_c->data_ptr<float>(), V_c->data_ptr<float>(),
                                                 attn_out->data_ptr<float>(), lse->data_ptr<float>(), B, n_heads, S, d_k,
-                                                causal, scale);
+                                                causal, scale, compute);
             if (qkv_grad) {
                 auto grad_fn = std::make_shared<FlashAttentionBackward>(Q_c, K_c, V_c, attn_out, lse,
-                                                                        B, n_heads, S, d_k, causal, scale, impl);
+                                                                        B, n_heads, S, d_k, causal, scale, impl, compute);
                 grad_fn->add_next_edge(get_grad_edge(Q_split).function);
                 grad_fn->add_next_edge(get_grad_edge(K_split).function);
                 grad_fn->add_next_edge(get_grad_edge(V_split).function);

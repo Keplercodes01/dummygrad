@@ -4,6 +4,11 @@ same way, so the two tables can be compared row by row.
 
     python bench/bench_torch.py            all configurations
     python bench/bench_torch.py small      one configuration
+    python bench/bench_torch.py --fp16     torch.autocast(float16) with GradScaler (dg_bench --fp16)
+    python bench/bench_torch.py --bf16     torch.autocast(bfloat16) (dg_bench --bf16)
+
+PyTorch's autocast also runs elementwise and normalization ops in half precision, while
+dummygrad's covers matmuls and attention, so the --fp16 tables compare the two recipes.
 """
 
 import sys
@@ -109,8 +114,12 @@ class ModernTransformer(nn.Module):
 
 
 def main():
-    only = sys.argv[1] if len(sys.argv) > 1 else None
+    args = sys.argv[1:]
+    amp = {"--fp16": torch.float16, "--bf16": torch.bfloat16}
+    amp_dtype = next((amp[a] for a in args if a in amp), None)
+    only = next((a for a in args if a not in amp), None)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    precision = {torch.float16: "fp16", torch.bfloat16: "bf16", None: "fp32"}[amp_dtype]
     torch.backends.cuda.matmul.allow_tf32 = True  # dummygrad enables TF32 tensor-core math too
     warmup, steps = 3, 10
 
@@ -118,7 +127,8 @@ def main():
         if device == "cuda":
             torch.cuda.synchronize()
 
-    print(f"PyTorch {torch.__version__} benchmark on {device.upper()} ({steps} timed steps after {warmup} warmup)\n")
+    print(f"PyTorch {torch.__version__} benchmark on {device.upper()}, {precision} autocast "
+          f"({steps} timed steps after {warmup} warmup)\n")
     print("| config | params | ms/step | tokens/s | forward | backward | optimizer |")
     print("|---|---|---|---|---|---|---|")
     for name, vocab, d, layers, heads, kv, batch, seq in CONFIGS:
@@ -127,6 +137,7 @@ def main():
         torch.manual_seed(0)
         model = ModernTransformer(vocab, d, layers, heads, kv, seq).to(device)
         opt = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)
+        scaler = torch.amp.GradScaler(device, enabled=amp_dtype == torch.float16)
         idx = torch.arange(batch * seq)
         inputs = ((idx * 7) % vocab).view(batch, seq).to(device)
         targets = ((idx * 7 + 1) % vocab).view(batch, seq).to(device)
@@ -136,13 +147,15 @@ def main():
             opt.zero_grad(set_to_none=True)
             sync()
             t0 = time.perf_counter()
-            loss = F.cross_entropy(model(inputs).view(-1, vocab), targets.view(-1))
+            with torch.autocast(device, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None):
+                loss = F.cross_entropy(model(inputs).view(-1, vocab), targets.view(-1))
             sync()
             t1 = time.perf_counter()
-            loss.backward()
+            scaler.scale(loss).backward()
             sync()
             t2 = time.perf_counter()
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
             sync()
             t3 = time.perf_counter()
             if s >= warmup:

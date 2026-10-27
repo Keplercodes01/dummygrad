@@ -1,5 +1,6 @@
 #pragma once
 #include "tensor.h"
+#include "autocast.h"
 #include "functional.h"
 #include "ops.h"
 #include <cmath>
@@ -2758,6 +2759,7 @@ inline std::shared_ptr<Tensor> im2col(const std::shared_ptr<Tensor>& x_in, int k
 struct MatmulBackward : public Node {
     std::shared_ptr<Tensor> a, b;
     int r1, c1, r2, c2, batch_size, n1, n2, nout, nout_batch;
+    DType compute = DType::Float32;  // CUDA GEMM precision the forward ran with (autocast)
     std::vector<int64_t> strides_a_broad, strides_b_broad, out_shape;
 
     MatmulBackward(std::shared_ptr<Tensor> a, std::shared_ptr<Tensor> b,
@@ -2783,7 +2785,7 @@ struct MatmulBackward : public Node {
 #ifdef USE_CUDA
         if (self_grad->device == Device::CUDA || a->device == Device::CUDA || b->device == Device::CUDA) {
             std::shared_ptr<Tensor> grad_a, grad_b;
-            cuda::matmul_backward(a, b, self_grad, grad_a, grad_b);
+            cuda::matmul_backward(a, b, self_grad, grad_a, grad_b, compute);
             return {grad_a, grad_b};
         }
 #endif
@@ -3003,7 +3005,8 @@ inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const st
     }
 #ifdef USE_CUDA
     if (a->device == Device::CUDA || b->device == Device::CUDA) {
-        auto out = cuda::matmul(a, b);
+        DType compute = autocast_dtype();
+        auto out = cuda::matmul(a, b, compute);
         out->requires_grad = needs_grad(a) || needs_grad(b);
         if (needs_grad(a) || needs_grad(b)) {
             int n1 = a->ndim();
@@ -3032,6 +3035,7 @@ inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const st
                 a, b, r1, c1, r2, c2, batch_size, n1, n2, nout, nout_batch,
                 strides_a_broad, strides_b_broad, out->shape
             );
+            grad_fn->compute = compute;
             grad_fn->add_next_edge(get_grad_edge(a).function);
             grad_fn->add_next_edge(get_grad_edge(b).function);
             out->grad_fn = grad_fn;

@@ -861,9 +861,67 @@ void adamw_step(float* param, const float* grad, float* m, float* v,
 
 // -------------------------------------------------------------
 // cuBLAS Matrix Multiplication (Row-Major via Column-Major Trick)
-// Supports TF32 (FP32), FP16, and BF16 with Tensor Core Acceleration
+// fp32 tensors in and out. The compute dtype (from AutocastGuard) picks the GEMM: Float32 runs
+// SGEMM (TF32 tensor cores where the GPU has them); Float16/BFloat16 round the operands to that
+// type and run on tensor cores, accumulating and writing fp32.
 // -------------------------------------------------------------
-std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& _a, const std::shared_ptr<Tensor>& _b) {
+
+__global__ void k_float_to_half(const float* in, __half* out, int64_t n) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) out[idx] = __float2half_rn(in[idx]);
+}
+
+__global__ void k_float_to_bfloat16(const float* in, __nv_bfloat16* out, int64_t n) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) out[idx] = __float2bfloat16_rn(in[idx]);
+}
+
+void cast_from_float(const float* in, void* out, int64_t n, DType dtype) {
+    if (dtype != DType::Float16 && dtype != DType::BFloat16) {
+        throw std::runtime_error("cuda::cast_from_float: target dtype must be Float16 or BFloat16");
+    }
+    if (n == 0) return;
+    int threads = 256;
+    int blocks = (int)((n + threads - 1) / threads);
+    if (dtype == DType::Float16) {
+        k_float_to_half<<<blocks, threads>>>(in, static_cast<__half*>(out), n);
+    } else {
+        k_float_to_bfloat16<<<blocks, threads>>>(in, static_cast<__nv_bfloat16*>(out), n);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void check_compute_dtype(DType compute, const char* who) {
+    if (compute != DType::Float32 && compute != DType::Float16 && compute != DType::BFloat16) {
+        throw std::runtime_error(std::string(who) + ": compute dtype must be Float32, Float16 or BFloat16");
+    }
+}
+
+// A contiguous fp32 tensor as a GEMM operand: itself for Float32 compute, else a rounded copy
+static std::shared_ptr<Tensor> gemm_operand(const std::shared_ptr<Tensor>& t, DType compute) {
+    if (compute == DType::Float32) return t;
+    auto out = std::make_shared<Tensor>(t->shape, Device::CUDA, compute, false);
+    cast_from_float(t->data_ptr<float>(), out->data_ptr<void>(), t->size(), compute);
+    return out;
+}
+
+// Column-major C = op_a(A) op_b(B) + beta * C with alpha = 1 (see gemm_strided_batched)
+static void gemm(cublasOperation_t op_a, cublasOperation_t op_b, int m, int n, int k,
+                 const void* A, int lda, long long stride_a, const void* B, int ldb, long long stride_b,
+                 float beta, float* C, int ldc, long long stride_c, int batch, DType compute) {
+    gemm_strided_batched(op_a, op_b, m, n, k, 1.0f, A, lda, stride_a, B, ldb, stride_b, beta, C, ldc, stride_c,
+                         batch, compute);
+}
+
+static void check_matmul_inputs(const Tensor& a, const Tensor& b, const char* who) {
+    if (a.dtype != DType::Float32 || b.dtype != DType::Float32) {
+        throw std::runtime_error(std::string(who) + ": tensors must be Float32 (use AutocastGuard for fp16/bf16 compute)");
+    }
+}
+
+std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& _a, const std::shared_ptr<Tensor>& _b, DType compute) {
+    check_matmul_inputs(*_a, *_b, "cuda::matmul");
+    check_compute_dtype(compute, "cuda::matmul");
     auto a = make_contiguous(_a);
     auto b = make_contiguous(_b);
     int n1 = a->ndim();
@@ -886,7 +944,7 @@ std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& _a, const std::sha
     out_shape[out_shape.size() - 2] = r1;
     out_shape[out_shape.size() - 1] = c2;
 
-    auto out = std::make_shared<Tensor>(out_shape, Device::CUDA, a->dtype, a->requires_grad || b->requires_grad);
+    auto out = std::make_shared<Tensor>(out_shape, Device::CUDA, DType::Float32, a->requires_grad || b->requires_grad);
 
     // A shared weight (b has batch 1) multiplies every row of a: run one GEMM over a viewed as
     // [batch * r1, c1] instead of a batched GEMM. The memory layout is identical.
@@ -896,86 +954,26 @@ std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& _a, const std::sha
         batch_size = 1;
     }
 
-    cublasHandle_t handle = get_cublas_handle();
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
+    long long int stride_a = (batch_size_a > 1) ? (long long)r1 * c1 : 0;
+    long long int stride_b = (batch_size_b > 1) ? (long long)r2 * c2 : 0;
+    long long int stride_c = (long long)r1 * c2;
 
-    long long int stride_a = (batch_size_a > 1) ? (r1 * c1) : 0;
-    long long int stride_b = (batch_size_b > 1) ? (r2 * c2) : 0;
-    long long int stride_c = r1 * c2;
-
+    auto ah = gemm_operand(a, compute);
+    auto bh = gemm_operand(b, compute);
     // Row-major C = A * B -> Col-major C^T = B^T * A^T
-    if (a->dtype == DType::Float16) {
-        if (batch_size == 1) {
-            CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                                     c2, r1, c1,
-                                     &alpha,
-                                     b->data_ptr<void>(), CUDA_R_16F, c2,
-                                     a->data_ptr<void>(), CUDA_R_16F, c1,
-                                     &beta,
-                                     out->data_ptr<void>(), CUDA_R_16F, c2,
-                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        } else {
-            CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                                                   c2, r1, c1,
-                                                   &alpha,
-                                                   b->data_ptr<void>(), CUDA_R_16F, c2, stride_b,
-                                                   a->data_ptr<void>(), CUDA_R_16F, c1, stride_a,
-                                                   &beta,
-                                                   out->data_ptr<void>(), CUDA_R_16F, c2, stride_c,
-                                                   batch_size,
-                                                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        }
-    } else if (a->dtype == DType::BFloat16) {
-        if (batch_size == 1) {
-            CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                                     c2, r1, c1,
-                                     &alpha,
-                                     b->data_ptr<void>(), CUDA_R_16BF, c2,
-                                     a->data_ptr<void>(), CUDA_R_16BF, c1,
-                                     &beta,
-                                     out->data_ptr<void>(), CUDA_R_16BF, c2,
-                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        } else {
-            CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                                                   c2, r1, c1,
-                                                   &alpha,
-                                                   b->data_ptr<void>(), CUDA_R_16BF, c2, stride_b,
-                                                   a->data_ptr<void>(), CUDA_R_16BF, c1, stride_a,
-                                                   &beta,
-                                                   out->data_ptr<void>(), CUDA_R_16BF, c2, stride_c,
-                                                   batch_size,
-                                                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        }
-    } else {
-        // Float32 with TF32 Tensor Cores enabled via get_cublas_handle()
-        if (batch_size == 1) {
-            CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                                     c2, r1, c1,
-                                     &alpha,
-                                     b->data_ptr<float>(), c2,
-                                     a->data_ptr<float>(), c1,
-                                     &beta,
-                                     out->data_ptr<float>(), c2));
-        } else {
-            CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                                                   c2, r1, c1,
-                                                   &alpha,
-                                                   b->data_ptr<float>(), c2, stride_b,
-                                                   a->data_ptr<float>(), c1, stride_a,
-                                                   &beta,
-                                                   out->data_ptr<float>(), c2, stride_c,
-                                                   batch_size));
-        }
-    }
-
+    gemm(CUBLAS_OP_N, CUBLAS_OP_N, c2, r1, c1,
+         bh->data_ptr<void>(), c2, stride_b, ah->data_ptr<void>(), c1, stride_a,
+         0.0f, out->data_ptr<float>(), c2, stride_c, batch_size, compute);
     return out;
 }
 
 void matmul_backward(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b,
                      const std::shared_ptr<Tensor>& grad_out,
-                     std::shared_ptr<Tensor>& grad_a, std::shared_ptr<Tensor>& grad_b) {
+                     std::shared_ptr<Tensor>& grad_a, std::shared_ptr<Tensor>& grad_b, DType compute) {
     if (!grad_out) return;
+    check_matmul_inputs(*a, *b, "cuda::matmul_backward");
+    check_compute_dtype(compute, "cuda::matmul_backward");
+    if (grad_out->dtype != DType::Float32) throw std::runtime_error("cuda::matmul_backward: gradient must be Float32");
     auto a_c = make_contiguous(a);
     auto b_c = make_contiguous(b);
     auto g_c = make_contiguous(grad_out);
@@ -993,10 +991,9 @@ void matmul_backward(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Ten
     if (batch_size_a != batch_size_b && batch_size_a != 1 && batch_size_b != 1)
         throw std::runtime_error("cuda::matmul_backward: partial batch broadcasting is not supported");
 
-    grad_a = std::make_shared<Tensor>(a_c->shape, Device::CUDA, a_c->dtype, false);
-    grad_a->fill_(0.0f);
-    grad_b = std::make_shared<Tensor>(b_c->shape, Device::CUDA, b_c->dtype, false);
-    grad_b->fill_(0.0f);
+    // No zero fill: every GEMM below writes its output with beta = 0 before anything accumulates
+    grad_a = std::make_shared<Tensor>(a_c->shape, Device::CUDA, DType::Float32, false);
+    grad_b = std::make_shared<Tensor>(b_c->shape, Device::CUDA, DType::Float32, false);
 
     // Shared weight: dA = dC @ B^T is one GEMM over [batch * r1] rows, and dB = A^T @ dC sums over
     // the batch inside a single GEMM whose inner dimension spans every row
@@ -1006,210 +1003,41 @@ void matmul_backward(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Ten
         batch_size = 1;
     }
 
-    cublasHandle_t handle = get_cublas_handle();
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
+    long long int stride_a = (batch_size_a > 1) ? (long long)r1 * c1 : 0;
+    long long int stride_b = (batch_size_b > 1) ? (long long)r2 * c2 : 0;
+    long long int stride_g = (long long)r1 * c2;
 
-    long long int stride_a = (batch_size_a > 1) ? (r1 * c1) : 0;
-    long long int stride_b = (batch_size_b > 1) ? (r2 * c2) : 0;
-    long long int stride_g = r1 * c2;
+    auto ah = gemm_operand(a_c, compute);
+    auto bh = gemm_operand(b_c, compute);
+    auto gh = gemm_operand(g_c, compute);
+    const char* A = ah->data_ptr<char>();
+    const char* B = bh->data_ptr<char>();
+    const char* G = gh->data_ptr<char>();
+    float* dA = grad_a->data_ptr<float>();
+    float* dB = grad_b->data_ptr<float>();
 
-    if (a_c->dtype == DType::Float16) {
-        if (batch_size_a == batch_size_b) {
-            if (batch_size == 1) {
-                CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                                         c1, r1, c2,
-                                         &alpha,
-                                         b_c->data_ptr<void>(), CUDA_R_16F, c2,
-                                         g_c->data_ptr<void>(), CUDA_R_16F, c2,
-                                         &beta,
-                                         grad_a->data_ptr<void>(), CUDA_R_16F, c1,
-                                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-                CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
-                                         c2, c1, r1,
-                                         &alpha,
-                                         g_c->data_ptr<void>(), CUDA_R_16F, c2,
-                                         a_c->data_ptr<void>(), CUDA_R_16F, c1,
-                                         &beta,
-                                         grad_b->data_ptr<void>(), CUDA_R_16F, c2,
-                                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-            } else {
-                CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                                                       c1, r1, c2,
-                                                       &alpha,
-                                                       b_c->data_ptr<void>(), CUDA_R_16F, c2, stride_b,
-                                                       g_c->data_ptr<void>(), CUDA_R_16F, c2, stride_g,
-                                                       &beta,
-                                                       grad_a->data_ptr<void>(), CUDA_R_16F, c1, stride_a,
-                                                       batch_size,
-                                                       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-                CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
-                                                       c2, c1, r1,
-                                                       &alpha,
-                                                       g_c->data_ptr<void>(), CUDA_R_16F, c2, stride_g,
-                                                       a_c->data_ptr<void>(), CUDA_R_16F, c1, stride_a,
-                                                       &beta,
-                                                       grad_b->data_ptr<void>(), CUDA_R_16F, c2, stride_b,
-                                                       batch_size,
-                                                       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-            }
-        } else {
-            for (int batch = 0; batch < batch_size; ++batch) {
-                float beta_a = (batch == 0 && batch_size_a == 1) ? 0.0f : (batch_size_a == 1 ? 1.0f : 0.0f);
-                float beta_b = (batch == 0 && batch_size_b == 1) ? 0.0f : (batch_size_b == 1 ? 1.0f : 0.0f);
-                const char* b_ptr = reinterpret_cast<const char*>(b_c->data_ptr<void>()) + (batch_size_b > 1 ? batch * r2 * c2 * sizeof(uint16_t) : 0);
-                const char* a_ptr = reinterpret_cast<const char*>(a_c->data_ptr<void>()) + (batch_size_a > 1 ? batch * r1 * c1 * sizeof(uint16_t) : 0);
-                const char* g_ptr = reinterpret_cast<const char*>(g_c->data_ptr<void>()) + batch * r1 * c2 * sizeof(uint16_t);
-                char* ga_ptr = reinterpret_cast<char*>(grad_a->data_ptr<void>()) + (batch_size_a > 1 ? batch * r1 * c1 * sizeof(uint16_t) : 0);
-                char* gb_ptr = reinterpret_cast<char*>(grad_b->data_ptr<void>()) + (batch_size_b > 1 ? batch * r2 * c2 * sizeof(uint16_t) : 0);
+    if (batch_size_a == batch_size_b) {
+        // dA = dC B^T, dB = A^T dC
+        gemm(CUBLAS_OP_T, CUBLAS_OP_N, c1, r1, c2, B, c2, stride_b, G, c2, stride_g,
+             0.0f, dA, c1, stride_a, batch_size, compute);
+        gemm(CUBLAS_OP_N, CUBLAS_OP_T, c2, c1, r1, G, c2, stride_g, A, c1, stride_a,
+             0.0f, dB, c2, stride_b, batch_size, compute);
+        return;
+    }
 
-                CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                                         c1, r1, c2,
-                                         &alpha,
-                                         b_ptr, CUDA_R_16F, c2,
-                                         g_ptr, CUDA_R_16F, c2,
-                                         &beta_a,
-                                         ga_ptr, CUDA_R_16F, c1,
-                                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-                CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
-                                         c2, c1, r1,
-                                         &alpha,
-                                         g_ptr, CUDA_R_16F, c2,
-                                         a_ptr, CUDA_R_16F, c1,
-                                         &beta_b,
-                                         gb_ptr, CUDA_R_16F, c2,
-                                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-            }
-        }
-    } else if (a_c->dtype == DType::BFloat16) {
-        if (batch_size_a == batch_size_b) {
-            if (batch_size == 1) {
-                CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                                         c1, r1, c2,
-                                         &alpha,
-                                         b_c->data_ptr<void>(), CUDA_R_16BF, c2,
-                                         g_c->data_ptr<void>(), CUDA_R_16BF, c2,
-                                         &beta,
-                                         grad_a->data_ptr<void>(), CUDA_R_16BF, c1,
-                                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-                CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
-                                         c2, c1, r1,
-                                         &alpha,
-                                         g_c->data_ptr<void>(), CUDA_R_16BF, c2,
-                                         a_c->data_ptr<void>(), CUDA_R_16BF, c1,
-                                         &beta,
-                                         grad_b->data_ptr<void>(), CUDA_R_16BF, c2,
-                                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-            } else {
-                CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                                                       c1, r1, c2,
-                                                       &alpha,
-                                                       b_c->data_ptr<void>(), CUDA_R_16BF, c2, stride_b,
-                                                       g_c->data_ptr<void>(), CUDA_R_16BF, c2, stride_g,
-                                                       &beta,
-                                                       grad_a->data_ptr<void>(), CUDA_R_16BF, c1, stride_a,
-                                                       batch_size,
-                                                       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-                CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
-                                                       c2, c1, r1,
-                                                       &alpha,
-                                                       g_c->data_ptr<void>(), CUDA_R_16BF, c2, stride_g,
-                                                       a_c->data_ptr<void>(), CUDA_R_16BF, c1, stride_a,
-                                                       &beta,
-                                                       grad_b->data_ptr<void>(), CUDA_R_16BF, c2, stride_b,
-                                                       batch_size,
-                                                       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-            }
-        } else {
-            for (int batch = 0; batch < batch_size; ++batch) {
-                float beta_a = (batch == 0 && batch_size_a == 1) ? 0.0f : (batch_size_a == 1 ? 1.0f : 0.0f);
-                float beta_b = (batch == 0 && batch_size_b == 1) ? 0.0f : (batch_size_b == 1 ? 1.0f : 0.0f);
-                const char* b_ptr = reinterpret_cast<const char*>(b_c->data_ptr<void>()) + (batch_size_b > 1 ? batch * r2 * c2 * sizeof(uint16_t) : 0);
-                const char* a_ptr = reinterpret_cast<const char*>(a_c->data_ptr<void>()) + (batch_size_a > 1 ? batch * r1 * c1 * sizeof(uint16_t) : 0);
-                const char* g_ptr = reinterpret_cast<const char*>(g_c->data_ptr<void>()) + batch * r1 * c2 * sizeof(uint16_t);
-                char* ga_ptr = reinterpret_cast<char*>(grad_a->data_ptr<void>()) + (batch_size_a > 1 ? batch * r1 * c1 * sizeof(uint16_t) : 0);
-                char* gb_ptr = reinterpret_cast<char*>(grad_b->data_ptr<void>()) + (batch_size_b > 1 ? batch * r2 * c2 * sizeof(uint16_t) : 0);
-
-                CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                                         c1, r1, c2,
-                                         &alpha,
-                                         b_ptr, CUDA_R_16BF, c2,
-                                         g_ptr, CUDA_R_16BF, c2,
-                                         &beta_a,
-                                         ga_ptr, CUDA_R_16BF, c1,
-                                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-                CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
-                                         c2, c1, r1,
-                                         &alpha,
-                                         g_ptr, CUDA_R_16BF, c2,
-                                         a_ptr, CUDA_R_16BF, c1,
-                                         &beta_b,
-                                         gb_ptr, CUDA_R_16BF, c2,
-                                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-            }
-        }
-    } else {
-        // Float32 with TF32 Tensor Cores enabled via get_cublas_handle()
-        if (batch_size_a == batch_size_b) {
-            if (batch_size == 1) {
-                CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                                         c1, r1, c2,
-                                         &alpha,
-                                         b_c->data_ptr<float>(), c2,
-                                         g_c->data_ptr<float>(), c2,
-                                         &beta,
-                                         grad_a->data_ptr<float>(), c1));
-                CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
-                                         c2, c1, r1,
-                                         &alpha,
-                                         g_c->data_ptr<float>(), c2,
-                                         a_c->data_ptr<float>(), c1,
-                                         &beta,
-                                         grad_b->data_ptr<float>(), c2));
-            } else {
-                CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                                                       c1, r1, c2,
-                                                       &alpha,
-                                                       b_c->data_ptr<float>(), c2, stride_b,
-                                                       g_c->data_ptr<float>(), c2, stride_g,
-                                                       &beta,
-                                                       grad_a->data_ptr<float>(), c1, stride_a,
-                                                       batch_size));
-                CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_T,
-                                                       c2, c1, r1,
-                                                       &alpha,
-                                                       g_c->data_ptr<float>(), c2, stride_g,
-                                                       a_c->data_ptr<float>(), c1, stride_a,
-                                                       &beta,
-                                                       grad_b->data_ptr<float>(), c2, stride_b,
-                                                       batch_size));
-            }
-        } else {
-            for (int batch = 0; batch < batch_size; ++batch) {
-                float beta_a = (batch == 0 && batch_size_a == 1) ? 0.0f : (batch_size_a == 1 ? 1.0f : 0.0f);
-                float beta_b = (batch == 0 && batch_size_b == 1) ? 0.0f : (batch_size_b == 1 ? 1.0f : 0.0f);
-                const float* b_ptr = b_c->data_ptr<float>() + (batch_size_b > 1 ? batch * r2 * c2 : 0);
-                const float* a_ptr = a_c->data_ptr<float>() + (batch_size_a > 1 ? batch * r1 * c1 : 0);
-                const float* g_ptr = g_c->data_ptr<float>() + batch * r1 * c2;
-                float* ga_ptr = grad_a->data_ptr<float>() + (batch_size_a > 1 ? batch * r1 * c1 : 0);
-                float* gb_ptr = grad_b->data_ptr<float>() + (batch_size_b > 1 ? batch * r2 * c2 : 0);
-
-                CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                                         c1, r1, c2,
-                                         &alpha,
-                                         b_ptr, c2,
-                                         g_ptr, c2,
-                                         &beta_a,
-                                         ga_ptr, c1));
-                CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
-                                         c2, c1, r1,
-                                         &alpha,
-                                         g_ptr, c2,
-                                         a_ptr, c1,
-                                         &beta_b,
-                                         gb_ptr, c2));
-            }
-        }
+    // a has batch 1 and b does not (the reverse was folded above): dA sums every batch's
+    // contribution, so the batches run one at a time and accumulate in fp32
+    size_t elem = dtype_size(compute);
+    for (int batch = 0; batch < batch_size; ++batch) {
+        float beta_a = (batch_size_a == 1 && batch > 0) ? 1.0f : 0.0f;
+        float beta_b = (batch_size_b == 1 && batch > 0) ? 1.0f : 0.0f;
+        int64_t off_a = batch_size_a > 1 ? (int64_t)batch * r1 * c1 : 0;
+        int64_t off_b = batch_size_b > 1 ? (int64_t)batch * r2 * c2 : 0;
+        int64_t off_g = (int64_t)batch * r1 * c2;
+        gemm(CUBLAS_OP_T, CUBLAS_OP_N, c1, r1, c2, B + off_b * elem, c2, 0, G + off_g * elem, c2, 0,
+             beta_a, dA + off_a, c1, 0, 1, compute);
+        gemm(CUBLAS_OP_N, CUBLAS_OP_T, c2, c1, r1, G + off_g * elem, c2, 0, A + off_a * elem, c1, 0,
+             beta_b, dB + off_b, c2, 0, 1, compute);
     }
 }
 

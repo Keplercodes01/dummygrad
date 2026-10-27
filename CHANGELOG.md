@@ -2,6 +2,34 @@
 
 All notable changes to dummygrad are documented here. Versions follow [Semantic Versioning](https://semver.org/); while the major version is 0, minor releases may change behavior.
 
+## [Unreleased]
+
+Mixed-precision training: matmuls and attention on fp16/bf16 tensor cores. On a T4 (Kaggle), fp16 cuts the medium ModernTransformer step (23M parameters) from 107.6 to 57.2 ms; `MatmulBackward` goes from 48.3 to 16.7 ms and attention backward from 6.9 to 4.5 ms.
+
+| config | fp32 | fp16 | PyTorch 2.11 fp16 |
+|---|---|---|---|
+| tiny (0.4M params) | 4.1 ms | 4.7 ms | 12.4 ms |
+| small (3.9M) | 28.2 ms | 22.0 ms | 23.8 ms |
+| medium (23.1M) | 107.6 ms | 57.2 ms | 51.4 ms |
+
+fp16 does not pay off at tiny sizes, where converting operands and the scaler's extra pass cost more than tensor cores save. PyTorch's autocast also runs elementwise and normalization ops in fp16, which accounts for most of its lead at 23M.
+
+### Added
+- **`AutocastGuard`** (`core/autocast.h`): while one is alive, CUDA matmuls round their fp32 inputs to fp16 or bf16 and run on tensor cores, accumulating and writing fp32. Everything else stays fp32: parameters, gradients, optimizer state, and the normalization and elementwise kernels. Each op's backward uses the precision its forward ran with, so `backward()` can run outside the guard. Thread-local, like `NoGradGuard`.
+- **Attention under autocast** (cuBLAS path, sequences up to 2048 tokens): Q, K, V and dO are rounded once per call, and the softmax probabilities P and score gradients dS are written in half precision for the GEMMs that read them. Scores, the softmax, lse and every GEMM output stay fp32, and the chunk size accounts for the extra half-precision buffers. The tiled kernels for longer sequences stay fp32.
+- **`GradScaler`** (`nn/grad_scaler.h`): dynamic loss scaling for fp16, with PyTorch's semantics (`scale`, `unscale`, `step`, `update`). Gradients are unscaled and checked for inf/NaN on the GPU in one pass with a single host sync. Its state round-trips through `TrainingState` checkpoints (`save_to` / `load_from`).
+- `dg_bench --fp16` / `--bf16` and `bench_torch.py --fp16` / `--bf16`; the notebook runs the fp16 comparison.
+- The notebook runs on Kaggle as well as Colab (working directory picked per platform, nvcc located when it is not on PATH); the README has an Open in Kaggle badge.
+- Tests: fp16 rounding edge cases and an exact round trip of all 65536 fp16 values; fp16 (and bf16 on Ampere+) matmul forward and gradients against fp32 for plain, batched, shared-weight and broadcast products; attention output, lse and gradients under autocast against fp32, causal and not, and the tiled kernels unchanged by autocast; GradScaler skip, backoff, growth and checkpointing; the tiny transformer trains under fp16 autocast.
+
+### Changed
+- The cuBLAS GEMM call is one shared helper (`gemm_strided_batched` in `cuda_common.h`) for matmul and attention, in fp32 or half precision.
+- **`cuda::matmul` takes and returns Float32 only**, with the GEMM precision as a separate `compute` argument. The old fp16/bf16 paths stored their outputs and gradients in half precision, which no other CUDA kernel could read. `matmul_backward` no longer zero-fills its outputs before GEMMs that overwrite them.
+- **Typed data access is checked:** `data_ptr<float>()` (and `float16`, `bfloat16`, `int8_t`) throws if the tensor's dtype differs, instead of reinterpreting the bytes. CUDA kernels take `float*`, so passing an fp16 tensor to any of them used to compute garbage silently. `data_ptr<void>()` and other raw types are unchecked.
+
+### Fixed
+- **fp32 to fp16 conversion on the CPU rounds to nearest even.** It used to truncate, biasing every value toward zero, and turned finite values beyond 65504 into NaN instead of infinity.
+
 ## [0.5.1] - 2026-10-25
 
 Backward-pass tuning. On a T4, the medium ModernTransformer step (23M parameters) went from 112.6 to 103.6 ms and is now 4% faster than eager PyTorch (107.7 ms); attention backward went from 17 to 6.6 ms and AccumulateGrad from about 4 to 1.1 ms per step.

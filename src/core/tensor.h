@@ -35,6 +35,7 @@ public:
     template<typename T = float>
     T* data_ptr() {
         if (!storage || !storage->data) return nullptr;
+        check_element_type<T>();
         char* base = static_cast<char*>(storage->data) + global_offset * dtype_size(dtype);
         if constexpr (std::is_void_v<T>) {
             return base;
@@ -46,6 +47,7 @@ public:
     template<typename T = float>
     const T* data_ptr() const {
         if (!storage || !storage->data) return nullptr;
+        check_element_type<T>();
         const char* base = static_cast<const char*>(storage->data) + global_offset * dtype_size(dtype);
         if constexpr (std::is_void_v<T>) {
             return base;
@@ -53,6 +55,17 @@ public:
             return reinterpret_cast<const T*>(base);
         }
     }
+    // Typed access must match the dtype (see has_dtype_v); raw byte access is always allowed
+    template<typename T>
+    void check_element_type() const {
+        using U = std::remove_cv_t<T>;
+        if constexpr (has_dtype_v<U>) {
+            if (dtype != dtype_of<U>()) {
+                throw std::runtime_error("Tensor::data_ptr: element type does not match the tensor's dtype");
+            }
+        }
+    }
+
     template<typename T> T data_at(int64_t i) const {
         if (device != Device::CPU) {
             throw std::runtime_error("Tensor::data_at: cannot directly access device tensor on CPU. Call .cpu() first.");
