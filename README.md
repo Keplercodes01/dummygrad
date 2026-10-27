@@ -301,6 +301,29 @@ TrainingState state = load_checkpoint("ckpt.safetensors", model, &optimizer);   
 - **Optimizers:** `Adam` (AdamW, decoupled weight decay) and `SGD` (momentum, weight decay). Their state lives on each parameter's device and follows the model if you move it.
 - **`MetricsLogger`** writes long-format CSV, so any metric can be logged at any step. Load it with `pandas.read_csv(path).pivot(index="step", columns="metric", values="value")`.
 
+### Mixed precision
+
+On CUDA, `AutocastGuard` runs every matmul, and the matrix products inside attention, on fp16 (or bf16) tensor cores. Inputs are rounded to half precision, products accumulate in fp32, and outputs are fp32. The attention softmax, parameters, gradients, optimizer state and every other op stay fp32, so nothing else in your code changes. fp16 needs loss scaling so that small gradients don't round to zero, and `GradScaler` handles it:
+
+```cpp
+GradScaler scaler;                                       // skip it for bf16
+for (int64_t step = 0; step < steps; ++step) {
+    optimizer.zero_grad(params);
+    std::shared_ptr<Tensor> loss;
+    {
+        AutocastGuard autocast(DType::Float16);          // matmuls in here run on tensor cores
+        loss = fused_cross_entropy(model.forward(b.inputs), b.targets);
+    }
+    scaler.scale(loss)->backward();                      // backward reuses each matmul's forward precision
+    scaler.unscale(params);                              // true gradients, e.g. for clipping
+    clip_grad_norm_(params, 1.0f);
+    scaler.step(optimizer, params);                      // skipped if a gradient overflowed
+    scaler.update();
+}
+```
+
+The scaler follows PyTorch's `GradScaler`: it starts at 65536, halves on overflow and doubles after 2000 clean steps. `scaler.skipped_steps()` counts skipped steps, and `scaler.save_to(state)` / `scaler.load_from(state)` carry it through `TrainingState` checkpoints. Use `dg_bench --fp16` to measure the speedup on your GPU.
+
 ### Writing your own ops
 
 A new op is a forward function plus a backward `Node`. [`examples/custom_op.cpp`](examples/custom_op.cpp) is a complete, compiled example (squared ReLU). The shape of it:
@@ -652,7 +675,7 @@ dummygrad's advantage is per-op overhead (no Python, no dispatcher), which domin
 
 dummygrad is pre-1.0: the core training path (CPU and CUDA, FP32) is covered by `test_engine`; other paths are less exercised.
 
-- **Half precision on CUDA.** FP16/BF16 are supported by `matmul` and data movement; elementwise, normalization and attention kernels are FP32, so there is no mixed-precision training yet.
+- **Mixed precision covers matrix products.** Under `AutocastGuard`, CUDA matmuls and attention (on its cuBLAS path, up to 2048 tokens) run on fp16/bf16 tensor cores. Normalization and elementwise kernels, the softmax, and attention beyond 2048 tokens stay fp32. Tensors are always stored in fp32; non-fp32 tensors are only for storage and conversion. bf16 needs an Ampere or newer GPU.
 - **Attention** runs as cuBLAS GEMMs for sequences up to 2048 tokens (any head dimension) and as tiled kernels beyond that for head dimensions 16, 32, 64 and 128. Other head dimensions past 2048 tokens (up to 512) fall back to slower untiled kernels, whose backward uses atomics and is not bitwise reproducible.
 - **Multi-GPU gradient aggregation** currently reduces through host memory.
 - **Metal and TPU kernels** are not covered by the test suite (macOS CI runs the CPU backend).

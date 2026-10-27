@@ -5,6 +5,8 @@
 //   ./dg_bench                  all configurations
 //   ./dg_bench small            one configuration (tiny, small, medium)
 //   ./dg_bench --profile        also print the most expensive backward ops per configuration
+//   ./dg_bench --fp16           matmuls and attention on fp16 tensor cores (AutocastGuard + GradScaler)
+//   ./dg_bench --bf16           matmuls and attention on bf16 tensor cores (Ampere or newer)
 
 #include "dummy_core.h"
 
@@ -40,11 +42,15 @@ static double now_ms() {
 int main(int argc, char** argv) {
     std::string only;
     bool profile = false;
+    DType compute = DType::Float32;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--profile") profile = true;
+        else if (arg == "--fp16") compute = DType::Float16;
+        else if (arg == "--bf16") compute = DType::BFloat16;
         else only = arg;
     }
+    const char* compute_name = compute == DType::Float16 ? "fp16" : compute == DType::BFloat16 ? "bf16" : "fp32";
     std::vector<std::string> profiles;
     Device device = Device::CPU;
 #ifdef USE_CUDA
@@ -52,8 +58,8 @@ int main(int argc, char** argv) {
     if (cudaGetDeviceCount(&gpus) == cudaSuccess && gpus > 0) device = Device::CUDA;
 #endif
     const int warmup = 3, steps = 10;
-    std::printf("dummygrad %s benchmark on %s (%d timed steps after %d warmup)\n\n", DUMMYGRAD_VERSION,
-                device == Device::CUDA ? "CUDA" : "CPU", steps, warmup);
+    std::printf("dummygrad %s benchmark on %s, %s autocast (%d timed steps after %d warmup)\n\n", DUMMYGRAD_VERSION,
+                device == Device::CUDA ? "CUDA" : "CPU", compute_name, steps, warmup);
     std::printf("| config | params | ms/step | tokens/s | forward | backward | optimizer | copies/step | MB/step |\n");
     std::printf("|---|---|---|---|---|---|---|---|---|\n");
 
@@ -64,6 +70,8 @@ int main(int argc, char** argv) {
         model.to(device);
         auto params = model.parameters();
         Adam optimizer(3e-4f);
+        // Loss scaling is part of the fp16 step cost; its unscale pass is timed with the optimizer
+        GradScaler scaler(65536.0f, 2.0f, 0.5f, 2000, compute == DType::Float16);
 
         std::vector<float> in(c.batch * c.seq_len), tg(c.batch * c.seq_len);
         for (size_t i = 0; i < in.size(); ++i) {
@@ -78,6 +86,10 @@ int main(int argc, char** argv) {
             return d;
         };
         auto inputs = make(in), targets = make(tg);
+        auto forward_loss = [&] {
+            AutocastGuard autocast(compute);
+            return fused_cross_entropy(model.forward(inputs), targets);
+        };
 
         double t_fwd = 0, t_bwd = 0, t_opt = 0;
         TransferStats traffic;
@@ -87,13 +99,14 @@ int main(int argc, char** argv) {
             optimizer.zero_grad(params);
             sync(device);
             double t0 = now_ms();
-            auto loss = fused_cross_entropy(model.forward(inputs), targets);
+            auto loss = forward_loss();
             sync(device);
             double t1 = now_ms();
-            loss->backward();
+            scaler.scale(loss)->backward();
             sync(device);
             double t2 = now_ms();
-            optimizer.step(params);
+            scaler.step(optimizer, params);
+            scaler.update();
             sync(device);
             double t3 = now_ms();
             if (timed) {
@@ -118,7 +131,7 @@ int main(int argc, char** argv) {
             set_profiling(true);
             for (int s = 0; s < profiled_steps; ++s) {
                 optimizer.zero_grad(params);
-                fused_cross_entropy(model.forward(inputs), targets)->backward();
+                scaler.scale(forward_loss())->backward();
             }
             set_profiling(false);
             std::string report = "\nBackward ops, " + c.name + " (ms per step):\n";

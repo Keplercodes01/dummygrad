@@ -512,6 +512,16 @@ __global__ void k_sum_squares_finish(const double* partial, double* out, int buf
     out[b] = acc;
 }
 
+// x *= inv_scale, raising *found_nonfinite if any input was inf or NaN. Every writer stores the
+// same 1, so the race is benign and the result deterministic.
+__global__ void k_unscale(float* x, int64_t n, float inv_scale, int* found_nonfinite) {
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        float v = x[i];
+        if (!isfinite(v)) *found_nonfinite = 1;
+        x[i] = v * inv_scale;
+    }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------
@@ -680,6 +690,20 @@ double sum_of_squares(const std::vector<const float*>& buffers, const std::vecto
     double total = 0.0;
     for (double v : host) total += v;
     return total;
+}
+
+bool unscale_and_check(const std::vector<float*>& buffers, const std::vector<int64_t>& sizes, float inv_scale) {
+    if (buffers.empty()) return false;
+    DeviceBuffer flag(sizeof(int));
+    CUDA_CHECK(cudaMemset(flag.ptr, 0, sizeof(int)));
+    for (size_t b = 0; b < buffers.size(); ++b) {
+        if (sizes[b] == 0) continue;
+        k_unscale<<<grid_for(sizes[b]), kThreads>>>(buffers[b], sizes[b], inv_scale, flag.as<int>());
+        CUDA_CHECK(cudaGetLastError());
+    }
+    int found = 0;
+    CUDA_CHECK(cudaMemcpy(&found, flag.ptr, sizeof(int), cudaMemcpyDeviceToHost));
+    return found != 0;
 }
 
 }  // namespace cuda

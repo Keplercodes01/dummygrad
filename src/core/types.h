@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <type_traits>
 
 enum class Device { CPU, CUDA, MPS, TPU };
 enum class DType { Float32, Float16, BFloat16, Int8 };
@@ -20,21 +21,30 @@ inline size_t dtype_size(DType dtype) {
 // IEEE 754 FP16 and Brain Floating Point BF16 bitwise helpers
 // -------------------------------------------------------------
 
+// Round to nearest even, like CUDA's __float2half_rn: finite values past the fp16 range become
+// +-inf, NaN stays a (quiet) NaN, and values below the smallest normal become subnormals.
 static inline uint16_t float_to_half_bits(float val) {
     uint32_t f;
     std::memcpy(&f, &val, sizeof(float));
     uint32_t sign = (f >> 16) & 0x8000;
-    int32_t exp = ((f >> 23) & 0x00ff) - 127 + 15;
-    uint32_t frac = f & 0x007fffff;
-    if (exp <= 0) {
-        if (exp < -10) return (uint16_t)sign;
-        frac |= 0x00800000;
-        frac >>= (1 - exp);
-        return (uint16_t)(sign | (frac >> 13));
-    } else if (exp >= 31) {
-        return (uint16_t)(sign | 0x7c00 | (frac ? 1 : 0));
+    uint32_t mag = f & 0x7fffffff;
+    if (mag > 0x7f800000) return (uint16_t)(sign | 0x7e00);   // NaN
+    if (mag >= 0x477ff000) return (uint16_t)(sign | 0x7c00);  // >= 65520 rounds past 65504: inf
+    if (mag < 0x38800000) {
+        // Subnormal: adding 0.5 aligns the value so the float adder rounds it at fp16's
+        // subnormal step (2^-24), leaving the result in the low mantissa bits
+        float a;
+        std::memcpy(&a, &mag, sizeof(a));
+        a += 0.5f;
+        uint32_t bits;
+        std::memcpy(&bits, &a, sizeof(bits));
+        return (uint16_t)(sign | (bits - 0x3f000000));
     }
-    return (uint16_t)(sign | (exp << 10) | (frac >> 13));
+    // Normal: rebias the exponent (127 -> 15) and round the 13 dropped mantissa bits to even.
+    // A carry out of the mantissa correctly bumps the exponent.
+    uint32_t odd = (mag >> 13) & 1;
+    mag += 0xc8000fff + odd;
+    return (uint16_t)(sign | (mag >> 13));
 }
 
 static inline float half_bits_to_float(uint16_t h) {
@@ -132,6 +142,20 @@ inline bfloat16 operator+(bfloat16 a, bfloat16 b) { return bfloat16((float)a + (
 inline bfloat16 operator-(bfloat16 a, bfloat16 b) { return bfloat16((float)a - (float)b); }
 inline bfloat16 operator*(bfloat16 a, bfloat16 b) { return bfloat16((float)a * (float)b); }
 inline bfloat16 operator/(bfloat16 a, bfloat16 b) { return bfloat16((float)a / (float)b); }
+
+// The DType a C++ element type reads, so typed data access can reject a mismatch: fp16 storage
+// read as float is garbage, not an error. Raw types (void, char, uint16_t, ...) are not checked.
+template <typename T>
+inline constexpr bool has_dtype_v = std::is_same_v<T, float> || std::is_same_v<T, float16> ||
+                                    std::is_same_v<T, bfloat16> || std::is_same_v<T, int8_t>;
+
+template <typename T>
+constexpr DType dtype_of() {
+    if constexpr (std::is_same_v<T, float>) return DType::Float32;
+    else if constexpr (std::is_same_v<T, float16>) return DType::Float16;
+    else if constexpr (std::is_same_v<T, bfloat16>) return DType::BFloat16;
+    else return DType::Int8;
+}
 
 #define Dispatch_DType(type, ...) \
     switch(type) { \

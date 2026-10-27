@@ -5,6 +5,7 @@
 #include "core/storage.h"
 #include "core/allocator.h"
 #include "core/tensor.h"
+#include "core/autocast.h"
 #include "core/utils.h"
 #include "core/init.h"
 #include "core/dummy_ptr.h"
@@ -51,3 +52,4 @@
 // Training workflow: data loading, checkpoints, metric logging
 #include "data.h"
 #include "training.h"
+#include "nn/grad_scaler.h"

@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
+#include "types.h"
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -40,6 +41,39 @@ inline cublasHandle_t get_cublas_handle() {
         return handle;
     }
     return it->second;
+}
+
+// cuBLAS strided-batched GEMM, column-major: C = alpha op_a(A) op_b(B) + beta C. C is fp32; A and
+// B are fp32, or both of the compute dtype: Float16/BFloat16 run on tensor cores and accumulate in
+// fp32. Float32 runs SGEMM, which uses TF32 tensor cores where the GPU has them (see the math mode
+// above). batch == 1 ignores the strides.
+inline void gemm_strided_batched(cublasOperation_t op_a, cublasOperation_t op_b, int m, int n, int k, float alpha,
+                                 const void* A, int lda, long long stride_a, const void* B, int ldb, long long stride_b,
+                                 float beta, float* C, int ldc, long long stride_c, int batch, DType compute) {
+    cublasHandle_t handle = get_cublas_handle();
+    if (compute == DType::Float32) {
+        const float* a = static_cast<const float*>(A);
+        const float* b = static_cast<const float*>(B);
+        if (batch == 1) {
+            CUBLAS_CHECK(cublasSgemm(handle, op_a, op_b, m, n, k, &alpha, a, lda, b, ldb, &beta, C, ldc));
+        } else {
+            CUBLAS_CHECK(cublasSgemmStridedBatched(handle, op_a, op_b, m, n, k, &alpha, a, lda, stride_a,
+                                                   b, ldb, stride_b, &beta, C, ldc, stride_c, batch));
+        }
+        return;
+    }
+    if (compute != DType::Float16 && compute != DType::BFloat16) {
+        throw std::runtime_error("gemm_strided_batched: compute dtype must be Float32, Float16 or BFloat16");
+    }
+    cudaDataType_t type = compute == DType::Float16 ? CUDA_R_16F : CUDA_R_16BF;
+    if (batch == 1) {
+        CUBLAS_CHECK(cublasGemmEx(handle, op_a, op_b, m, n, k, &alpha, A, type, lda, B, type, ldb,
+                                  &beta, C, CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    } else {
+        CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, op_a, op_b, m, n, k, &alpha, A, type, lda, stride_a,
+                                                B, type, ldb, stride_b, &beta, C, CUDA_R_32F, ldc, stride_c,
+                                                batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    }
 }
 
 // -------------------------------------------------------------

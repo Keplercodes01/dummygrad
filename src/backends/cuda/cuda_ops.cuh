@@ -13,11 +13,18 @@ namespace cuda {
     void copy_from_vector(Tensor& tensor, const std::vector<float>& values);
     void make_contiguous(Tensor& dst, const Tensor& src);
 
-    // Fast cuBLAS matrix multiplication (supports batched + broadcasting)
-    std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b);
+    // cuBLAS matrix multiplication (batched, whole-operand broadcasting) on Float32 tensors.
+    // compute is the GEMM input precision: Float32, or Float16/BFloat16 on tensor cores with fp32
+    // accumulation (see AutocastGuard). Outputs and gradients are always Float32.
+    std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b,
+                                   DType compute = DType::Float32);
     void matmul_backward(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b,
                          const std::shared_ptr<Tensor>& grad_out,
-                         std::shared_ptr<Tensor>& grad_a, std::shared_ptr<Tensor>& grad_b);
+                         std::shared_ptr<Tensor>& grad_a, std::shared_ptr<Tensor>& grad_b,
+                         DType compute = DType::Float32);
+
+    // Rounds n device floats to Float16 or BFloat16 (nearest even) into out
+    void cast_from_float(const float* in, void* out, int64_t n, DType dtype);
 
     // Fused elementwise activations
     void relu_forward(const float* in, float* out, int64_t size);
@@ -94,22 +101,30 @@ namespace cuda {
 
     // Sum of squares over several device buffers, in double precision (for gradient clipping)
     double sum_of_squares(const std::vector<const float*>& buffers, const std::vector<int64_t>& sizes);
+    // Multiplies every buffer by inv_scale in place; returns whether any value was inf or NaN
+    // (GradScaler). One host sync for all buffers.
+    bool unscale_and_check(const std::vector<float*>& buffers, const std::vector<int64_t>& sizes, float inv_scale);
 
     // ---- cuda_attention.cu: attention (cuBLAS GEMM path or tiled kernels, deterministic backward) ----
     // q, k, v, out, dout, dq, dk, dv are [batch * heads, seq_len, head_dim]; lse is [batch * heads, seq_len].
     // seq_len <= attention_gemm_max_seq() runs as batched GEMMs (any head dim); longer sequences use the
     // tiled kernels for head dims 16/32/64/128 and the untiled flash kernels otherwise. Forward returns
     // the implementation it used; pass it to backward, which needs the matching saved statistics.
+    // compute (see AutocastGuard) is the precision of the GEMM path's products: Float16/BFloat16 round
+    // Q, K, V, dO and the probabilities P / score gradients dS for tensor cores, while scores, softmax,
+    // lse and every output stay fp32. The tiled and untiled kernels always compute in fp32.
     enum class AttentionImpl { Gemm, Tiled, Untiled };
     // Longest sequence that takes the GEMM path (default 2048). The GEMM path materializes [seq, seq]
     // scores for a chunk of heads (at most 256 MB); 0 forces the tiled kernels, whose memory is linear in seq.
     void set_attention_gemm_max_seq(int seq_len);
     int attention_gemm_max_seq();
     AttentionImpl attention_forward(const float* q, const float* k, const float* v, float* out, float* lse,
-                                    int batch, int heads, int seq_len, int head_dim, bool causal, float scale);
+                                    int batch, int heads, int seq_len, int head_dim, bool causal, float scale,
+                                    DType compute = DType::Float32);
     void attention_backward(const float* q, const float* k, const float* v, const float* out, const float* dout,
                             const float* lse, float* dq, float* dk, float* dv,
-                            int batch, int heads, int seq_len, int head_dim, bool causal, float scale, AttentionImpl impl);
+                            int batch, int heads, int seq_len, int head_dim, bool causal, float scale, AttentionImpl impl,
+                            DType compute = DType::Float32);
 
     // Rotary Position Embeddings (RoPE)
     void rope_forward(const float* in, const float* cos_freqs, const float* sin_freqs,
