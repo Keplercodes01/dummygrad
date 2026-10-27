@@ -12,7 +12,10 @@ Groundwork for keeping activations in fp16 under autocast: half-precision tensor
 - CUDA `matmul` and `linear` take Float32, Float16 or BFloat16 inputs: an input already in the GEMM's compute dtype is used as is, others are converted. Each input's gradient comes back in its own dtype.
 - Tests: `cast` rounding and gradients (CPU and CUDA, no host copies on CUDA); 18 ops given fp16 inputs produce bit-identical outputs to fp32 inputs, with the fp32 gradient rounded once to fp16.
 
+- **Same-session baselines in the notebook.** Set `BASELINE` (e.g. `v0.7.0`) and the notebook also builds that version's benchmark, from the current `bench.cpp`, and runs it right after the branch's, so a before/after comparison is free of session-to-session noise.
+
 ### Changed
+- **Benchmarks report medians over a fixed time budget.** `dg_bench` and `bench_torch.py` run 10 warmup steps, then at least 50 timed steps covering at least 2 seconds (`--seconds` changes it), and report the median step with its 10th-90th percentile spread. They used to average 10 steps after 3 warmups, about 20 ms of measurement for the tiny model, which on shared cloud CPUs moved by tens of percent from run to run. `--profile` now averages 10 steps instead of 3.
 - `Tensor::to(dtype)` on a CUDA tensor converts on the GPU. It used to copy to the host, convert there and copy back.
 - CUDA `fill` and `add_inplace` (gradient accumulation) work on fp16 and bf16, summing in fp32 and rounding once.
 - `SliceBackward` copies by element size, so it works in any dtype, and on CUDA builds the gradient on the device with one strided copy. It used to round-trip every GPU gradient through the host.

@@ -6,6 +6,10 @@ same way, so the two tables can be compared row by row.
     python bench/bench_torch.py small      one configuration
     python bench/bench_torch.py --fp16     torch.autocast(float16) with GradScaler (dg_bench --fp16)
     python bench/bench_torch.py --bf16     torch.autocast(bfloat16) (dg_bench --bf16)
+    python bench/bench_torch.py --seconds 5   time each configuration for at least 5 seconds (default 2)
+
+Like dg_bench, each configuration runs 10 warmup steps, then at least 50 timed steps covering at
+least 2 seconds, and reports the median step with its 10th-90th percentile spread.
 
 PyTorch's autocast also runs elementwise and normalization ops in half precision, while
 dummygrad's covers matmuls and attention, so the --fp16 tables compare the two recipes.
@@ -113,24 +117,39 @@ class ModernTransformer(nn.Module):
         return self.rms_f(x) @ self.emb.weight.t()  # tied output head
 
 
+def quantile(values, q):
+    """q-quantile (0 <= q <= 1), interpolating between neighbouring order statistics, as dg_bench does."""
+    v = sorted(values)
+    pos = q * (len(v) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(v) - 1)
+    return v[lo] + (v[hi] - v[lo]) * (pos - lo)
+
+
 def main():
     args = sys.argv[1:]
+    min_seconds = 2.0
+    if "--seconds" in args:
+        i = args.index("--seconds")
+        min_seconds = float(args[i + 1])
+        del args[i:i + 2]
     amp = {"--fp16": torch.float16, "--bf16": torch.bfloat16}
     amp_dtype = next((amp[a] for a in args if a in amp), None)
     only = next((a for a in args if a not in amp), None)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     precision = {torch.float16: "fp16", torch.bfloat16: "bf16", None: "fp32"}[amp_dtype]
     torch.backends.cuda.matmul.allow_tf32 = True  # dummygrad enables TF32 tensor-core math too
-    warmup, steps = 3, 10
+    warmup, min_steps, max_steps = 10, 50, 5000  # same as dg_bench
 
     def sync():
         if device == "cuda":
             torch.cuda.synchronize()
 
-    print(f"PyTorch {torch.__version__} benchmark on {device.upper()}, {precision} autocast "
-          f"({steps} timed steps after {warmup} warmup)\n")
-    print("| config | params | ms/step | tokens/s | forward | backward | optimizer |")
-    print("|---|---|---|---|---|---|---|")
+    print(f"PyTorch {torch.__version__} benchmark on {device.upper()}, {precision} autocast")
+    print(f"median of >= {min_steps} steps and >= {min_seconds:.0f} s per config after {warmup} warmup; "
+          f"p10-p90 is the spread of step times\n")
+    print("| config | params | ms/step | p10-p90 | tokens/s | forward | backward | optimizer | steps |")
+    print("|---|---|---|---|---|---|---|---|---|")
     for name, vocab, d, layers, heads, kv, batch, seq in CONFIGS:
         if only and only != name:
             continue
@@ -142,8 +161,10 @@ def main():
         inputs = ((idx * 7) % vocab).view(batch, seq).to(device)
         targets = ((idx * 7 + 1) % vocab).view(batch, seq).to(device)
 
-        t_fwd = t_bwd = t_opt = 0.0
-        for s in range(warmup + steps):
+        t_fwd, t_bwd, t_opt, t_step = [], [], [], []
+        for s in range(warmup + max_steps):
+            if s >= warmup and len(t_step) >= min_steps and sum(t_step) >= min_seconds:
+                break
             opt.zero_grad(set_to_none=True)
             sync()
             t0 = time.perf_counter()
@@ -159,13 +180,16 @@ def main():
             sync()
             t3 = time.perf_counter()
             if s >= warmup:
-                t_fwd += t1 - t0
-                t_bwd += t2 - t1
-                t_opt += t3 - t2
-        per_step = (t_fwd + t_bwd + t_opt) / steps * 1000
+                t_fwd.append(t1 - t0)
+                t_bwd.append(t2 - t1)
+                t_opt.append(t3 - t2)
+                t_step.append(t3 - t0)
+        ms = lambda v, q=0.5: quantile(v, q) * 1000
+        per_step = ms(t_step)
         params = sum(p.numel() for p in model.parameters()) / 1e6
-        print(f"| {name} | {params:.1f}M | {per_step:.1f} | {batch * seq * 1000 / per_step:.0f} | "
-              f"{t_fwd / steps * 1000:.1f} | {t_bwd / steps * 1000:.1f} | {t_opt / steps * 1000:.1f} |", flush=True)
+        print(f"| {name} | {params:.1f}M | {per_step:.2f} | {ms(t_step, 0.1):.2f}-{ms(t_step, 0.9):.2f} | "
+              f"{batch * seq * 1000 / per_step:.0f} | {ms(t_fwd):.2f} | {ms(t_bwd):.2f} | {ms(t_opt):.2f} | "
+              f"{len(t_step)} |", flush=True)
 
 
 if __name__ == "__main__":

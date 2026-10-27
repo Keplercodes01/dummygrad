@@ -1,6 +1,11 @@
 // Training-step benchmark: ModernTransformer (RMSNorm, RoPE, GQA, SwiGLU, tied embeddings) at a
 // few sizes, timed as forward / backward / optimizer, with host<->device traffic per step.
-// bench/bench_torch.py runs the same architecture in PyTorch for comparison.
+// bench/bench_torch.py runs the same architecture in PyTorch, timed the same way.
+//
+// Each configuration runs 10 warmup steps, then timed steps until it has at least 50 and at least
+// 2 seconds' worth, and reports the median step and its 10th-90th percentile spread. Small models
+// are paced by the host CPU, which on shared cloud machines varies from run to run, so a short
+// mean is not a reliable number there.
 //
 //   ./dg_bench                  all configurations
 //   ./dg_bench small            one configuration (tiny, small, medium)
@@ -8,9 +13,11 @@
 //   ./dg_bench --fp16           matmuls and attention on fp16 tensor cores (AutocastGuard + GradScaler)
 //   ./dg_bench --bf16           matmuls and attention on bf16 tensor cores (Ampere or newer)
 //   ./dg_bench --worker-threads run backward on the engine's worker pool (the GPU default is the calling thread)
+//   ./dg_bench --seconds 5      time each configuration for at least 5 seconds (default 2)
 
 #include "dummy_core.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <iostream>
@@ -36,6 +43,15 @@ static void sync(Device device) {
 #endif
 }
 
+// q-quantile of v (0 <= q <= 1), interpolating between neighbouring order statistics
+static double quantile(std::vector<double> v, double q) {
+    std::sort(v.begin(), v.end());
+    double pos = q * (double)(v.size() - 1);
+    size_t lo = (size_t)pos;
+    size_t hi = std::min(lo + 1, v.size() - 1);
+    return v[lo] + (v[hi] - v[lo]) * (pos - (double)lo);
+}
+
 static double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -43,10 +59,12 @@ static double now_ms() {
 int main(int argc, char** argv) {
     std::string only;
     bool profile = false;
+    double min_seconds = 2.0;
     DType compute = DType::Float32;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--profile") profile = true;
+        else if (arg == "--seconds" && i + 1 < argc) min_seconds = std::stod(argv[++i]);
         else if (arg == "--fp16") compute = DType::Float16;
         else if (arg == "--bf16") compute = DType::BFloat16;
         else if (arg == "--worker-threads") set_backward_execution(BackwardExecution::ThreadPool);
@@ -59,16 +77,18 @@ int main(int argc, char** argv) {
     int gpus = 0;
     if (cudaGetDeviceCount(&gpus) == cudaSuccess && gpus > 0) device = Device::CUDA;
 #endif
-    const int warmup = 3, steps = 10;
+    const int warmup = 10, min_steps = 50, max_steps = 5000;
     BackwardExecution mode = backward_execution();
     if (mode == BackwardExecution::Auto) {
         mode = device == Device::CPU ? BackwardExecution::ThreadPool : BackwardExecution::CallingThread;
     }
-    std::printf("dummygrad %s benchmark on %s, %s autocast, backward on %s (%d timed steps after %d warmup)\n\n",
-                DUMMYGRAD_VERSION, device == Device::CUDA ? "CUDA" : "CPU", compute_name,
-                mode == BackwardExecution::CallingThread ? "the calling thread" : "worker threads", steps, warmup);
-    std::printf("| config | params | ms/step | tokens/s | forward | backward | optimizer | copies/step | MB/step |\n");
-    std::printf("|---|---|---|---|---|---|---|---|---|\n");
+    std::printf("dummygrad %s benchmark on %s, %s autocast, backward on %s\n", DUMMYGRAD_VERSION,
+                device == Device::CUDA ? "CUDA" : "CPU", compute_name,
+                mode == BackwardExecution::CallingThread ? "the calling thread" : "worker threads");
+    std::printf("median of >= %d steps and >= %.0f s per config after %d warmup; p10-p90 is the spread of step times\n\n",
+                min_steps, min_seconds, warmup);
+    std::printf("| config | params | ms/step | p10-p90 | tokens/s | forward | backward | optimizer | steps | copies/step | MB/step |\n");
+    std::printf("|---|---|---|---|---|---|---|---|---|---|---|\n");
 
     for (const auto& c : kConfigs) {
         if (!only.empty() && only != c.name) continue;
@@ -98,10 +118,11 @@ int main(int argc, char** argv) {
             return fused_cross_entropy(model.forward(inputs), targets);
         };
 
-        double t_fwd = 0, t_bwd = 0, t_opt = 0;
-        TransferStats traffic;
-        for (int s = 0; s < warmup + steps; ++s) {
+        std::vector<double> t_fwd, t_bwd, t_opt, t_step;
+        double timed_ms = 0.0;
+        for (int s = 0; s < warmup + max_steps; ++s) {
             bool timed = s >= warmup;
+            if (timed && (int)t_step.size() >= min_steps && timed_ms >= min_seconds * 1000.0) break;
             if (s == warmup) reset_transfer_stats();
             optimizer.zero_grad(params);
             sync(device);
@@ -117,24 +138,28 @@ int main(int argc, char** argv) {
             sync(device);
             double t3 = now_ms();
             if (timed) {
-                t_fwd += t1 - t0;
-                t_bwd += t2 - t1;
-                t_opt += t3 - t2;
+                t_fwd.push_back(t1 - t0);
+                t_bwd.push_back(t2 - t1);
+                t_opt.push_back(t3 - t2);
+                t_step.push_back(t3 - t0);
+                timed_ms += t3 - t0;
             }
         }
-        traffic = transfer_stats();
-        double per_step = (t_fwd + t_bwd + t_opt) / steps;
+        TransferStats traffic = transfer_stats();
+        double steps = (double)t_step.size();
+        double per_step = quantile(t_step, 0.5);
         double copies = (double)(traffic.to_device_count + traffic.to_host_count) / steps;
         double mb = (double)(traffic.to_device_bytes + traffic.to_host_bytes) / steps / 1e6;
-        std::printf("| %s | %.1fM | %.1f | %.0f | %.1f | %.1f | %.1f | %.0f | %.1f |\n", c.name.c_str(),
-                    model.num_parameters() / 1e6, per_step, c.batch * c.seq_len * 1000.0 / per_step,
-                    t_fwd / steps, t_bwd / steps, t_opt / steps, copies, mb);
+        std::printf("| %s | %.1fM | %.2f | %.2f-%.2f | %.0f | %.2f | %.2f | %.2f | %d | %.0f | %.1f |\n", c.name.c_str(),
+                    model.num_parameters() / 1e6, per_step, quantile(t_step, 0.1), quantile(t_step, 0.9),
+                    c.batch * c.seq_len * 1000.0 / per_step, quantile(t_fwd, 0.5), quantile(t_bwd, 0.5),
+                    quantile(t_opt, 0.5), (int)t_step.size(), copies, mb);
         std::fflush(stdout);
 
         if (profile) {
             // Separate pass: profiling synchronizes at every op and serializes backward, which skews
             // the timings above
-            const int profiled_steps = 3;
+            const int profiled_steps = 10;
             reset_profile();
             set_profiling(true);
             for (int s = 0; s < profiled_steps; ++s) {
