@@ -16,11 +16,19 @@ namespace cuda {
     // cuBLAS matrix multiplication (batched, whole-operand broadcasting) on Float32 tensors.
     // compute is the GEMM input precision: Float32, or Float16/BFloat16 on tensor cores with fp32
     // accumulation (see AutocastGuard). Outputs and gradients are always Float32.
+    // saved_a / saved_b, when given, receive the operands the GEMM consumed (contiguous, already
+    // rounded to compute) so that matmul_backward needs neither a cast nor a densifying copy.
     std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b,
-                                   DType compute = DType::Float32);
-    void matmul_backward(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b,
+                                   DType compute = DType::Float32,
+                                   std::shared_ptr<Tensor>* saved_a = nullptr,
+                                   std::shared_ptr<Tensor>* saved_b = nullptr);
+    // Gradients of out = a @ b for inputs of shapes a_shape and b_shape. a and b are Float32 or
+    // compute-dtype operands (normally matmul's saved ones). grad_a needs only b and grad_b only a:
+    // a null grad_a / grad_b skips that GEMM, and the operand only it uses may then be null.
+    void matmul_backward(const std::vector<int64_t>& a_shape, const std::vector<int64_t>& b_shape,
+                         const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b,
                          const std::shared_ptr<Tensor>& grad_out,
-                         std::shared_ptr<Tensor>& grad_a, std::shared_ptr<Tensor>& grad_b,
+                         std::shared_ptr<Tensor>* grad_a, std::shared_ptr<Tensor>* grad_b,
                          DType compute = DType::Float32);
 
     // Rounds n device floats to Float16 or BFloat16 (nearest even) into out

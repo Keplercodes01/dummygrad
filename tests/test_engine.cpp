@@ -1307,14 +1307,16 @@ static bool cuda_has_bf16_tensor_cores() {
 }
 
 // fp16/bf16 matmuls against the fp32 result: forward and both gradients, for a plain, a batched,
-// a shared-weight (folded) and a broadcast-a (accumulated per batch) product
+// a shared-weight (folded), a broadcast-a (accumulated per batch) and a transposed-weight (tied LM
+// head: b is a strided view, densified before rounding) product
 static std::string amp_matmul_parity(DType compute) {
-    struct Shape { std::vector<int64_t> a, b; };
+    struct Shape { std::vector<int64_t> a, b; bool transpose_b = false; };  // b's shape before any transpose
     const Shape shapes[] = {
         {{48, 64}, {64, 40}},
         {{3, 32, 64}, {3, 64, 24}},
         {{4, 16, 64}, {64, 32}},
         {{16, 64}, {4, 64, 32}},
+        {{4, 16, 64}, {40, 64}, true},
     };
     for (const auto& s : shapes) {
         auto av = random_values(numel(s.a), -1, 1), bv = random_values(numel(s.b), -1, 1);
@@ -1323,7 +1325,7 @@ static std::string amp_matmul_parity(DType compute) {
             TensorPtr y;
             {
                 AutocastGuard autocast(dt);
-                y = matmul(a, b);
+                y = matmul(a, s.transpose_b ? transpose(b, 0, 1) : b);
             }
             if (y->dtype != DType::Float32) throw std::runtime_error("autocast matmul output is not Float32");
             // Backward runs outside the guard: it must use the dtype the forward ran with
@@ -1346,10 +1348,46 @@ static std::string amp_matmul_parity(DType compute) {
             if (worst == 0.0f) return std::string(what) + " is bit-identical to fp32: autocast had no effect";
             return "";
         };
-        std::string label = "a" + std::to_string(s.a.size()) + "d x b" + std::to_string(s.b.size()) + "d: ";
+        std::string label = "a" + std::to_string(s.a.size()) + "d x b" + std::to_string(s.b.size()) + "d" +
+                            (s.transpose_b ? " (transposed)" : "") + ": ";
         for (auto err : {compare(y32, y16, "output"), compare(ga32, ga16, "grad a"), compare(gb32, gb16, "grad b")}) {
             if (!err.empty()) return label + err;
         }
+    }
+    return "";
+}
+
+// A CUDA matmul with one frozen operand (a fixed input, or a frozen weight as in LoRA fine-tuning)
+// computes only the other gradient, which must be bit-identical to the one from the same product
+// with both operands trainable. Covers the plain, folded, per-batch and transposed-weight paths.
+static std::string matmul_frozen_operand_cuda(DType compute) {
+    struct Shape { std::vector<int64_t> a, b; bool transpose_b = false; };
+    const Shape shapes[] = {
+        {{48, 64}, {64, 40}},
+        {{4, 16, 64}, {64, 32}},
+        {{16, 64}, {4, 64, 32}},
+        {{4, 16, 64}, {40, 64}, true},
+    };
+    for (const auto& s : shapes) {
+        auto av = random_values(numel(s.a), -1, 1), bv = random_values(numel(s.b), -1, 1);
+        auto run = [&](bool train_a, bool train_b) {
+            auto a = upload(av, s.a, Device::CUDA, train_a), b = upload(bv, s.b, Device::CUDA, train_b);
+            {
+                AutocastGuard autocast(compute);
+                auto y = matmul(a, s.transpose_b ? transpose(b, 0, 1) : b);
+                scalar_sum(reshape(mul(y, y), {1, (int64_t)y->size()}))->backward();
+            }
+            return std::make_pair(a->grad, b->grad);
+        };
+        auto both = run(true, true);
+        auto only_a = run(true, false);
+        auto only_b = run(false, true);
+        std::string label = "a" + std::to_string(s.a.size()) + "d x b" + std::to_string(s.b.size()) + "d" +
+                            (s.transpose_b ? " (transposed)" : "") + ": ";
+        if (!only_a.first || only_a.second) return label + "frozen b: expected a gradient for a only";
+        if (!only_b.second || only_b.first) return label + "frozen a: expected a gradient for b only";
+        if (download(only_a.first) != download(both.first)) return label + "grad a changed when b was frozen";
+        if (download(only_b.second) != download(both.second)) return label + "grad b changed when a was frozen";
     }
     return "";
 }
@@ -1590,6 +1628,8 @@ int main() {
     run_case(r, "amp/grad_scaler", amp_grad_scaler);
 #ifdef USE_CUDA
     if (has_cuda) {
+        run_case(r, "amp/matmul_frozen_operand_fp32_cuda", [] { return matmul_frozen_operand_cuda(DType::Float32); });
+        run_case(r, "amp/matmul_frozen_operand_fp16_cuda", [] { return matmul_frozen_operand_cuda(DType::Float16); });
         run_case(r, "amp/matmul_parity_fp16_cuda", [] { return amp_matmul_parity(DType::Float16); });
         run_case(r, "amp/attention_parity_fp16_cuda", [] { return amp_attention_parity(DType::Float16); });
         if (cuda_has_bf16_tensor_cores()) {

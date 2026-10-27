@@ -2759,7 +2759,6 @@ inline std::shared_ptr<Tensor> im2col(const std::shared_ptr<Tensor>& x_in, int k
 struct MatmulBackward : public Node {
     std::shared_ptr<Tensor> a, b;
     int r1, c1, r2, c2, batch_size, n1, n2, nout, nout_batch;
-    DType compute = DType::Float32;  // CUDA GEMM precision the forward ran with (autocast)
     std::vector<int64_t> strides_a_broad, strides_b_broad, out_shape;
 
     MatmulBackward(std::shared_ptr<Tensor> a, std::shared_ptr<Tensor> b,
@@ -2785,7 +2784,7 @@ struct MatmulBackward : public Node {
 #ifdef USE_CUDA
         if (self_grad->device == Device::CUDA || a->device == Device::CUDA || b->device == Device::CUDA) {
             std::shared_ptr<Tensor> grad_a, grad_b;
-            cuda::matmul_backward(a, b, self_grad, grad_a, grad_b, compute);
+            cuda::matmul_backward(a->shape, b->shape, a, b, self_grad, &grad_a, &grad_b);
             return {grad_a, grad_b};
         }
 #endif
@@ -2999,6 +2998,45 @@ cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
     return out;
 }
 
+#ifdef USE_CUDA
+// Backward of a CUDA matmul. Holds the operands exactly as the forward GEMM consumed them
+// (contiguous, already rounded to the autocast dtype), so backward neither re-casts nor
+// re-densifies them, and only those it needs: B for dA, A for dB. Under fp16 autocast a saved
+// activation is a half-size copy, and the fp32 original can be freed once forward moves on.
+struct CudaMatmulBackward : public Node {
+    std::vector<int64_t> a_shape, b_shape;
+    std::shared_ptr<Tensor> a, b;  // saved GEMM operands; null when no gradient needs them
+    bool grad_a, grad_b;
+    DType compute;  // GEMM precision the forward ran with (autocast)
+
+    CudaMatmulBackward(std::vector<int64_t> a_shape, std::vector<int64_t> b_shape,
+                       std::shared_ptr<Tensor> a, std::shared_ptr<Tensor> b,
+                       bool grad_a, bool grad_b, DType compute)
+        : a_shape(std::move(a_shape)), b_shape(std::move(b_shape)), a(std::move(a)), b(std::move(b)),
+          grad_a(grad_a), grad_b(grad_b), compute(compute) {}
+
+    // Same label as the CPU node, so profiles stay comparable across devices and releases
+    std::string name() const override { return "MatmulBackward"; }
+
+    void release_variables() override {
+        a = nullptr;
+        b = nullptr;
+    }
+
+    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0]) return {nullptr, nullptr};
+        if ((grad_a && !b) || (grad_b && !a)) {
+            throw std::runtime_error("MatmulBackward: saved operands were released; pass retain_graph=true "
+                                     "to call backward through this graph more than once");
+        }
+        std::shared_ptr<Tensor> da, db;
+        cuda::matmul_backward(a_shape, b_shape, a, b, grads[0], grad_a ? &da : nullptr, grad_b ? &db : nullptr,
+                              compute);
+        return {da, db};
+    }
+};
+#endif
+
 inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
     if (a->device != b->device) {
         throw std::runtime_error("matmul: devices mismatch between tensor a and tensor b");
@@ -3006,36 +3044,14 @@ inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const st
 #ifdef USE_CUDA
     if (a->device == Device::CUDA || b->device == Device::CUDA) {
         DType compute = autocast_dtype();
-        auto out = cuda::matmul(a, b, compute);
-        out->requires_grad = needs_grad(a) || needs_grad(b);
-        if (needs_grad(a) || needs_grad(b)) {
-            int n1 = a->ndim();
-            int n2 = b->ndim();
-            int r1 = a->shape[n1 - 2];
-            int c1 = a->shape[n1 - 1];
-            int r2 = b->shape[n2 - 2];
-            int c2 = b->shape[n2 - 1];
-            int b1 = n1 - 2;
-            int b2 = n2 - 2;
-            int nout_batch = std::max(b1, b2);
-            int batch_size = 1;
-            for (int i = 0; i < nout_batch; i++) batch_size *= out->shape[i];
-            int nout = out->ndim();
-            std::vector<int64_t> strides_a_broad(nout_batch, 0);
-            std::vector<int64_t> strides_b_broad(nout_batch, 0);
-            for (int i = 0; i < nout_batch; ++i) {
-                int idx_a = i - (nout_batch - b1);
-                int idx_b = i - (nout_batch - b2);
-                int dim_a = (idx_a >= 0) ? a->shape[idx_a] : 1;
-                int dim_b = (idx_b >= 0) ? b->shape[idx_b] : 1;
-                strides_a_broad[i] = (idx_a >= 0 && dim_a != 1) ? a->strides[idx_a] : 0;
-                strides_b_broad[i] = (idx_b >= 0 && dim_b != 1) ? b->strides[idx_b] : 0;
-            }
-            auto grad_fn = std::make_shared<MatmulBackward>(
-                a, b, r1, c1, r2, c2, batch_size, n1, n2, nout, nout_batch,
-                strides_a_broad, strides_b_broad, out->shape
-            );
-            grad_fn->compute = compute;
+        bool grad_a = needs_grad(a), grad_b = needs_grad(b);
+        // dA = dC B^T needs only B and dB = A^T dC only A: keep just the operands backward will use
+        std::shared_ptr<Tensor> saved_a, saved_b;
+        auto out = cuda::matmul(a, b, compute, grad_b ? &saved_a : nullptr, grad_a ? &saved_b : nullptr);
+        out->requires_grad = grad_a || grad_b;
+        if (grad_a || grad_b) {
+            auto grad_fn = std::make_shared<CudaMatmulBackward>(a->shape, b->shape, std::move(saved_a),
+                                                                std::move(saved_b), grad_a, grad_b, compute);
             grad_fn->add_next_edge(get_grad_edge(a).function);
             grad_fn->add_next_edge(get_grad_edge(b).function);
             out->grad_fn = grad_fn;
