@@ -2,6 +2,17 @@
 
 All notable changes to dummygrad are documented here. Versions follow [Semantic Versioning](https://semver.org/); while the major version is 0, minor releases may change behavior.
 
+## [Unreleased]
+
+### Changed
+- **CUDA matmul backward reuses the forward's operands.** The backward node keeps the forward GEMM's inputs (contiguous, already rounded to fp16/bf16 under autocast), so backward no longer re-casts or re-densifies A and B; only dC is rounded, once for both products. Under fp16 autocast a saved activation is a half-size copy, and its fp32 original can be freed as soon as nothing else holds it. In fp32, a transposed operand (the tied LM head) is kept as the dense copy the forward already made, instead of being copied again in backward.
+- **Frozen matmul operands skip their gradient.** When only one input of a CUDA matmul requires grad (a fixed input, a frozen weight in LoRA-style fine-tuning), backward runs only that input's GEMM and keeps only the operand it needs. Previously both gradients were computed and the unused one discarded.
+- `cuda::matmul` can return its GEMM operands (`saved_a` / `saved_b`), and `cuda::matmul_backward` takes the input shapes plus optional gradient outputs, so either GEMM can be skipped. CUDA matmuls record a dedicated backward node; it still reports as `MatmulBackward` in profiles.
+- Backward through a CUDA matmul whose saved operands were already released now throws (pass `retain_graph=true` to run backward twice) instead of silently producing no gradients.
+
+### Added
+- Tests: fp16/bf16 matmul parity for a transposed weight; a frozen operand yields only the other gradient, bit-identical to the fully trainable product (fp32 and fp16).
+
 ## [0.6.0] - 2026-10-27
 
 Mixed-precision training: matmuls and attention on fp16/bf16 tensor cores. On a T4 (Kaggle), fp16 cuts the medium ModernTransformer step (23M parameters) from 107.6 to 57.2 ms; `MatmulBackward` goes from 48.3 to 16.7 ms and attention backward from 6.9 to 4.5 ms.

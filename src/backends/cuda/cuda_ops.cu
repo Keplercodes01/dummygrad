@@ -919,7 +919,8 @@ static void check_matmul_inputs(const Tensor& a, const Tensor& b, const char* wh
     }
 }
 
-std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& _a, const std::shared_ptr<Tensor>& _b, DType compute) {
+std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& _a, const std::shared_ptr<Tensor>& _b, DType compute,
+                               std::shared_ptr<Tensor>* saved_a, std::shared_ptr<Tensor>* saved_b) {
     check_matmul_inputs(*_a, *_b, "cuda::matmul");
     check_compute_dtype(compute, "cuda::matmul");
     auto a = make_contiguous(_a);
@@ -964,36 +965,58 @@ std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& _a, const std::sha
     gemm(CUBLAS_OP_N, CUBLAS_OP_N, c2, r1, c1,
          bh->data_ptr<void>(), c2, stride_b, ah->data_ptr<void>(), c1, stride_a,
          0.0f, out->data_ptr<float>(), c2, stride_c, batch_size, compute);
+    if (saved_a) *saved_a = std::move(ah);
+    if (saved_b) *saved_b = std::move(bh);
     return out;
 }
 
-void matmul_backward(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b,
+// A backward GEMM operand: contiguous and of the compute dtype. matmul's saved operands already
+// are, so they pass through untouched; plain fp32 tensors are densified and rounded here.
+static std::shared_ptr<Tensor> backward_operand(const std::shared_ptr<Tensor>& t, DType compute) {
+    if (!t) return nullptr;
+    if (t->dtype != DType::Float32 && t->dtype != compute) {
+        throw std::runtime_error("cuda::matmul_backward: operands must be Float32 or the compute dtype");
+    }
+    auto c = make_contiguous(t);
+    return c->dtype == compute ? c : gemm_operand(c, compute);
+}
+
+static int64_t shape_numel(const std::vector<int64_t>& shape) {
+    int64_t n = 1;
+    for (int64_t d : shape) n *= d;
+    return n;
+}
+
+void matmul_backward(const std::vector<int64_t>& a_shape, const std::vector<int64_t>& b_shape,
+                     const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b,
                      const std::shared_ptr<Tensor>& grad_out,
-                     std::shared_ptr<Tensor>& grad_a, std::shared_ptr<Tensor>& grad_b, DType compute) {
-    if (!grad_out) return;
-    check_matmul_inputs(*a, *b, "cuda::matmul_backward");
+                     std::shared_ptr<Tensor>* grad_a, std::shared_ptr<Tensor>* grad_b, DType compute) {
+    if (!grad_out || (!grad_a && !grad_b)) return;
     check_compute_dtype(compute, "cuda::matmul_backward");
     if (grad_out->dtype != DType::Float32) throw std::runtime_error("cuda::matmul_backward: gradient must be Float32");
-    auto a_c = make_contiguous(a);
-    auto b_c = make_contiguous(b);
-    auto g_c = make_contiguous(grad_out);
+    if ((grad_a && !b) || (grad_b && !a)) {
+        throw std::runtime_error("cuda::matmul_backward: grad_a needs operand b and grad_b needs operand a");
+    }
+    if (a_shape.size() < 2 || b_shape.size() < 2) throw std::runtime_error("cuda::matmul_backward: operands must be at least 2-D");
 
-    int n1 = a_c->ndim();
-    int n2 = b_c->ndim();
-    int r1 = a_c->shape[n1 - 2];
-    int c1 = a_c->shape[n1 - 1];
-    int r2 = b_c->shape[n2 - 2];
-    int c2 = b_c->shape[n2 - 1];
+    int r1 = a_shape[a_shape.size() - 2];
+    int c1 = a_shape[a_shape.size() - 1];
+    int r2 = b_shape[b_shape.size() - 2];
+    int c2 = b_shape[b_shape.size() - 1];
 
-    int batch_size_a = a_c->size() / (r1 * c1);
-    int batch_size_b = b_c->size() / (r2 * c2);
+    int batch_size_a = shape_numel(a_shape) / ((int64_t)r1 * c1);
+    int batch_size_b = shape_numel(b_shape) / ((int64_t)r2 * c2);
     int batch_size = std::max(batch_size_a, batch_size_b);
     if (batch_size_a != batch_size_b && batch_size_a != 1 && batch_size_b != 1)
         throw std::runtime_error("cuda::matmul_backward: partial batch broadcasting is not supported");
+    if ((a && a->size() != shape_numel(a_shape)) || (b && b->size() != shape_numel(b_shape)) ||
+        grad_out->size() != (int64_t)batch_size * r1 * c2) {
+        throw std::runtime_error("cuda::matmul_backward: operand sizes do not match the given shapes");
+    }
 
     // No zero fill: every GEMM below writes its output with beta = 0 before anything accumulates
-    grad_a = std::make_shared<Tensor>(a_c->shape, Device::CUDA, DType::Float32, false);
-    grad_b = std::make_shared<Tensor>(b_c->shape, Device::CUDA, DType::Float32, false);
+    if (grad_a) *grad_a = std::make_shared<Tensor>(a_shape, Device::CUDA, DType::Float32, false);
+    if (grad_b) *grad_b = std::make_shared<Tensor>(b_shape, Device::CUDA, DType::Float32, false);
 
     // Shared weight: dA = dC @ B^T is one GEMM over [batch * r1] rows, and dB = A^T @ dC sums over
     // the batch inside a single GEMM whose inner dimension spans every row
@@ -1007,21 +1030,22 @@ void matmul_backward(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Ten
     long long int stride_b = (batch_size_b > 1) ? (long long)r2 * c2 : 0;
     long long int stride_g = (long long)r1 * c2;
 
-    auto ah = gemm_operand(a_c, compute);
-    auto bh = gemm_operand(b_c, compute);
-    auto gh = gemm_operand(g_c, compute);
-    const char* A = ah->data_ptr<char>();
-    const char* B = bh->data_ptr<char>();
+    // Each operand is rounded at most once: a saved one not at all, dC once for both products
+    auto ah = grad_b ? backward_operand(a, compute) : nullptr;
+    auto bh = grad_a ? backward_operand(b, compute) : nullptr;
+    auto gh = backward_operand(grad_out, compute);
+    const char* A = ah ? ah->data_ptr<char>() : nullptr;
+    const char* B = bh ? bh->data_ptr<char>() : nullptr;
     const char* G = gh->data_ptr<char>();
-    float* dA = grad_a->data_ptr<float>();
-    float* dB = grad_b->data_ptr<float>();
+    float* dA = grad_a ? (*grad_a)->data_ptr<float>() : nullptr;
+    float* dB = grad_b ? (*grad_b)->data_ptr<float>() : nullptr;
 
     if (batch_size_a == batch_size_b) {
         // dA = dC B^T, dB = A^T dC
-        gemm(CUBLAS_OP_T, CUBLAS_OP_N, c1, r1, c2, B, c2, stride_b, G, c2, stride_g,
-             0.0f, dA, c1, stride_a, batch_size, compute);
-        gemm(CUBLAS_OP_N, CUBLAS_OP_T, c2, c1, r1, G, c2, stride_g, A, c1, stride_a,
-             0.0f, dB, c2, stride_b, batch_size, compute);
+        if (dA) gemm(CUBLAS_OP_T, CUBLAS_OP_N, c1, r1, c2, B, c2, stride_b, G, c2, stride_g,
+                     0.0f, dA, c1, stride_a, batch_size, compute);
+        if (dB) gemm(CUBLAS_OP_N, CUBLAS_OP_T, c2, c1, r1, G, c2, stride_g, A, c1, stride_a,
+                     0.0f, dB, c2, stride_b, batch_size, compute);
         return;
     }
 
@@ -1034,10 +1058,10 @@ void matmul_backward(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Ten
         int64_t off_a = batch_size_a > 1 ? (int64_t)batch * r1 * c1 : 0;
         int64_t off_b = batch_size_b > 1 ? (int64_t)batch * r2 * c2 : 0;
         int64_t off_g = (int64_t)batch * r1 * c2;
-        gemm(CUBLAS_OP_T, CUBLAS_OP_N, c1, r1, c2, B + off_b * elem, c2, 0, G + off_g * elem, c2, 0,
-             beta_a, dA + off_a, c1, 0, 1, compute);
-        gemm(CUBLAS_OP_N, CUBLAS_OP_T, c2, c1, r1, G + off_g * elem, c2, 0, A + off_a * elem, c1, 0,
-             beta_b, dB + off_b, c2, 0, 1, compute);
+        if (dA) gemm(CUBLAS_OP_T, CUBLAS_OP_N, c1, r1, c2, B + off_b * elem, c2, 0, G + off_g * elem, c2, 0,
+                     beta_a, dA + off_a, c1, 0, 1, compute);
+        if (dB) gemm(CUBLAS_OP_N, CUBLAS_OP_T, c2, c1, r1, G + off_g * elem, c2, 0, A + off_a * elem, c1, 0,
+                     beta_b, dB + off_b, c2, 0, 1, compute);
     }
 }
 
