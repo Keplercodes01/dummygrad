@@ -14,7 +14,7 @@ static std::atomic<bool> g_detect_anomaly{false};
 void set_detect_anomaly(bool enabled) { g_detect_anomaly = enabled; }
 bool detect_anomaly_enabled() { return g_detect_anomaly; }
 
-static std::atomic<BackwardExecution> g_backward_execution{BackwardExecution::ThreadPool};
+static std::atomic<BackwardExecution> g_backward_execution{BackwardExecution::Auto};
 
 void set_backward_execution(BackwardExecution mode) { g_backward_execution = mode; }
 BackwardExecution backward_execution() { return g_backward_execution; }
@@ -206,7 +206,11 @@ void AutogradEngine::execute(std::shared_ptr<Node> root, const std::vector<int64
         }
     };
 
-    if (g_backward_execution == BackwardExecution::CallingThread) {
+    BackwardExecution mode = g_backward_execution;
+    if (mode == BackwardExecution::Auto) {
+        mode = device == Device::CPU ? BackwardExecution::ThreadPool : BackwardExecution::CallingThread;
+    }
+    if (mode == BackwardExecution::CallingThread) {
         // Newest node first, as PyTorch does: every node is created after the nodes it feeds
         // gradients to, so this follows the forward pass in reverse and frees saved tensors early.
         // An exception from a node propagates straight out; nothing else is in flight.

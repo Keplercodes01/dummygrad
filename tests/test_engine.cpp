@@ -1034,7 +1034,7 @@ static std::string workflow_deterministic_backward_cuda_gpt() {
 // engine usable
 static std::string engine_calling_thread(Device dev) {
     struct RestoreMode {
-        ~RestoreMode() { set_backward_execution(BackwardExecution::ThreadPool); }
+        ~RestoreMode() { set_backward_execution(BackwardExecution::Auto); }
     } restore;
     manual_seed(3);
     ModernTransformer model(16, 8, 16, 2, 2, 1);
@@ -1049,6 +1049,8 @@ static std::string engine_calling_thread(Device dev) {
     auto pool = run();
     set_backward_execution(BackwardExecution::CallingThread);
     if (run() != pool) return "gradients differ between the worker pool and the calling thread";
+    set_backward_execution(BackwardExecution::Auto);
+    if (run() != pool) return "gradients differ between the worker pool and the automatic choice";
 
     auto x = upload({1, 2, 3, 4}, {2, 2}, Device::CPU, true);
     auto bad = std::make_shared<ThrowingNode>();

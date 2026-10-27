@@ -4,9 +4,19 @@ All notable changes to dummygrad are documented here. Versions follow [Semantic 
 
 ## [Unreleased]
 
+Fused Linear and single-threaded GPU backward. On a T4 (Kaggle), fp16:
+
+| config | v0.6.1 | now | PyTorch 2.11 fp16 |
+|---|---|---|---|
+| tiny (0.4M params) | 4.0 ms | 1.7 ms | 10.8 ms |
+| small (3.9M) | 18.8 ms | 14.4 ms | 21.9 ms |
+| medium (23.1M) | 55.5 ms | 50.5 ms | 50.7 ms |
+
+The v0.6.1 column is from an earlier session; Kaggle sessions differ by a few percent (PyTorch measured 52.0 ms then). The medium profile shows where it came from: the forward op total went from 21.6 to 18.2 ms and the backward from 30.2 to 27.5 ms.
+
 ### Added
 - **Fused Linear on CUDA.** `linear(x, w, b)` adds the bias inside the GEMM (cuBLASLt epilogue) instead of with a separate kernel that reads and writes the whole output again, and one `LinearBackward` node returns dx, dw and db. `Linear` uses it, so every Linear in a model gets it. On other devices `linear` is `matmul` followed by `add`. If cuBLASLt cannot fuse a case (no algorithm for the shape, or an unaligned offset view), the bias is added by a separate kernel; `cuda::linear_unfused_count()` counts those calls.
-- **`set_backward_execution(BackwardExecution::CallingThread)`** runs backward on the thread that called it, newest node first, instead of on the engine's worker pool. On a GPU every kernel goes to one stream, so the worker threads only add hand-off latency there. Gradients are bit-identical in both modes. The default is still the worker pool; `dg_bench --calling-thread` measures the difference.
+- **Backward runs on the calling thread for GPU losses.** On a GPU every kernel goes to one stream, so the engine's worker pool only added thread hand-offs. Backward now runs on the thread that called it, newest node first, whenever the loss is on a GPU. On a T4 (fp16) that made the tiny step 2.1x faster (3.6 → 1.7 ms) and small 20% faster (17.9 → 14.4 ms); medium, which is GPU-bound, is unchanged. CPU graphs keep the worker pool. `set_backward_execution(BackwardExecution::ThreadPool / CallingThread / Auto)` overrides the choice; gradients are bit-identical in every mode. `dg_bench --worker-threads` measures the pool.
 - **Forward profiling.** `set_profiling(true)` now times forward ops as well as backward nodes. Forward entries are named after the op (`matmul`, `rms_norm`, `add`, `attention`, `autocast_cast` for fp16/bf16 conversions) and count self time: an op that calls other ops counts only its own work. Ops a backward node runs internally stay part of that node's time. `dg_bench --profile` prints a forward table next to the backward one, each with its total.
 - `DG_PROFILE_OP("name")` gives your own ops a forward entry (`examples/custom_op.cpp` shows it).
 - `ProfileEntry::phase` and `profile_report(ProfilePhase)` select one phase.
