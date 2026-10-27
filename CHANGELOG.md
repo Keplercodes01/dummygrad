@@ -2,11 +2,11 @@
 
 All notable changes to dummygrad are documented here. Versions follow [Semantic Versioning](https://semver.org/); while the major version is 0, minor releases may change behavior.
 
-## [Unreleased]
+## [0.7.0] - 2026-10-27
 
 Fused Linear and single-threaded GPU backward. On a T4 (Kaggle), fp16:
 
-| config | v0.6.1 | now | PyTorch 2.11 fp16 |
+| config | v0.6.1 | v0.7.0 | PyTorch 2.11 fp16 |
 |---|---|---|---|
 | tiny (0.4M params) | 4.0 ms | 1.7 ms | 10.8 ms |
 | small (3.9M) | 18.8 ms | 14.4 ms | 21.9 ms |
