@@ -1,6 +1,7 @@
 #pragma once
 #include "tensor.h"
 #include "autocast.h"
+#include "profiler.h"
 #include "functional.h"
 #include "ops.h"
 #include <cmath>
@@ -52,6 +53,7 @@ inline bool needs_grad(const std::shared_ptr<Tensor>& t) {
 // itself when it is already contiguous, so the common case costs nothing.
 inline std::shared_ptr<Tensor> contiguous(const std::shared_ptr<Tensor>& a) {
     if (!a || a->is_contiguous()) return a;
+    DG_PROFILE_OP("contiguous");
     auto out = make_contiguous(a);
     out->requires_grad = needs_grad(a);
     if (needs_grad(a)) {
@@ -99,6 +101,7 @@ struct ReluBackward : public Node {
 
 // relu
 inline std::shared_ptr<Tensor> relu(const std::shared_ptr<Tensor>& a_in) {
+    DG_PROFILE_OP("relu");
     auto a = contiguous(a_in);
     bool req_grad = grad_enabled() && (a->requires_grad);
     auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
@@ -169,6 +172,7 @@ struct TanhBackward : public Node {
 
 // tanh
 inline std::shared_ptr<Tensor> tanh(const std::shared_ptr<Tensor>& a_in) {
+    DG_PROFILE_OP("tanh");
     auto a = contiguous(a_in);
     bool req_grad = grad_enabled() && (a->requires_grad);
 #ifdef USE_CUDA
@@ -249,6 +253,7 @@ struct GeluBackward : public Node {
 
 // gelu
 inline std::shared_ptr<Tensor> gelu(const std::shared_ptr<Tensor>& a_in) {
+    DG_PROFILE_OP("gelu");
     auto a = contiguous(a_in);
     const float sqrt_2_over_pi = 0.7978845608f;
     const float coeff = 0.044715f;
@@ -325,6 +330,7 @@ struct SigmoidBackward : public Node {
 
 // sigmoid
 inline std::shared_ptr<Tensor> sigmoid(const std::shared_ptr<Tensor>& a_in) {
+    DG_PROFILE_OP("sigmoid");
     auto a = contiguous(a_in);
     bool req_grad = grad_enabled() && (a->requires_grad);
     auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
@@ -414,6 +420,7 @@ struct SiluBackward : public Node {
 
 // silu (Swish)
 inline std::shared_ptr<Tensor> silu(const std::shared_ptr<Tensor>& a_in) {
+    DG_PROFILE_OP("silu");
     auto a = contiguous(a_in);
     bool req_grad = grad_enabled() && (a->requires_grad);
     auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
@@ -508,6 +515,7 @@ struct LeakyReluBackward : public Node {
 
 // leaky_relu
 inline std::shared_ptr<Tensor> leaky_relu(const std::shared_ptr<Tensor>& a_in, float negative_slope = 0.01f) {
+    DG_PROFILE_OP("leaky_relu");
     auto a = contiguous(a_in);
     bool req_grad = grad_enabled() && (a->requires_grad);
     auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
@@ -602,6 +610,7 @@ struct BroadcastBackward : public Node {
 
 // broadcast
 inline std::shared_ptr<Tensor> broadcast(const std::shared_ptr<Tensor>& a_in, int axis, int n) {
+    DG_PROFILE_OP("broadcast");
     auto a = contiguous(a_in);
     int ndim = a->shape.size();
     if (ndim < 2) {
@@ -862,6 +871,7 @@ struct BroadcastBinaryBackward : public Node {
 
 inline std::shared_ptr<Tensor> broadcast_binary(BinaryOp op, const std::shared_ptr<Tensor>& x_in,
                                                 const std::shared_ptr<Tensor>& y_in) {
+    DG_PROFILE_OP(binary_op_name(op));
     if (!x_in || !y_in) throw std::invalid_argument(std::string(binary_op_name(op)) + ": null tensor");
     if (x_in->device != y_in->device) throw std::invalid_argument(std::string(binary_op_name(op)) + ": tensors are on different devices");
     if (x_in->dtype != DType::Float32 || y_in->dtype != DType::Float32) {
@@ -984,6 +994,7 @@ struct ConcatBackward : public Node {
 // concatenation
 inline std::shared_ptr<Tensor> concat(const std::shared_ptr<Tensor>& a_in,
                                        const std::shared_ptr<Tensor>& b_in, int axis) {
+    DG_PROFILE_OP("concat");
     auto a = contiguous(a_in);
     auto b = contiguous(b_in);
     if (!a || !b) {
@@ -1115,6 +1126,7 @@ struct CrossEntropyBackward : public Node {
 
 // cross_entropy
 inline std::shared_ptr<Tensor> cross_entropy(const std::shared_ptr<Tensor>& pred_in, const std::shared_ptr<Tensor>& target_in) {
+    DG_PROFILE_OP("cross_entropy");
     auto pred = contiguous(pred_in);
     auto target = contiguous(target_in);
     if (pred->shape != target->shape) {
@@ -1207,6 +1219,7 @@ struct FusedCrossEntropyBackward : public Node {
 
 inline std::shared_ptr<Tensor> fused_cross_entropy(const std::shared_ptr<Tensor>& logits_in,
                                                    const std::shared_ptr<Tensor>& targets_in, int ignore_index = -100) {
+    DG_PROFILE_OP("fused_cross_entropy");
     auto logits = contiguous(logits_in);
     if (logits->ndim() < 1) throw std::invalid_argument("fused_cross_entropy: logits must have a class dimension");
     int64_t vocab = logits->shape.back();
@@ -1318,6 +1331,7 @@ struct MseBackward : public Node {
 
 // mse
 inline std::shared_ptr<Tensor> mse(const std::shared_ptr<Tensor>& pred_in, const std::shared_ptr<Tensor>& target_in) {
+    DG_PROFILE_OP("mse");
     auto pred = contiguous(pred_in);
     auto target = contiguous(target_in);
     if (pred->shape != target->shape) {
@@ -1412,6 +1426,7 @@ struct L1LossBackward : public Node {
 
 // l1_loss (MAE - Mean Absolute Error)
 inline std::shared_ptr<Tensor> l1_loss(const std::shared_ptr<Tensor>& pred_in, const std::shared_ptr<Tensor>& target_in) {
+    DG_PROFILE_OP("l1_loss");
     auto pred = contiguous(pred_in);
     auto target = contiguous(target_in);
     if (pred->shape != target->shape) {
@@ -1507,6 +1522,7 @@ struct BoolMaskBackward : public Node {
 
 // boolean mask
 inline std::shared_ptr<Tensor> bool_mask(const std::shared_ptr<Tensor>& a_in, const std::shared_ptr<Tensor>& m_in) {
+    DG_PROFILE_OP("bool_mask");
     auto a = contiguous(a_in);
     auto m = contiguous(m_in);
     int ndim = a->shape.size();
@@ -1592,6 +1608,7 @@ struct CausalMaskBackward : public Node {
 
 // causal mask
 inline std::shared_ptr<Tensor> causal_mask(const std::shared_ptr<Tensor>& a_in) {
+    DG_PROFILE_OP("causal_mask");
     auto a = contiguous(a_in);
     int ndim = a->shape.size();
     if (ndim < 2) throw std::invalid_argument("causal_mask requires tensor with ndim >= 2");
@@ -1715,6 +1732,7 @@ struct MeanBackward : public Node {
 };
 
 inline std::shared_ptr<Tensor> mean(const std::shared_ptr<Tensor>& a_in, int axis) {
+    DG_PROFILE_OP("mean");
     auto a = contiguous(a_in);
     int ndim = a->ndim();
     if (ndim < 2) throw std::invalid_argument("mean requires tensor with ndim >= 2");
@@ -1852,6 +1870,8 @@ struct ScalarOpBackward : public Node {
 };
 
 inline std::shared_ptr<Tensor> scalar_op(ScalarOp op, const std::shared_ptr<Tensor>& a_in, float s) {
+    static const char* names[] = {"add_scalar", "sub_scalar", "mul_scalar", "div_scalar", "rsub_scalar", "rdiv_scalar"};
+    DG_PROFILE_OP(names[(int)op]);
     auto a = contiguous(a_in);
     if (a->dtype != DType::Float32) throw std::invalid_argument("scalar ops: only Float32 is supported");
     Device dev = a->device;
@@ -1936,6 +1956,7 @@ struct SliceBackward : public Node {
 
 // O(1) Tensor Slicing (Memory Sharing)
 inline std::shared_ptr<Tensor> slice(const std::shared_ptr<Tensor>& x, int dim, int start, int end) {
+    DG_PROFILE_OP("slice");
     if (dim < 0 || dim >= x->ndim()) throw std::runtime_error("slice: dim out of bounds");
     if (start < 0) start += x->shape[dim];
     if (end < 0) end += x->shape[dim];
@@ -2015,6 +2036,7 @@ struct SoftmaxBackward : public Node {
 };
 
 inline std::shared_ptr<Tensor> softmax(const std::shared_ptr<Tensor>& a_in, int axis = -1) {
+    DG_PROFILE_OP("softmax");
     auto a = contiguous(a_in);
     int ndim = a->shape.size();
     if (ndim < 1) throw std::runtime_error("softmax: tensor must be at least 1D");
@@ -2161,6 +2183,7 @@ struct StdDevBackward : public Node {
 
 // standard deviation
 inline std::shared_ptr<Tensor> std_dev(const std::shared_ptr<Tensor>& a_in, int axis) {
+    DG_PROFILE_OP("std_dev");
     auto a = contiguous(a_in);
     int ndim = a->shape.size();
     if (ndim < 2) throw std::runtime_error("std_dev: tensor must be at least 2D");
@@ -2292,6 +2315,7 @@ struct SumBackward : public Node {
 
 // sum
 inline std::shared_ptr<Tensor> sum(const std::shared_ptr<Tensor>& a_in, int axis) {
+    DG_PROFILE_OP("sum");
     auto a = contiguous(a_in);
     int ndim = a->shape.size();
     if (ndim < 2) throw std::runtime_error("sum: tensor must be at least 2D");
@@ -2382,6 +2406,7 @@ struct TransposeBackward : public Node {
 
 // Functional transpose with autograd support
 inline std::shared_ptr<Tensor> transpose(const std::shared_ptr<Tensor>& a, int dim0, int dim1) {
+    DG_PROFILE_OP("transpose");
     int n = a->ndim();
     if (n < 2) {
         throw std::runtime_error("transpose: tensor must be at least 2D");
@@ -2477,6 +2502,7 @@ struct VarBackward : public Node {
 
 // variance
 inline std::shared_ptr<Tensor> var(const std::shared_ptr<Tensor>& a_in, int axis) {
+    DG_PROFILE_OP("var");
     auto a = contiguous(a_in);
     int ndim = a->shape.size();
     if (ndim < 2) throw std::runtime_error("var: tensor must be at least 2D");
@@ -2571,6 +2597,7 @@ struct ViewBackward : public Node {
 
 // Fast zero-copy functional view (throws error if non-contiguous)
 inline std::shared_ptr<Tensor> view(const std::shared_ptr<Tensor>& a, const std::vector<int64_t>& new_shape) {
+    DG_PROFILE_OP("view");
     auto out = a->_view(new_shape);
     out->requires_grad = needs_grad(a);
 
@@ -2585,6 +2612,7 @@ inline std::shared_ptr<Tensor> view(const std::shared_ptr<Tensor>& a, const std:
 
 // General functional reshape (handles any layout)
 inline std::shared_ptr<Tensor> reshape(const std::shared_ptr<Tensor>& a, const std::vector<int64_t>& new_shape) {
+    DG_PROFILE_OP("reshape");
     auto out = a->_reshape(new_shape);
     out->requires_grad = needs_grad(a);
 
@@ -2705,6 +2733,7 @@ struct Im2ColBackward : public Node {
 };
 
 inline std::shared_ptr<Tensor> im2col(const std::shared_ptr<Tensor>& x_in, int kH, int kW, int padH, int padW, int strideH, int strideW) {
+    DG_PROFILE_OP("im2col");
     auto x = contiguous(x_in);
     if (x->ndim() != 4) throw std::runtime_error("im2col requires 4D tensor (B, C, H, W)");
 
@@ -3038,6 +3067,7 @@ struct CudaMatmulBackward : public Node {
 #endif
 
 inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
+    DG_PROFILE_OP("matmul");
     if (a->device != b->device) {
         throw std::runtime_error("matmul: devices mismatch between tensor a and tensor b");
     }

@@ -27,6 +27,7 @@ set(DUMMYGRAD_SOURCES
     src/autograd/autograd.cpp
     src/core/tensor.cpp
     src/core/allocator.cpp
+    src/core/profiler.cpp
     src/ops/ops.cpp
     src/backends/cpu/cpu_ops.cpp
     src/backends/tpu/pjrt_client.cpp

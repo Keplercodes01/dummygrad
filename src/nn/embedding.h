@@ -78,6 +78,7 @@ public:
     }
 
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& indices_in) {
+        DG_PROFILE_OP("embedding");
         if (!indices_in) throw std::runtime_error("Embedding: indices tensor is null");
         Device dev = weight->device;
         auto indices = contiguous(indices_in->device == dev ? indices_in : indices_in->to(dev));

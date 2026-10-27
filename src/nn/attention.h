@@ -75,6 +75,7 @@ public:
         std::shared_ptr<Tensor> out;
 #ifdef USE_CUDA
         if (x->device == Device::CUDA && !mask) {
+            DG_PROFILE_OP("attention");
             auto Q_4d = make_contiguous(reshape(Q, {B, 1, S, d_k}));
             auto K_4d = make_contiguous(reshape(K, {B, 1, S, d_k}));
             auto V_4d = make_contiguous(reshape(V, {B, 1, S, d_k}));
@@ -162,6 +163,7 @@ struct RepeatKVBackward : public Node {
 };
 
 inline std::shared_ptr<Tensor> repeat_kv(const std::shared_ptr<Tensor>& x_in, int64_t group) {
+    DG_PROFILE_OP("repeat_kv");
     if (group == 1) return x_in;
     auto x = contiguous(x_in);
     if (x->ndim() != 4) throw std::invalid_argument("repeat_kv: expected [batch, kv_heads, seq, head_dim]");
@@ -269,6 +271,7 @@ public:
         std::shared_ptr<Tensor> attn_out;
 #ifdef USE_CUDA
         if (x->device == Device::CUDA && !mask) {
+            DG_PROFILE_OP("attention");
             auto Q_c = make_contiguous(Q_split);
             auto K_c = make_contiguous(K_split);
             auto V_c = make_contiguous(V_split);

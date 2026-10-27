@@ -2,6 +2,17 @@
 
 All notable changes to dummygrad are documented here. Versions follow [Semantic Versioning](https://semver.org/); while the major version is 0, minor releases may change behavior.
 
+## [Unreleased]
+
+### Added
+- **Forward profiling.** `set_profiling(true)` now times forward ops as well as backward nodes. Forward entries are named after the op (`matmul`, `rms_norm`, `add`, `attention`, `autocast_cast` for fp16/bf16 conversions) and count self time: an op that calls other ops counts only its own work. Ops a backward node runs internally stay part of that node's time. `dg_bench --profile` prints a forward table next to the backward one, each with its total.
+- `DG_PROFILE_OP("name")` gives your own ops a forward entry (`examples/custom_op.cpp` shows it).
+- `ProfileEntry::phase` and `profile_report(ProfilePhase)` select one phase.
+- Tests: forward and backward entries land in their own phases, nested ops record self time, and ops inside a backward node get no forward entry.
+
+### Changed
+- Profiling lives in `core/profiler.h` / `profiler.cpp` (still included by `autograd.h`). `profile_report()` with no argument returns both phases. Before, it returned backward entries only.
+
 ## [0.6.1] - 2026-10-27
 
 Faster fp16 backward for matmuls. On a T4 (Kaggle), the fp16 medium step goes from 57.2 to 53.8 ms (PyTorch 2.11 fp16: 51.8 ms), and `MatmulBackward` from 16.7 to 13.9 ms. small goes from 22.0 to 21.3 ms.

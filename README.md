@@ -37,7 +37,7 @@ Full details for every release are in [CHANGELOG.md](CHANGELOG.md).
 - **Everything stays on the GPU.** New kernels for broadcast and scalar ops, RMSNorm, cross entropy, embedding lookup, GQA and gradient clipping removed 1.5 GB of host-device copies per step.
 - **Tiled attention:** FlashAttention-style forward and an atomic-free FlashAttention-2 backward.
 - **Reproducible on the GPU:** the new kernels use fixed-order sums instead of atomics, so ModernTransformer training gives the same results run to run.
-- **Profiler:** `dg_bench --profile` (or `set_profiling(true)`) shows where backward time goes.
+- **Profiler:** `dg_bench --profile` (or `set_profiling(true)`) shows where forward and backward time goes, per op.
 - **Fixed:** broadcasting now follows NumPy rules; `[1, H, S, S]` operands such as ALiBi biases were applied to the wrong heads with batch size above 1.
 
 ### v0.4.0: the workflow release
@@ -356,6 +356,7 @@ struct SquaredReluBackward : public Node {
 };
 
 std::shared_ptr<Tensor> squared_relu(const std::shared_ptr<Tensor>& x_in) {
+    DG_PROFILE_OP("squared_relu");             // optional: an entry in the forward profile
     auto x = contiguous(x_in);                 // kernels that index raw memory need dense inputs
     auto out = /* compute y = relu(x)^2 */;
     out->requires_grad = needs_grad(x);        // false inside NoGradGuard
@@ -396,6 +397,19 @@ if (!err.empty()) std::cerr << err << "\n";   // e.g. "input 0 element 3: analyt
 ```
 
 Anomaly detection scans every gradient (and copies GPU gradients to the host), so enable it only while hunting a problem.
+
+To see where a step's time goes, profile a few steps. Forward ops are listed by function name (`matmul`, `rms_norm`, `autocast_cast` for the fp16 conversions) and backward nodes by node name (`MatmulBackward`):
+
+```cpp
+reset_profile();
+set_profiling(true);
+for (int i = 0; i < 3; ++i) { optimizer.zero_grad(params); loss_fn(model.forward(x), y)->backward(); }
+set_profiling(false);
+for (const auto& e : profile_report(ProfilePhase::Forward))   // or ProfilePhase::Backward
+    std::printf("%8.2f ms  %4lld calls  %s\n", e.total_ms / 3, (long long)e.calls / 3, e.name.c_str());
+```
+
+The profiler synchronizes the GPU at every op so each time is exact, which makes profiled steps slower than normal ones. A forward op's time is its own work only: ops it calls have their own entries. Ops you write show up once their forward starts with `DG_PROFILE_OP("my_op");`.
 
 ### Troubleshooting
 
@@ -684,7 +698,7 @@ Training-step time (forward, backward, AdamW) for the same ModernTransformer arc
 | small (d=256, 4 layers, batch 16x128) | 3.9M | **23.9 ms** | 27.6 ms | 13% faster |
 | medium (d=512, 6 layers, batch 8x256) | 23.1M | **103.6 ms** | 107.7 ms | 4% faster |
 
-dummygrad's advantage is per-op overhead (no Python, no dispatcher), which dominates small models; at larger sizes both are bound by cuBLAS matrix multiplies (`MatmulBackward` is 47 of medium's 104 ms). Reproduce it with the [Colab notebook](notebooks/dummygrad_colab.ipynb), or run `./build/dg_bench` and `python bench/bench_torch.py` on your own GPU. `./build/dg_bench --profile` breaks backward time down by op.
+dummygrad's advantage is per-op overhead (no Python, no dispatcher), which dominates small models; at larger sizes both are bound by cuBLAS matrix multiplies (`MatmulBackward` is 47 of medium's 104 ms). Reproduce it with the [Colab notebook](notebooks/dummygrad_colab.ipynb), or run `./build/dg_bench` and `python bench/bench_torch.py` on your own GPU. `./build/dg_bench --profile` breaks forward and backward time down by op.
 
 With fp16 mixed precision (`dg_bench --fp16`: `AutocastGuard` + `GradScaler`, against `torch.autocast` + `GradScaler`), on a Kaggle T4:
 

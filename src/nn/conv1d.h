@@ -2,6 +2,7 @@
 #include "conv2d.h"
 
 inline std::shared_ptr<Tensor> conv1d(const std::shared_ptr<Tensor>& x, const std::shared_ptr<Tensor>& weight, int stride = 1, int padding = 0) {
+    DG_PROFILE_OP("conv1d");
     if (!x || !weight) throw std::runtime_error("conv1d: input or weight is null");
     if (x->ndim() != 3) throw std::runtime_error("conv1d: x must be a 3D tensor (B, C_in, L)");
     if (weight->ndim() != 3) throw std::runtime_error("conv1d: weight must be a 3D tensor (C_out, C_in, k)");

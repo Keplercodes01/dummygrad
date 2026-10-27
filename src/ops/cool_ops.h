@@ -80,6 +80,7 @@ struct ScaleAndShiftBackward : public Node {
 inline std::shared_ptr<Tensor> scale_n_shift(const std::shared_ptr<Tensor>& x_in,
                                              const std::shared_ptr<Tensor>& gamma_in,
                                              const std::shared_ptr<Tensor>& beta_in) {
+    DG_PROFILE_OP("scale_n_shift");
     auto x = contiguous(x_in);
     auto gamma = contiguous(gamma_in);
     auto beta = contiguous(beta_in);

@@ -1,6 +1,7 @@
 #include "cuda_ops.cuh"
 #include "cuda_common.h"
 #include "cuda_reduce.cuh"
+#include "profiler.h"
 #include <cmath>
 #include <algorithm>
 
@@ -877,6 +878,7 @@ __global__ void k_float_to_bfloat16(const float* in, __nv_bfloat16* out, int64_t
 }
 
 void cast_from_float(const float* in, void* out, int64_t n, DType dtype) {
+    DG_PROFILE_OP("autocast_cast");
     if (dtype != DType::Float16 && dtype != DType::BFloat16) {
         throw std::runtime_error("cuda::cast_from_float: target dtype must be Float16 or BFloat16");
     }

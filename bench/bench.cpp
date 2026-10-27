@@ -4,7 +4,7 @@
 //
 //   ./dg_bench                  all configurations
 //   ./dg_bench small            one configuration (tiny, small, medium)
-//   ./dg_bench --profile        also print the most expensive backward ops per configuration
+//   ./dg_bench --profile        also print the most expensive forward and backward ops per configuration
 //   ./dg_bench --fp16           matmuls and attention on fp16 tensor cores (AutocastGuard + GradScaler)
 //   ./dg_bench --bf16           matmuls and attention on bf16 tensor cores (Ampere or newer)
 
@@ -125,7 +125,8 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
 
         if (profile) {
-            // Separate pass: profiling serializes and synchronizes backward, which skews the timings above
+            // Separate pass: profiling synchronizes at every op and serializes backward, which skews
+            // the timings above
             const int profiled_steps = 3;
             reset_profile();
             set_profiling(true);
@@ -134,14 +135,24 @@ int main(int argc, char** argv) {
                 scaler.scale(forward_loss())->backward();
             }
             set_profiling(false);
-            std::string report = "\nBackward ops, " + c.name + " (ms per step):\n";
-            int shown = 0;
-            for (const auto& e : profile_report()) {
-                if (shown++ == 12) break;
-                char line[256];
-                std::snprintf(line, sizeof(line), "  %8.2f ms  %5lld calls  %s\n", e.total_ms / profiled_steps,
-                              (long long)(e.calls / profiled_steps), e.name.c_str());
-                report += line;
+            std::string report;
+            for (ProfilePhase phase : {ProfilePhase::Forward, ProfilePhase::Backward}) {
+                auto entries = profile_report(phase);
+                double total = 0.0;
+                for (const auto& e : entries) total += e.total_ms;
+                char title[256];
+                std::snprintf(title, sizeof(title), "\n%s ops, %s (ms per step, %.2f ms total):\n",
+                              phase == ProfilePhase::Forward ? "Forward" : "Backward", c.name.c_str(),
+                              total / profiled_steps);
+                report += title;
+                int shown = 0;
+                for (const auto& e : entries) {
+                    if (shown++ == 12) break;
+                    char line[256];
+                    std::snprintf(line, sizeof(line), "  %8.2f ms  %5lld calls  %s\n", e.total_ms / profiled_steps,
+                                  (long long)(e.calls / profiled_steps), e.name.c_str());
+                    report += line;
+                }
             }
             profiles.push_back(report);
         }
