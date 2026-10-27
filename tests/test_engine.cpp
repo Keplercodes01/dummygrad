@@ -1029,6 +1029,47 @@ static std::string workflow_deterministic_backward_cuda_gpt() {
     return deterministic_backward(model, Device::CUDA, 4, 32);
 }
 
+// Backward on the calling thread gives the worker pool's gradients bit for bit (tied embedding and
+// GQA give the graph branches that meet again), propagates a node's exception, and leaves the
+// engine usable
+static std::string engine_calling_thread(Device dev) {
+    struct RestoreMode {
+        ~RestoreMode() { set_backward_execution(BackwardExecution::Auto); }
+    } restore;
+    manual_seed(3);
+    ModernTransformer model(16, 8, 16, 2, 2, 1);
+    if (dev == Device::CUDA) model.cuda();
+    std::vector<float> in{1, 2, 3, 4, 5, 6}, tg{2, 3, 4, 5, 6, 7};
+    auto run = [&] {
+        model.zero_grad();
+        fused_cross_entropy(model.forward(upload(in, {2, 3}, dev, false)), upload(tg, {2, 3}, dev, false))->backward();
+        return all_grads(model);
+    };
+    set_backward_execution(BackwardExecution::ThreadPool);
+    auto pool = run();
+    set_backward_execution(BackwardExecution::CallingThread);
+    if (run() != pool) return "gradients differ between the worker pool and the calling thread";
+    set_backward_execution(BackwardExecution::Auto);
+    if (run() != pool) return "gradients differ between the worker pool and the automatic choice";
+
+    auto x = upload({1, 2, 3, 4}, {2, 2}, Device::CPU, true);
+    auto bad = std::make_shared<ThrowingNode>();
+    bad->add_next_edge(get_grad_edge(mul_scalar(x, 2.0f)).function);
+    auto out = std::make_shared<Tensor>(std::vector<int64_t>{1, 1}, Device::CPU, DType::Float32, true);
+    out->fill_(0.0f);
+    out->grad_fn = bad;
+    bool threw = false;
+    try {
+        out->backward();
+    } catch (const std::runtime_error& e) {
+        threw = std::string(e.what()) == "boom";
+    }
+    if (!threw) return "an exception from a backward node did not reach backward()";
+    auto z = upload({1, 2, 3, 4}, {2, 2}, Device::CPU, true);
+    scalar_sum(mul_scalar(z, 5.0f))->backward();
+    return expect_all(z, 5.0f, "backward after a failed backward");
+}
+
 template <typename Optimizer>
 static void train_steps(ModernTransformer& model, Optimizer& opt, int first_step, int steps) {
     auto params = model.parameters();
@@ -1443,6 +1484,55 @@ static std::string matmul_frozen_operand_cuda(DType compute) {
     return "";
 }
 
+// linear on CUDA (bias added inside the GEMM) against matmul + add: outputs agree to rounding,
+// and with a loss linear in the output, so both see the same output gradient, dx, dw and db are
+// bit-identical. A frozen bias gets no gradient, and every call took the fused path.
+static std::string linear_fused_cuda(DType compute) {
+    struct Case { std::vector<int64_t> x, w, b; };
+    const Case cases[] = {
+        {{48, 64}, {64, 40}, {1, 40}},
+        {{4, 16, 64}, {64, 32}, {32}},
+    };
+    int64_t unfused_before = cuda::linear_unfused_count();
+    for (const auto& c : cases) {
+        auto xv = random_values(numel(c.x), -1, 1), wv = random_values(numel(c.w), -1, 1);
+        auto bv = random_values(numel(c.b), -1, 1);
+        auto cv = random_values(numel(c.x) / c.x.back() * c.w[1], -1, 1);
+        auto run = [&](bool fused, bool train_b) {
+            auto x = upload(xv, c.x, Device::CUDA, true), w = upload(wv, c.w, Device::CUDA, true);
+            auto b = upload(bv, c.b, Device::CUDA, train_b);
+            TensorPtr y;
+            {
+                AutocastGuard autocast(compute);
+                y = fused ? linear(x, w, b) : add(matmul(x, w), b);
+            }
+            auto coeff = upload(cv, y->shape, Device::CUDA, false);
+            scalar_sum(reshape(mul(y, coeff), {1, (int64_t)y->size()}))->backward();
+            return std::vector<TensorPtr>{y, x->grad, w->grad, b->grad};
+        };
+        auto ref = run(false, true), got = run(true, true), frozen = run(true, false);
+        std::string label = "x" + std::to_string(c.x.size()) + "d: ";
+        if (got[0]->shape != ref[0]->shape) return label + "output shape differs from matmul + add";
+        auto y_ref = download(ref[0]), y_got = download(got[0]);
+        float scale = 0.0f, worst = 0.0f;
+        for (size_t i = 0; i < y_ref.size(); ++i) {
+            scale = std::max(scale, std::fabs(y_ref[i]));
+            worst = std::max(worst, std::fabs(y_ref[i] - y_got[i]));
+        }
+        if (!(worst <= 1e-3f * scale + 1e-5f)) return label + "output differs from matmul + add by " + std::to_string(worst);
+        const char* names[] = {"", "grad x", "grad w", "grad b"};
+        for (int k = 1; k < 4; ++k) {
+            if (!got[k]) return label + names[k] + " is missing";
+            if (got[k]->shape != ref[k]->shape) return label + names[k] + " has the wrong shape";
+            if (download(got[k]) != download(ref[k])) return label + names[k] + " is not bit-identical to matmul + add";
+        }
+        if (frozen[3]) return label + "a frozen bias received a gradient";
+        if (!frozen[1] || download(frozen[1]) != download(got[1])) return label + "grad x changed when the bias was frozen";
+    }
+    if (cuda::linear_unfused_count() != unfused_before) return "linear fell back to a separate bias kernel";
+    return "";
+}
+
 // Attention under autocast against fp32: output, lse and the three gradients on the GEMM path,
 // causal and not, with a sequence length that is not a multiple of 8. The tiled kernels ignore
 // autocast, so there the results must be bit-identical.
@@ -1649,6 +1739,8 @@ int main() {
     run_case(r, "engine/concurrent_fanin", engine_concurrent_fanin);
     run_case(r, "engine/adopted_grads_do_not_alias", engine_adopted_grads_do_not_alias);
     run_case(r, "engine/deep_chain", engine_deep_chain);
+    run_case(r, "engine/calling_thread", [] { return engine_calling_thread(Device::CPU); });
+    if (has_cuda) run_case(r, "engine/calling_thread_cuda", [] { return engine_calling_thread(Device::CUDA); });
 
     std::cout << "\n-- modules\n";
     run_case(r, "module/checkpoint_names", module_checkpoint_names);
@@ -1679,6 +1771,8 @@ int main() {
     run_case(r, "amp/grad_scaler", amp_grad_scaler);
 #ifdef USE_CUDA
     if (has_cuda) {
+        run_case(r, "amp/linear_fused_fp32_cuda", [] { return linear_fused_cuda(DType::Float32); });
+        run_case(r, "amp/linear_fused_fp16_cuda", [] { return linear_fused_cuda(DType::Float16); });
         run_case(r, "amp/matmul_frozen_operand_fp32_cuda", [] { return matmul_frozen_operand_cuda(DType::Float32); });
         run_case(r, "amp/matmul_frozen_operand_fp16_cuda", [] { return matmul_frozen_operand_cuda(DType::Float16); });
         run_case(r, "amp/matmul_parity_fp16_cuda", [] { return amp_matmul_parity(DType::Float16); });

@@ -398,7 +398,7 @@ if (!err.empty()) std::cerr << err << "\n";   // e.g. "input 0 element 3: analyt
 
 Anomaly detection scans every gradient (and copies GPU gradients to the host), so enable it only while hunting a problem.
 
-To see where a step's time goes, profile a few steps. Forward ops are listed by function name (`matmul`, `rms_norm`, `autocast_cast` for the fp16 conversions) and backward nodes by node name (`MatmulBackward`):
+To see where a step's time goes, profile a few steps. Forward ops are listed by function name (`linear`, `matmul`, `rms_norm`, `autocast_cast` for the fp16 conversions) and backward nodes by node name (`LinearBackward`, `MatmulBackward`):
 
 ```cpp
 reset_profile();

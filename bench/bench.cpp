@@ -7,6 +7,7 @@
 //   ./dg_bench --profile        also print the most expensive forward and backward ops per configuration
 //   ./dg_bench --fp16           matmuls and attention on fp16 tensor cores (AutocastGuard + GradScaler)
 //   ./dg_bench --bf16           matmuls and attention on bf16 tensor cores (Ampere or newer)
+//   ./dg_bench --worker-threads run backward on the engine's worker pool (the GPU default is the calling thread)
 
 #include "dummy_core.h"
 
@@ -48,6 +49,7 @@ int main(int argc, char** argv) {
         if (arg == "--profile") profile = true;
         else if (arg == "--fp16") compute = DType::Float16;
         else if (arg == "--bf16") compute = DType::BFloat16;
+        else if (arg == "--worker-threads") set_backward_execution(BackwardExecution::ThreadPool);
         else only = arg;
     }
     const char* compute_name = compute == DType::Float16 ? "fp16" : compute == DType::BFloat16 ? "bf16" : "fp32";
@@ -58,8 +60,13 @@ int main(int argc, char** argv) {
     if (cudaGetDeviceCount(&gpus) == cudaSuccess && gpus > 0) device = Device::CUDA;
 #endif
     const int warmup = 3, steps = 10;
-    std::printf("dummygrad %s benchmark on %s, %s autocast (%d timed steps after %d warmup)\n\n", DUMMYGRAD_VERSION,
-                device == Device::CUDA ? "CUDA" : "CPU", compute_name, steps, warmup);
+    BackwardExecution mode = backward_execution();
+    if (mode == BackwardExecution::Auto) {
+        mode = device == Device::CPU ? BackwardExecution::ThreadPool : BackwardExecution::CallingThread;
+    }
+    std::printf("dummygrad %s benchmark on %s, %s autocast, backward on %s (%d timed steps after %d warmup)\n\n",
+                DUMMYGRAD_VERSION, device == Device::CUDA ? "CUDA" : "CPU", compute_name,
+                mode == BackwardExecution::CallingThread ? "the calling thread" : "worker threads", steps, warmup);
     std::printf("| config | params | ms/step | tokens/s | forward | backward | optimizer | copies/step | MB/step |\n");
     std::printf("|---|---|---|---|---|---|---|---|---|\n");
 

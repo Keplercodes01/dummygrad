@@ -22,6 +22,18 @@ namespace cuda {
                                    DType compute = DType::Float32,
                                    std::shared_ptr<Tensor>* saved_a = nullptr,
                                    std::shared_ptr<Tensor>* saved_b = nullptr);
+    // out = x @ w + bias for a 2-D weight w [in, out] and a bias with one value per output feature.
+    // The bias is added inside the GEMM (cuBLASLt epilogue) when cuBLASLt supports the case, else
+    // by a separate kernel. saved_x / saved_w as for matmul; the gradients are matmul_backward's
+    // plus bias_grad.
+    std::shared_ptr<Tensor> linear(const std::shared_ptr<Tensor>& x, const std::shared_ptr<Tensor>& w,
+                                   const std::shared_ptr<Tensor>& bias, DType compute = DType::Float32,
+                                   std::shared_ptr<Tensor>* saved_x = nullptr,
+                                   std::shared_ptr<Tensor>* saved_w = nullptr);
+    // How many linear calls so far added the bias with a separate kernel because cuBLASLt could
+    // not fuse it (no algorithm for the shape, or an unaligned pointer). Should stay 0 for
+    // ordinary layers; a rising count means Linear is running slower than it should.
+    int64_t linear_unfused_count();
     // Gradients of out = a @ b for inputs of shapes a_shape and b_shape. a and b are Float32 or
     // compute-dtype operands (normally matmul's saved ones). grad_a needs only b and grad_b only a:
     // a null grad_a / grad_b skips that GEMM, and the operand only it uses may then be null.
@@ -106,6 +118,10 @@ namespace cuda {
     // GQA: [B, kv_heads, S, D] -> [B, kv_heads * group, S, D], and its gradient
     void repeat_kv_forward(const float* in, float* out, int64_t batch, int64_t kv_heads, int64_t group, int64_t head_elems);
     void repeat_kv_backward(const float* grad, float* gin, int64_t batch, int64_t kv_heads, int64_t group, int64_t head_elems);
+
+    // Column sums of a row-major [rows, cols] gradient: a Linear's bias gradient. Deterministic, and
+    // bit-identical to the broadcast-add backward it replaces.
+    void bias_grad(const float* grad, float* db, int64_t rows, int64_t cols);
 
     // Sum of squares over several device buffers, in double precision (for gradient clipping)
     double sum_of_squares(const std::vector<const float*>& buffers, const std::vector<int64_t>& sizes);
