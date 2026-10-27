@@ -29,6 +29,15 @@ struct DetectAnomalyGuard {
 
 // Profiling (set_profiling, profile_report) for forward ops and backward nodes: see profiler.h
 
+// Where backward runs its nodes. ThreadPool (the default): the engine's worker threads, which can
+// run independent branches of the graph at the same time. CallingThread: the thread that called
+// backward(), one node at a time, most recently created first. On a GPU every kernel goes to the
+// same stream, so worker threads add hand-off latency without adding parallelism there. Results
+// are bit-identical either way: gradients that meet at a node are summed in a fixed order.
+enum class BackwardExecution { ThreadPool, CallingThread };
+void set_backward_execution(BackwardExecution mode);
+BackwardExecution backward_execution();
+
 class AutogradEngine {
 private:
     std::vector<std::thread> workers;

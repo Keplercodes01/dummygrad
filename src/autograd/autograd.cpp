@@ -14,6 +14,11 @@ static std::atomic<bool> g_detect_anomaly{false};
 void set_detect_anomaly(bool enabled) { g_detect_anomaly = enabled; }
 bool detect_anomaly_enabled() { return g_detect_anomaly; }
 
+static std::atomic<BackwardExecution> g_backward_execution{BackwardExecution::ThreadPool};
+
+void set_backward_execution(BackwardExecution mode) { g_backward_execution = mode; }
+BackwardExecution backward_execution() { return g_backward_execution; }
+
 // Runs node.apply, timing it when profiling is on.
 static std::vector<std::shared_ptr<Tensor>> apply_node(Node& node, const std::vector<std::shared_ptr<Tensor>>& incoming) {
     if (!profiling_enabled()) return node.apply(incoming);
@@ -200,6 +205,24 @@ void AutogradEngine::execute(std::shared_ptr<Node> root, const std::vector<int64
             curr->release_variables();
         }
     };
+
+    if (g_backward_execution == BackwardExecution::CallingThread) {
+        // Newest node first, as PyTorch does: every node is created after the nodes it feeds
+        // gradients to, so this follows the forward pass in reverse and frees saved tensors early.
+        // An exception from a node propagates straight out; nothing else is in flight.
+        auto older = [](const std::shared_ptr<Node>& x, const std::shared_ptr<Node>& y) {
+            return x->sequence_nr < y->sequence_nr;
+        };
+        std::priority_queue<std::shared_ptr<Node>, std::vector<std::shared_ptr<Node>>, decltype(older)> ready(older);
+        push_task = [&](std::shared_ptr<Node> curr) { ready.push(std::move(curr)); };
+        ready.push(root);
+        while (!ready.empty()) {
+            auto curr = ready.top();
+            ready.pop();
+            run_node(curr);
+        }
+        return;
+    }
 
     push_task = [&](std::shared_ptr<Node> curr) {
         {

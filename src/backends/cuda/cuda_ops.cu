@@ -2,7 +2,12 @@
 #include "cuda_common.h"
 #include "cuda_reduce.cuh"
 #include "profiler.h"
+#include "allocator.h"
+#include <cublasLt.h>
+#include <atomic>
+#include <unordered_map>
 #include <cmath>
+#include <cstdint>
 #include <algorithm>
 
 #ifdef USE_CUDA
@@ -915,14 +920,113 @@ static void gemm(cublasOperation_t op_a, cublasOperation_t op_b, int m, int n, i
                          batch, compute);
 }
 
+// ---- cuBLASLt GEMM with the bias fused into its epilogue (Linear) ----
+// Column-major D (m x n, ld m) = A (m x k, ld m) B (k x n, ld k) + bias[m] added to every column,
+// with no transposes. The row-major Linear out[M, N] = x[M, K] W[K, N] + b maps onto it with
+// m = N, n = M, A = W, B = x, so the bias runs along D's rows. Plans (descriptors and the
+// heuristic's algorithm) are cached per shape and dtype, so a call only sets the bias pointer.
+
+struct LtKey {
+    int m, n, k, dtype;
+    bool operator==(const LtKey& o) const { return m == o.m && n == o.n && k == o.k && dtype == o.dtype; }
+};
+struct LtKeyHash {
+    size_t operator()(const LtKey& key) const {
+        size_t h = (size_t)key.m;
+        for (int v : {key.n, key.k, key.dtype}) h = h * 1000003u ^ (size_t)v;
+        return h;
+    }
+};
+struct LtPlan {
+    bool ok = false;  // false: cuBLASLt has no algorithm for this case; the caller falls back
+    cublasLtMatmulDesc_t op = nullptr;
+    cublasLtMatrixLayout_t a = nullptr, b = nullptr, d = nullptr;
+    cublasLtMatmulAlgo_t algo{};
+};
+struct LtContext {
+    cublasLtHandle_t handle = nullptr;
+    void* workspace = nullptr;
+    std::unordered_map<LtKey, LtPlan, LtKeyHash> plans;
+};
+constexpr size_t kLtWorkspaceBytes = 4u << 20;
+
+// Per thread and device, like get_cublas_handle: a plan's descriptor is modified on every call
+static LtContext& lt_context() {
+    int dev = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    static thread_local std::unordered_map<int, LtContext> contexts;
+    LtContext& ctx = contexts[dev];
+    if (!ctx.handle) {
+        CUBLAS_CHECK(cublasLtCreate(&ctx.handle));
+        ctx.workspace = get_memory(Device::CUDA, kLtWorkspaceBytes);
+    }
+    return ctx;
+}
+
+static LtPlan& lt_bias_plan(LtContext& ctx, int m, int n, int k, DType compute) {
+    LtKey key{m, n, k, (int)compute};
+    auto it = ctx.plans.find(key);
+    if (it != ctx.plans.end()) return it->second;
+    LtPlan& p = ctx.plans[key];
+
+    cudaDataType_t in_type = compute == DType::Float16 ? CUDA_R_16F : compute == DType::BFloat16 ? CUDA_R_16BF : CUDA_R_32F;
+    // fp32 inputs use TF32 tensor cores where the GPU has them, like the SGEMM path's math mode
+    cublasComputeType_t compute_type = compute == DType::Float32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+    CUBLAS_CHECK(cublasLtMatmulDescCreate(&p.op, compute_type, CUDA_R_32F));
+    cublasOperation_t no_trans = CUBLAS_OP_N;
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSA, &no_trans, sizeof(no_trans)));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSB, &no_trans, sizeof(no_trans)));
+    cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&p.a, in_type, m, k, m));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&p.b, in_type, k, n, k));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&p.d, CUDA_R_32F, m, n, m));
+
+    cublasLtMatmulPreference_t pref = nullptr;
+    CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+    size_t workspace = kLtWorkspaceBytes;
+    CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace,
+                                                      sizeof(workspace)));
+    cublasLtMatmulHeuristicResult_t result{};
+    int found = 0;
+    cublasStatus_t status = cublasLtMatmulAlgoGetHeuristic(ctx.handle, p.op, p.a, p.b, p.d, p.d, pref, 1, &result, &found);
+    cublasLtMatmulPreferenceDestroy(pref);
+    if (status == CUBLAS_STATUS_SUCCESS && found > 0) {
+        p.algo = result.algo;
+        p.ok = true;
+    }
+    return p;
+}
+
+static std::atomic<int64_t> g_linear_unfused{0};
+int64_t linear_unfused_count() { return g_linear_unfused; }
+
+static bool aligned16(const void* ptr) { return (reinterpret_cast<uintptr_t>(ptr) & 15u) == 0; }
+
+// D = A B + bias as described above. Returns false (and does nothing) when cuBLASLt cannot run the
+// case: no algorithm for the shape, or a pointer that is not 16-byte aligned (an offset view).
+static bool gemm_bias(int m, int n, int k, const void* A, const void* B, const float* bias, float* D, DType compute) {
+    if (!aligned16(A) || !aligned16(B) || !aligned16(bias) || !aligned16(D)) return false;
+    LtContext& ctx = lt_context();
+    LtPlan& p = lt_bias_plan(ctx, m, n, k, compute);
+    if (!p.ok) return false;
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+    const float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasLtMatmul(ctx.handle, p.op, &alpha, A, p.a, B, p.b, &beta, D, p.d, D, p.d, &p.algo,
+                                ctx.workspace, kLtWorkspaceBytes, 0));
+    return true;
+}
+
 static void check_matmul_inputs(const Tensor& a, const Tensor& b, const char* who) {
     if (a.dtype != DType::Float32 || b.dtype != DType::Float32) {
         throw std::runtime_error(std::string(who) + ": tensors must be Float32 (use AutocastGuard for fp16/bf16 compute)");
     }
 }
 
-std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& _a, const std::shared_ptr<Tensor>& _b, DType compute,
-                               std::shared_ptr<Tensor>* saved_a, std::shared_ptr<Tensor>* saved_b) {
+// out = a @ b (+ bias over the last dimension); bias requires b to be a single 2-D matrix
+static std::shared_ptr<Tensor> matmul_impl(const std::shared_ptr<Tensor>& _a, const std::shared_ptr<Tensor>& _b,
+                                           const std::shared_ptr<Tensor>& bias, DType compute,
+                                           std::shared_ptr<Tensor>* saved_a, std::shared_ptr<Tensor>* saved_b) {
     check_matmul_inputs(*_a, *_b, "cuda::matmul");
     check_compute_dtype(compute, "cuda::matmul");
     auto a = make_contiguous(_a);
@@ -963,13 +1067,40 @@ std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& _a, const std::sha
 
     auto ah = gemm_operand(a, compute);
     auto bh = gemm_operand(b, compute);
-    // Row-major C = A * B -> Col-major C^T = B^T * A^T
-    gemm(CUBLAS_OP_N, CUBLAS_OP_N, c2, r1, c1,
-         bh->data_ptr<void>(), c2, stride_b, ah->data_ptr<void>(), c1, stride_a,
-         0.0f, out->data_ptr<float>(), c2, stride_c, batch_size, compute);
+    // Row-major C = A * B -> Col-major C^T = B^T * A^T. With a bias, b is one shared matrix, so
+    // the product is a single folded GEMM (batch_size 1) and the bias rides in its epilogue.
+    bool fused = bias && batch_size == 1 &&
+                 gemm_bias(c2, r1, c1, bh->data_ptr<void>(), ah->data_ptr<void>(), bias->data_ptr<float>(),
+                           out->data_ptr<float>(), compute);
+    if (!fused) {
+        gemm(CUBLAS_OP_N, CUBLAS_OP_N, c2, r1, c1,
+             bh->data_ptr<void>(), c2, stride_b, ah->data_ptr<void>(), c1, stride_a,
+             0.0f, out->data_ptr<float>(), c2, stride_c, batch_size, compute);
+        if (bias) {
+            ++g_linear_unfused;
+            int64_t rows = out->size() / c2;
+            broadcast_binary_forward(0, out->data_ptr<float>(), bias->data_ptr<float>(), out->data_ptr<float>(),
+                                     {rows, (int64_t)c2}, {1, (int64_t)c2});
+        }
+    }
     if (saved_a) *saved_a = std::move(ah);
     if (saved_b) *saved_b = std::move(bh);
     return out;
+}
+
+std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b, DType compute,
+                               std::shared_ptr<Tensor>* saved_a, std::shared_ptr<Tensor>* saved_b) {
+    return matmul_impl(a, b, nullptr, compute, saved_a, saved_b);
+}
+
+std::shared_ptr<Tensor> linear(const std::shared_ptr<Tensor>& x, const std::shared_ptr<Tensor>& w,
+                               const std::shared_ptr<Tensor>& bias, DType compute,
+                               std::shared_ptr<Tensor>* saved_x, std::shared_ptr<Tensor>* saved_w) {
+    if (w->ndim() != 2) throw std::runtime_error("cuda::linear: weight must be 2-D [in, out]");
+    if (bias->dtype != DType::Float32 || bias->device != Device::CUDA || bias->size() != w->shape[1]) {
+        throw std::runtime_error("cuda::linear: bias must be a Float32 CUDA tensor with one value per output feature");
+    }
+    return matmul_impl(x, w, make_contiguous(bias), compute, saved_x, saved_w);
 }
 
 // A backward GEMM operand: contiguous and of the compute dtype. matmul's saved operands already

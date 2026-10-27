@@ -18,7 +18,7 @@ public:
     }
 
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x) {
-        return cast_n_add(matmul(x, W), b);
+        return linear(x, W, b);
     }
 
     void visit(ModuleVisitor& v) override {

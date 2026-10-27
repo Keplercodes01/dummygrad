@@ -205,6 +205,18 @@ struct BroadcastGradY {
     }
 };
 
+// Column t of a row-major [K, cols] gradient, summed over its K rows in row order: the same terms
+// in the same order as BroadcastGradY for a [K, cols] + [1, cols] add
+struct ColumnSum {
+    const float* grad;
+    int64_t cols;
+    struct Ctx {
+        int64_t col;
+    };
+    __device__ Ctx context(int64_t t) const { return Ctx{t}; }
+    __device__ float operator()(const Ctx& ctx, int64_t k) const { return grad[k * cols + ctx.col]; }
+};
+
 // ---------------------------------------------------------------------------------------------
 // Scalar ops: 0 add, 1 sub, 2 mul, 3 div, 4 rsub (s - a), 5 rdiv (s / a)
 // ---------------------------------------------------------------------------------------------
@@ -556,6 +568,10 @@ void broadcast_binary_backward_y(int op, const float* grad, const float* x, cons
     int64_t K = 1;
     for (int d = 0; d < b.nred; ++d) K *= b.red_size[d];
     reduce_terms(BroadcastGradY{op, grad, x, y, b}, numel(y_shape), K, gy);
+}
+
+void bias_grad(const float* grad, float* db, int64_t rows, int64_t cols) {
+    reduce_terms(ColumnSum{grad, cols}, cols, rows, db);
 }
 
 void scalar_forward(int op, const float* a, float s, float* out, int64_t n) {

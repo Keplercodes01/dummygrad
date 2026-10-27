@@ -3028,24 +3028,27 @@ cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
 }
 
 #ifdef USE_CUDA
-// Backward of a CUDA matmul. Holds the operands exactly as the forward GEMM consumed them
-// (contiguous, already rounded to the autocast dtype), so backward neither re-casts nor
-// re-densifies them, and only those it needs: B for dA, A for dB. Under fp16 autocast a saved
-// activation is a half-size copy, and the fp32 original can be freed once forward moves on.
+// Backward of a CUDA matmul or linear (matmul plus bias). Holds the operands exactly as the
+// forward GEMM consumed them (contiguous, already rounded to the autocast dtype), so backward
+// neither re-casts nor re-densifies them, and only those it needs: B for dA, A for dB. Under fp16
+// autocast a saved activation is a half-size copy, and the fp32 original can be freed once forward
+// moves on. With a bias (bias_shape non-empty) it has a third input, whose gradient is the column
+// sum of the output gradient.
 struct CudaMatmulBackward : public Node {
-    std::vector<int64_t> a_shape, b_shape;
+    std::vector<int64_t> a_shape, b_shape, bias_shape;
     std::shared_ptr<Tensor> a, b;  // saved GEMM operands; null when no gradient needs them
-    bool grad_a, grad_b;
+    bool grad_a, grad_b, grad_bias;
     DType compute;  // GEMM precision the forward ran with (autocast)
 
     CudaMatmulBackward(std::vector<int64_t> a_shape, std::vector<int64_t> b_shape,
                        std::shared_ptr<Tensor> a, std::shared_ptr<Tensor> b,
-                       bool grad_a, bool grad_b, DType compute)
-        : a_shape(std::move(a_shape)), b_shape(std::move(b_shape)), a(std::move(a)), b(std::move(b)),
-          grad_a(grad_a), grad_b(grad_b), compute(compute) {}
+                       bool grad_a, bool grad_b, DType compute,
+                       std::vector<int64_t> bias_shape = {}, bool grad_bias = false)
+        : a_shape(std::move(a_shape)), b_shape(std::move(b_shape)), bias_shape(std::move(bias_shape)),
+          a(std::move(a)), b(std::move(b)), grad_a(grad_a), grad_b(grad_b), grad_bias(grad_bias), compute(compute) {}
 
-    // Same label as the CPU node, so profiles stay comparable across devices and releases
-    std::string name() const override { return "MatmulBackward"; }
+    // MatmulBackward is the CPU node's label too, so profiles stay comparable across devices
+    std::string name() const override { return bias_shape.empty() ? "MatmulBackward" : "LinearBackward"; }
 
     void release_variables() override {
         a = nullptr;
@@ -3061,7 +3064,14 @@ struct CudaMatmulBackward : public Node {
         std::shared_ptr<Tensor> da, db;
         cuda::matmul_backward(a_shape, b_shape, a, b, grads[0], grad_a ? &da : nullptr, grad_b ? &db : nullptr,
                               compute);
-        return {da, db};
+        if (bias_shape.empty()) return {da, db};
+        std::shared_ptr<Tensor> dbias;
+        if (grad_bias) {
+            int64_t cols = b_shape.back();
+            dbias = std::make_shared<Tensor>(bias_shape, Device::CUDA, DType::Float32, false);
+            cuda::bias_grad(grads[0]->data_ptr<float>(), dbias->data_ptr<float>(), grads[0]->size() / cols, cols);
+        }
+        return {da, db, dbias};
     }
 };
 #endif
@@ -3090,5 +3100,43 @@ inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const st
     }
 #endif
     return manual_matmul(a, b);
+}
+
+// y = x @ w + b: x [..., in], w [in, out], b [out] or [1, out], or null for no bias. On CUDA the
+// bias is added inside the GEMM (cuBLASLt epilogue) instead of by a separate pass over the output,
+// and one LinearBackward node returns dx, dw and db. Elsewhere it is matmul followed by add.
+inline std::shared_ptr<Tensor> linear(const std::shared_ptr<Tensor>& x, const std::shared_ptr<Tensor>& w,
+                                      const std::shared_ptr<Tensor>& b = nullptr) {
+    DG_PROFILE_OP("linear");
+    if (!x || !w) throw std::invalid_argument("linear: null input or weight");
+    if (!b) return matmul(x, w);
+    if (w->ndim() != 2) throw std::invalid_argument("linear: weight must be 2-D [in, out], got " + shape_string(w->shape));
+    if (b->size() != w->shape[1]) {
+        throw std::invalid_argument("linear: bias " + shape_string(b->shape) + " does not match " +
+                                    std::to_string(w->shape[1]) + " output features");
+    }
+    if (x->device != w->device || b->device != w->device) {
+        throw std::invalid_argument("linear: input, weight and bias are on different devices");
+    }
+#ifdef USE_CUDA
+    if (x->device == Device::CUDA) {
+        DType compute = autocast_dtype();
+        bool grad_x = needs_grad(x), grad_w = needs_grad(w), grad_b = needs_grad(b);
+        // As in matmul: dx needs only w and dw only x
+        std::shared_ptr<Tensor> saved_x, saved_w;
+        auto out = cuda::linear(x, w, b, compute, grad_w ? &saved_x : nullptr, grad_x ? &saved_w : nullptr);
+        out->requires_grad = grad_x || grad_w || grad_b;
+        if (out->requires_grad) {
+            auto grad_fn = std::make_shared<CudaMatmulBackward>(x->shape, w->shape, std::move(saved_x), std::move(saved_w),
+                                                                grad_x, grad_w, compute, b->shape, grad_b);
+            grad_fn->add_next_edge(get_grad_edge(x).function);
+            grad_fn->add_next_edge(get_grad_edge(w).function);
+            grad_fn->add_next_edge(get_grad_edge(b).function);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
+#endif
+    return add(matmul(x, w), b);
 }
 
