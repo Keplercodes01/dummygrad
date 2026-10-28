@@ -2,7 +2,18 @@
 
 All notable changes to dummygrad are documented here. Versions follow [Semantic Versioning](https://semver.org/); while the major version is 0, minor releases may change behavior.
 
-## [Unreleased]
+## [0.8.0] - 2026-10-28
+
+The audit release: every finding of a full-codebase audit fixed, plus the benchmark tooling. On a Kaggle T4, same session, median ms per step:
+
+| config | v0.7.0 fp32 | v0.8.0 fp32 | v0.7.0 fp16 | v0.8.0 fp16 |
+|---|---|---|---|---|
+| tiny (0.4M params) | 1.72 | 1.54 | 1.70 | 1.56 |
+| small (3.9M) | 25.4 | 22.1 | 16.0 | 15.4 |
+| medium (23.1M) | 121.0 | 100.4 | 56.9 | 53.9 |
+| large (100.2M) | 967 | 820 | 359 | 324 |
+
+267 tests pass on the T4 x2, including the two-GPU test.
 
 Groundwork for keeping activations in fp16 under autocast: half-precision tensors now work with every op. Speed is unchanged; the fp16 kernels and the switch come next.
 
