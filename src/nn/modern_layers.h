@@ -8,6 +8,7 @@
 #include <vector>
 #include <memory>
 #include <algorithm>
+#include <unordered_set>
 
 // ============================================================================
 // 1. RMSNorm (Root Mean Square Layer Normalization)
@@ -361,28 +362,38 @@ public:
 // ============================================================================
 
 inline float clip_grad_norm_(const std::vector<std::shared_ptr<Tensor>>& parameters, float max_norm) {
+    // Each gradient once (a tied weight may be listed twice), dense, so it can be scaled in place.
+    // Gradients belong to their parameters (adopted or accumulated into fresh buffers), so
+    // scaling them in place changes nothing else.
+    std::vector<std::shared_ptr<Tensor>> grads;
+    std::unordered_set<const Tensor*> seen;
+    for (const auto& p : parameters) {
+        if (!p || !p->grad || !seen.insert(p.get()).second) continue;
+        if (p->grad->dtype != DType::Float32) throw std::runtime_error("clip_grad_norm_: gradients must be Float32");
+        if (!p->grad->is_contiguous()) p->grad = make_contiguous(p->grad);
+        grads.push_back(p->grad);
+    }
+
     // Accumulate in double: summing millions of squared floats in float loses precision
     double total_sq = 0.0;
 #ifdef USE_CUDA
-    std::vector<std::shared_ptr<Tensor>> keep_alive;
     std::vector<const float*> device_grads;
+    std::vector<float*> device_targets;
     std::vector<int64_t> device_sizes;
 #endif
-    for (const auto& p : parameters) {
-        if (!p || !p->grad) continue;
-        auto g = make_contiguous(p->grad);
+    for (const auto& g : grads) {
 #ifdef USE_CUDA
         if (g->device == Device::CUDA) {
-            // Reduced on the GPU below, all parameters in one pass with a single host copy
+            // Reduced on the GPU below, all gradients in one launch with a single host copy
             device_grads.push_back(g->data_ptr<float>());
+            device_targets.push_back(g->data_ptr<float>());
             device_sizes.push_back(g->size());
-            keep_alive.push_back(g);
             continue;
         }
 #endif
-        if (g->device != Device::CPU) g = g->cpu();
-        const float* d = g->data_ptr<float>();
-        for (int64_t i = 0; i < g->size(); ++i) total_sq += (double)d[i] * (double)d[i];
+        auto h = (g->device == Device::CPU) ? g : g->cpu();
+        const float* d = h->data_ptr<float>();
+        for (int64_t i = 0; i < h->size(); ++i) total_sq += (double)d[i] * (double)d[i];
     }
 #ifdef USE_CUDA
     total_sq += cuda::sum_of_squares(device_grads, device_sizes);
@@ -391,9 +402,18 @@ inline float clip_grad_norm_(const std::vector<std::shared_ptr<Tensor>>& paramet
 
     if (total_norm > max_norm) {
         float scale = max_norm / (total_norm + 1e-6f);
-        NoGradGuard no_grad;
-        for (const auto& p : parameters) {
-            if (p && p->grad) p->grad = mul_scalar(p->grad, scale);
+#ifdef USE_CUDA
+        cuda::scale_buffers(device_targets, device_sizes, scale);
+#endif
+        for (const auto& g : grads) {
+            if (g->device == Device::CUDA) continue;
+            if (g->device == Device::CPU || g->device == Device::MPS) {
+                float* d = g->data_ptr<float>();
+                for (int64_t i = 0; i < g->size(); ++i) d[i] *= scale;
+            } else {
+                NoGradGuard no_grad;
+                ops::make_contiguous(*g, *mul_scalar(g, scale));
+            }
         }
     }
     return total_norm;

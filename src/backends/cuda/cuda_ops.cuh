@@ -140,8 +140,11 @@ namespace cuda {
     // bit-identical to the broadcast-add backward it replaces.
     void bias_grad(const float* grad, float* db, int64_t rows, int64_t cols);
 
-    // Sum of squares over several device buffers, in double precision (for gradient clipping)
+    // Sum of squares over several device buffers, in double precision (gradient clipping): one
+    // launch for all of them, deterministic, one host sync
     double sum_of_squares(const std::vector<const float*>& buffers, const std::vector<int64_t>& sizes);
+    // Multiplies every buffer by scale in place, in one launch
+    void scale_buffers(const std::vector<float*>& buffers, const std::vector<int64_t>& sizes, float scale);
     // Multiplies every buffer by inv_scale in place; returns whether any value was inf or NaN
     // (GradScaler). One host sync for all buffers.
     bool unscale_and_check(const std::vector<float*>& buffers, const std::vector<int64_t>& sizes, float inv_scale);

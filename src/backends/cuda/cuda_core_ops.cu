@@ -11,6 +11,8 @@
 #include "allocator.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <memory>
 #include <cmath>
 #include <vector>
 
@@ -559,35 +561,62 @@ __global__ void k_max_pool2d_backward(const float* grad, const float* argmax, fl
 }
 
 // ---------------------------------------------------------------------------------------------
-// Sum of squares in double precision: a fixed grid writes one partial per thread (strided, so
-// reads are coalesced), then one thread per buffer adds its partials in order.
+// Multi-tensor kernels: one launch covers a list of buffers. The list is uploaded as n pointers
+// followed by n sizes (uint64); blockIdx.y picks the buffer (offset by `first` for lists longer
+// than the grid's y limit) and the blocks along x stride through it.
 // ---------------------------------------------------------------------------------------------
 
-constexpr int kSqBlocks = 64;
-constexpr int64_t kSqPartials = (int64_t)kSqBlocks * kThreads;
+constexpr int kSqBlocks = 64;  // partial sums per buffer
 
-__global__ void k_sum_squares_partials(const float* x, int64_t n, double* partial) {
-    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    double acc = 0.0;
-    for (int64_t i = tid; i < n; i += kSqPartials) acc += (double)x[i] * (double)x[i];
-    partial[tid] = acc;
+__device__ __forceinline__ double block_reduce_sum_double(double v) {
+    __shared__ double s_warp[32];
+    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) v += __shfl_down_sync(0xffffffff, v, offset);
+    if (lane == 0) s_warp[warp] = v;
+    __syncthreads();
+    int warps = (blockDim.x + 31) / 32;
+    v = (threadIdx.x < warps) ? s_warp[threadIdx.x] : 0.0;
+    if (warp == 0) {
+#pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) v += __shfl_down_sync(0xffffffff, v, offset);
+    }
+    return v;  // the block's sum, in thread 0
 }
 
-__global__ void k_sum_squares_finish(const double* partial, double* out, int buffers) {
-    int b = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= buffers) return;
+// partial[b * kSqBlocks + block] = sum of squares of the block's strided share of buffer b, in
+// double: a fixed partition reduced in a fixed order, so the result is deterministic
+__global__ void k_sum_squares_partials(const uint64_t* list, int n, int first, double* partial) {
+    int b = first + blockIdx.y;
+    const float* x = reinterpret_cast<const float*>(list[b]);
+    int64_t size = (int64_t)list[n + b];
     double acc = 0.0;
-    for (int64_t i = 0; i < kSqPartials; ++i) acc += partial[(int64_t)b * kSqPartials + i];
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < size; i += (int64_t)gridDim.x * blockDim.x) {
+        double v = (double)x[i];
+        acc += v * v;
+    }
+    acc = block_reduce_sum_double(acc);
+    if (threadIdx.x == 0) partial[(int64_t)b * kSqBlocks + blockIdx.x] = acc;
+}
+
+__global__ void k_sum_squares_finish(const double* partial, double* out, int n) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n) return;
+    double acc = 0.0;
+    for (int k = 0; k < kSqBlocks; ++k) acc += partial[(int64_t)b * kSqBlocks + k];
     out[b] = acc;
 }
 
-// x *= inv_scale, raising *found_nonfinite if any input was inf or NaN. Every writer stores the
-// same 1, so the race is benign and the result deterministic.
-__global__ void k_unscale(float* x, int64_t n, float inv_scale, int* found_nonfinite) {
-    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+// x *= scale for every buffer. With found_nonfinite, also raises the flag if any input was inf or
+// NaN (every writer stores the same 1, so the race is benign and the result deterministic).
+__global__ void k_scale_buffers(const uint64_t* list, int n, int first, float scale, int* found_nonfinite) {
+    int b = first + blockIdx.y;
+    float* x = reinterpret_cast<float*>(list[b]);
+    int64_t size = (int64_t)list[n + b];
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < size; i += (int64_t)gridDim.x * blockDim.x) {
         float v = x[i];
-        if (!isfinite(v)) *found_nonfinite = 1;
-        x[i] = v * inv_scale;
+        if (found_nonfinite && !isfinite(v)) *found_nonfinite = 1;
+        x[i] = v * scale;
     }
 }
 
@@ -770,30 +799,68 @@ void max_pool2d_backward(const float* grad, const float* argmax, float* gx, int6
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Uploads a buffer list for the multi-tensor kernels: n pointers, then n sizes
+template <typename Ptr>
+static std::unique_ptr<DeviceBuffer> upload_buffer_list(const std::vector<Ptr>& buffers, const std::vector<int64_t>& sizes) {
+    size_t n = buffers.size();
+    std::vector<uint64_t> packed(2 * n);
+    for (size_t b = 0; b < n; ++b) {
+        packed[b] = (uint64_t)reinterpret_cast<uintptr_t>(buffers[b]);
+        packed[n + b] = (uint64_t)sizes[b];
+    }
+    auto list = std::make_unique<DeviceBuffer>(packed.size() * sizeof(uint64_t));
+    CUDA_CHECK(cudaMemcpy(list->ptr, packed.data(), packed.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    return list;
+}
+
+constexpr int kMaxGridY = 65535;
+
+// Grid width for the scaling kernels: enough blocks for the largest buffer, at most 1024
+static int scale_blocks(const std::vector<int64_t>& sizes) {
+    int64_t largest = 1;
+    for (int64_t s : sizes) largest = std::max(largest, s);
+    return (int)std::min<int64_t>(1024, (largest + kThreads - 1) / kThreads);
+}
+
 double sum_of_squares(const std::vector<const float*>& buffers, const std::vector<int64_t>& sizes) {
-    int count = (int)buffers.size();
-    if (count == 0) return 0.0;
-    DeviceBuffer partial((size_t)(count * kSqPartials) * sizeof(double)), sums((size_t)count * sizeof(double));
-    for (int b = 0; b < count; ++b) {
-        k_sum_squares_partials<<<kSqBlocks, kThreads>>>(buffers[b], sizes[b], partial.as<double>() + (int64_t)b * kSqPartials);
+    int n = (int)buffers.size();
+    if (n == 0) return 0.0;
+    auto list = upload_buffer_list(buffers, sizes);
+    DeviceBuffer partial((size_t)n * kSqBlocks * sizeof(double)), sums((size_t)n * sizeof(double));
+    for (int first = 0; first < n; first += kMaxGridY) {
+        dim3 grid(kSqBlocks, std::min(kMaxGridY, n - first));
+        k_sum_squares_partials<<<grid, kThreads>>>(list->as<uint64_t>(), n, first, partial.as<double>());
         CUDA_CHECK(cudaGetLastError());
     }
-    k_sum_squares_finish<<<(count + kThreads - 1) / kThreads, kThreads>>>(partial.as<double>(), sums.as<double>(), count);
+    k_sum_squares_finish<<<(n + kThreads - 1) / kThreads, kThreads>>>(partial.as<double>(), sums.as<double>(), n);
     CUDA_CHECK(cudaGetLastError());
-    std::vector<double> host(count);
-    CUDA_CHECK(cudaMemcpy(host.data(), sums.ptr, count * sizeof(double), cudaMemcpyDeviceToHost));
+    std::vector<double> host(n);
+    CUDA_CHECK(cudaMemcpy(host.data(), sums.ptr, n * sizeof(double), cudaMemcpyDeviceToHost));
     double total = 0.0;
     for (double v : host) total += v;
     return total;
 }
 
+void scale_buffers(const std::vector<float*>& buffers, const std::vector<int64_t>& sizes, float scale) {
+    int n = (int)buffers.size();
+    if (n == 0) return;
+    auto list = upload_buffer_list(buffers, sizes);
+    for (int first = 0; first < n; first += kMaxGridY) {
+        dim3 grid(scale_blocks(sizes), std::min(kMaxGridY, n - first));
+        k_scale_buffers<<<grid, kThreads>>>(list->as<uint64_t>(), n, first, scale, nullptr);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
 bool unscale_and_check(const std::vector<float*>& buffers, const std::vector<int64_t>& sizes, float inv_scale) {
-    if (buffers.empty()) return false;
+    int n = (int)buffers.size();
+    if (n == 0) return false;
+    auto list = upload_buffer_list(buffers, sizes);
     DeviceBuffer flag(sizeof(int));
     CUDA_CHECK(cudaMemset(flag.ptr, 0, sizeof(int)));
-    for (size_t b = 0; b < buffers.size(); ++b) {
-        if (sizes[b] == 0) continue;
-        k_unscale<<<grid_for(sizes[b]), kThreads>>>(buffers[b], sizes[b], inv_scale, flag.as<int>());
+    for (int first = 0; first < n; first += kMaxGridY) {
+        dim3 grid(scale_blocks(sizes), std::min(kMaxGridY, n - first));
+        k_scale_buffers<<<grid, kThreads>>>(list->as<uint64_t>(), n, first, inv_scale, flag.as<int>());
         CUDA_CHECK(cudaGetLastError());
     }
     int found = 0;

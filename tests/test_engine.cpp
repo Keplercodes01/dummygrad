@@ -1342,7 +1342,10 @@ static std::string workflow_clip_grad_norm() {
     float ga = download(a->grad)[0], gb = download(b->grad)[1];
     if (std::fabs(ga - 0.6f) > 1e-5f || std::fabs(gb - 0.8f) > 1e-5f) return "gradients not rescaled to norm 1";
     float unclipped = clip_grad_norm_({a, b}, 10.0f);
-    return std::fabs(unclipped - 1.0f) < 1e-4f ? "" : "a norm under the limit was changed";
+    if (std::fabs(unclipped - 1.0f) > 1e-4f) return "a norm under the limit was changed";
+    // A parameter listed twice (a tied weight in a hand-built list) counts once
+    float tied = clip_grad_norm_({a, a, b}, 10.0f);
+    return std::fabs(tied - 1.0f) < 1e-4f ? "" : "a parameter listed twice was counted twice: norm " + std::to_string(tied);
 }
 
 // Data-parallel reduction: every replica ends with the average (or sum) of all replicas' gradients,
