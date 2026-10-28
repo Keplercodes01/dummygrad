@@ -11,7 +11,8 @@
 // (Q, K, V, dO, P, dS) are rounded to half precision for tensor cores; scores, the softmax, lse
 // and every GEMM output stay fp32.
 //
-// Tiled path (longer sequences, head dims 16/32/64/128), whose memory stays linear in seq:
+// Tiled path (longer sequences, head dims up to 128; other sizes run zero-padded to 16/32/64/128),
+// whose memory stays linear in seq. Head dims above 128 take the GEMM path at every length:
 //
 // Forward: each query row is owned by a group of head_dim / 16 threads holding 16-element slices
 // in registers; K/V stream through shared memory in tiles while an online softmax accumulates the
@@ -303,7 +304,67 @@ void launch_backward(const float* q, const float* k, const float* v, const float
     CUDA_CHECK(cudaGetLastError());
 }
 
-bool tiled_supported(int D) { return D == 16 || D == 32 || D == 64 || D == 128; }
+// Smallest tiled head dim holding D (D <= 128). Other head dims run the tiled kernels on copies
+// zero-padded to it: zero columns add nothing to Q K^T and give zero output columns, so the
+// results (and lse) are exactly those of the unpadded problem.
+int padded_head_dim(int D) { return D <= 16 ? 16 : D <= 32 ? 32 : D <= 64 ? 64 : 128; }
+
+// rows of D floats -> rows of Dp floats, zeros past D
+void pad_rows(const float* src, float* dst, int64_t rows, int D, int Dp) {
+    CUDA_CHECK(cudaMemsetAsync(dst, 0, (size_t)rows * Dp * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy2DAsync(dst, (size_t)Dp * sizeof(float), src, (size_t)D * sizeof(float), (size_t)D * sizeof(float),
+                                 (size_t)rows, cudaMemcpyDeviceToDevice));
+}
+
+// rows of Dp floats -> their first D floats
+void unpad_rows(const float* src, float* dst, int64_t rows, int D, int Dp) {
+    CUDA_CHECK(cudaMemcpy2DAsync(dst, (size_t)D * sizeof(float), src, (size_t)Dp * sizeof(float), (size_t)D * sizeof(float),
+                                 (size_t)rows, cudaMemcpyDeviceToDevice));
+}
+
+void tiled_forward(const float* q, const float* k, const float* v, float* out, float* lse, int bh, int S, int D,
+                   bool causal, float scale) {
+    switch (D) {
+        case 16: launch_forward<16>(q, k, v, out, lse, bh, S, causal, scale); return;
+        case 32: launch_forward<32>(q, k, v, out, lse, bh, S, causal, scale); return;
+        case 64: launch_forward<64>(q, k, v, out, lse, bh, S, causal, scale); return;
+        case 128: launch_forward<128>(q, k, v, out, lse, bh, S, causal, scale); return;
+        default: break;
+    }
+    int Dp = padded_head_dim(D);
+    int64_t rows = (int64_t)bh * S;
+    size_t bytes = (size_t)rows * Dp * sizeof(float);
+    DeviceBuffer qp(bytes), kp(bytes), vp(bytes), op(bytes);
+    pad_rows(q, qp.f(), rows, D, Dp);
+    pad_rows(k, kp.f(), rows, D, Dp);
+    pad_rows(v, vp.f(), rows, D, Dp);
+    tiled_forward(qp.f(), kp.f(), vp.f(), op.f(), lse, bh, S, Dp, causal, scale);
+    unpad_rows(op.f(), out, rows, D, Dp);
+}
+
+// delta (rowwise dO . O) is computed by the caller from the unpadded tensors
+void tiled_backward(const float* q, const float* k, const float* v, const float* dout, const float* lse, const float* delta,
+                    float* dq, float* dk, float* dv, int bh, int S, int D, bool causal, float scale) {
+    switch (D) {
+        case 16: launch_backward<16>(q, k, v, dout, lse, delta, dq, dk, dv, bh, S, causal, scale); return;
+        case 32: launch_backward<32>(q, k, v, dout, lse, delta, dq, dk, dv, bh, S, causal, scale); return;
+        case 64: launch_backward<64>(q, k, v, dout, lse, delta, dq, dk, dv, bh, S, causal, scale); return;
+        case 128: launch_backward<128>(q, k, v, dout, lse, delta, dq, dk, dv, bh, S, causal, scale); return;
+        default: break;
+    }
+    int Dp = padded_head_dim(D);
+    int64_t rows = (int64_t)bh * S;
+    size_t bytes = (size_t)rows * Dp * sizeof(float);
+    DeviceBuffer qp(bytes), kp(bytes), vp(bytes), dop(bytes), dqp(bytes), dkp(bytes), dvp(bytes);
+    pad_rows(q, qp.f(), rows, D, Dp);
+    pad_rows(k, kp.f(), rows, D, Dp);
+    pad_rows(v, vp.f(), rows, D, Dp);
+    pad_rows(dout, dop.f(), rows, D, Dp);
+    tiled_backward(qp.f(), kp.f(), vp.f(), dop.f(), lse, delta, dqp.f(), dkp.f(), dvp.f(), bh, S, Dp, causal, scale);
+    unpad_rows(dqp.f(), dq, rows, D, Dp);
+    unpad_rows(dkp.f(), dk, rows, D, Dp);
+    unpad_rows(dvp.f(), dv, rows, D, Dp);
+}
 
 // ---------------------------------------------------------------------------------------------
 // GEMM path
@@ -485,9 +546,9 @@ AttentionImpl attention_forward(const float* q, const float* k, const float* v, 
                                 int batch, int heads, int seq_len, int head_dim, bool causal, float scale,
                                 DType compute) {
     int bh = batch * heads;
-    AttentionImpl impl = seq_len <= g_gemm_max_seq ? AttentionImpl::Gemm
-                       : tiled_supported(head_dim) ? AttentionImpl::Tiled
-                                                   : AttentionImpl::Untiled;
+    // Past the GEMM limit the tiled kernels keep memory linear in seq; head dims above their 128
+    // take the GEMM path anyway, a chunk of heads (at least one) at a time
+    AttentionImpl impl = (seq_len <= g_gemm_max_seq || head_dim > 128) ? AttentionImpl::Gemm : AttentionImpl::Tiled;
     if (bh == 0 || seq_len == 0) return impl;
     switch (impl) {
         case AttentionImpl::Gemm:
@@ -500,17 +561,8 @@ AttentionImpl attention_forward(const float* q, const float* k, const float* v, 
                 default: throw std::runtime_error("cuda::attention_forward: compute dtype must be Float32, Float16 or BFloat16");
             }
             break;
-        case AttentionImpl::Untiled:
-            // Other head sizes at long lengths; writes no lse, its backward recomputes the statistics
-            flash_attention_forward(q, k, v, out, batch, heads, seq_len, head_dim, causal, scale);
-            break;
         case AttentionImpl::Tiled:
-            switch (head_dim) {
-                case 16: launch_forward<16>(q, k, v, out, lse, bh, seq_len, causal, scale); break;
-                case 32: launch_forward<32>(q, k, v, out, lse, bh, seq_len, causal, scale); break;
-                case 64: launch_forward<64>(q, k, v, out, lse, bh, seq_len, causal, scale); break;
-                default: launch_forward<128>(q, k, v, out, lse, bh, seq_len, causal, scale); break;
-            }
+            tiled_forward(q, k, v, out, lse, bh, seq_len, head_dim, causal, scale);
             break;
     }
     return impl;
@@ -522,10 +574,6 @@ void attention_backward(const float* q, const float* k, const float* v, const fl
                         DType compute) {
     int bh = batch * heads;
     if (bh == 0 || seq_len == 0) return;
-    if (impl == AttentionImpl::Untiled) {
-        flash_attention_backward(q, k, v, out, dout, dq, dk, dv, batch, heads, seq_len, head_dim, causal, scale);
-        return;
-    }
     int64_t rows = (int64_t)bh * seq_len;
     DeviceBuffer delta((size_t)rows * sizeof(float));
     k_attention_delta<<<(unsigned)((rows * 32 + 255) / 256), 256>>>(out, dout, delta.f(), rows, head_dim);
@@ -546,12 +594,7 @@ void attention_backward(const float* q, const float* k, const float* v, const fl
         }
         return;
     }
-    switch (head_dim) {
-        case 16: launch_backward<16>(q, k, v, dout, lse, delta.f(), dq, dk, dv, bh, seq_len, causal, scale); break;
-        case 32: launch_backward<32>(q, k, v, dout, lse, delta.f(), dq, dk, dv, bh, seq_len, causal, scale); break;
-        case 64: launch_backward<64>(q, k, v, dout, lse, delta.f(), dq, dk, dv, bh, seq_len, causal, scale); break;
-        default: launch_backward<128>(q, k, v, dout, lse, delta.f(), dq, dk, dv, bh, seq_len, causal, scale); break;
-    }
+    tiled_backward(q, k, v, dout, lse, delta.f(), dq, dk, dv, bh, seq_len, head_dim, causal, scale);
 }
 
 }  // namespace cuda

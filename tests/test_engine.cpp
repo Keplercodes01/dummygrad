@@ -391,8 +391,9 @@ static std::vector<GradTest> build_grad_tests() {
 
     // Multi-head attention. Leaves: x, then (W, b) for q, k, v, o. Weights scale with 1/sqrt(d_model)
     // so the softmax stays smooth. On CUDA these short sequences take the GEMM path; main() runs them
-    // again on the tiled kernels (head dims 16/32/64/128, with sequence lengths that cross their tile
-    // and block boundaries) and the untiled ones (other head dims).
+    // again past the GEMM limit: the tiled kernels (head dims 16/32/64/128, with sequence lengths that
+    // cross their tile and block boundaries; other head dims up to 128 zero-padded) and, above 128,
+    // the GEMM path a chunk of heads at a time.
     auto attention_test = [&](const std::string& name, int d_model, int n_heads, int n_kv_heads, bool use_rope,
                               int batch, int seq) {
         auto mha = std::make_shared<MultiHeadAttention>(d_model, n_heads, n_kv_heads, true);
@@ -426,6 +427,8 @@ static std::vector<GradTest> build_grad_tests() {
     attention_test("attention_d32_gqa_rope", 128, 4, 2, true, 2, 37);
     attention_test("attention_d64", 128, 2, 0, false, 2, 20);
     attention_test("attention_d128_two_blocks", 256, 2, 0, false, 1, 40);
+    attention_test("attention_d48_padded", 96, 2, 0, true, 1, 9);
+    attention_test("attention_d160", 320, 2, 0, false, 1, 9);
 
     // --- Shape ops ---
     add_test("concat_rows", {leaf({2, 3, 4}), leaf({2, 2, 4})},

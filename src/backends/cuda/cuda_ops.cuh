@@ -183,12 +183,13 @@ namespace cuda {
     // ---- cuda_attention.cu: attention (cuBLAS GEMM path or tiled kernels, deterministic backward) ----
     // q, k, v, out, dout, dq, dk, dv are [batch * heads, seq_len, head_dim]; lse is [batch * heads, seq_len].
     // seq_len <= attention_gemm_max_seq() runs as batched GEMMs (any head dim); longer sequences use the
-    // tiled kernels for head dims 16/32/64/128 and the untiled flash kernels otherwise. Forward returns
-    // the implementation it used; pass it to backward, which needs the matching saved statistics.
+    // tiled kernels (head dims up to 128, zero-padded to 16/32/64/128), or the GEMM path a chunk of
+    // heads at a time for larger head dims. Every path is deterministic. Forward returns the
+    // implementation it used; pass it to backward.
     // compute (see AutocastGuard) is the precision of the GEMM path's products: Float16/BFloat16 round
     // Q, K, V, dO and the probabilities P / score gradients dS for tensor cores, while scores, softmax,
-    // lse and every output stay fp32. The tiled and untiled kernels always compute in fp32.
-    enum class AttentionImpl { Gemm, Tiled, Untiled };
+    // lse and every output stay fp32. The tiled kernels always compute in fp32.
+    enum class AttentionImpl { Gemm, Tiled };
     // Longest sequence that takes the GEMM path (default 2048). The GEMM path materializes [seq, seq]
     // scores for a chunk of heads (at most 256 MB); 0 forces the tiled kernels, whose memory is linear in seq.
     void set_attention_gemm_max_seq(int seq_len);
@@ -206,17 +207,6 @@ namespace cuda {
                       float* out, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos);
     void rope_backward(const float* grad_out, const float* cos_freqs, const float* sin_freqs,
                        float* grad_in, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos);
-
-    // Frontier Tiled FlashAttention (Online Softmax, O(N) memory)
-    void flash_attention_forward(const float* q, const float* k, const float* v,
-                                 float* out,
-                                 int batch_size, int num_heads, int seq_len, int d_k,
-                                 bool causal, float scale);
-    void flash_attention_backward(const float* q, const float* k, const float* v,
-                                  const float* out, const float* grad_out,
-                                  float* grad_q, float* grad_k, float* grad_v,
-                                  int batch_size, int num_heads, int seq_len, int d_k,
-                                  bool causal, float scale);
 
     // Epilogue Fusion: Fused Bias + Activation
     void add_bias(float* data, const float* bias, int rows, int cols);
