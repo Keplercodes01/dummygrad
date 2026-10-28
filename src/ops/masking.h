@@ -38,17 +38,19 @@ struct SlidingWindowMaskBackward : public Node {
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
         if (grads.empty() || !grads[0]) return {nullptr};
         auto self_grad = grads[0];
+        // Every element is written below, so no zero fill (the Metal kernel's coverage is not relied on)
         auto ga = std::make_shared<Tensor>(self_grad->shape, self_grad->device, self_grad->dtype, false);
-        ga->fill_(0.0f);
 
 #ifdef USE_CUDA
         if (self_grad->device == Device::CUDA) {
             cuda::sliding_window_mask_backward(self_grad->data_ptr<float>(), ga->data_ptr<float>(),
-                                               batch_size, r, window_size);
+                                               batch_size, r, c, window_size);
             return {ga};
         }
 #endif
-        if (self_grad->device == Device::MPS) {
+        // The Metal kernel handles square scores only
+        if (self_grad->device == Device::MPS && r == c) {
+            ga->fill_(0.0f);
             MetalBackend::get().sliding_window_mask_backward(self_grad->data_ptr<float>(), ga->data_ptr<float>(),
                                                              batch_size, r, window_size);
             return {ga};
@@ -89,7 +91,7 @@ inline std::shared_ptr<Tensor> sliding_window_mask(const std::shared_ptr<Tensor>
 
 #ifdef USE_CUDA
     if (scores->device == Device::CUDA) {
-        cuda::sliding_window_mask(scores->data_ptr<float>(), out->data_ptr<float>(), batch_size, r, window_size);
+        cuda::sliding_window_mask(scores->data_ptr<float>(), out->data_ptr<float>(), batch_size, r, c, window_size);
         if (req_grad) {
             auto grad_fn = std::make_shared<SlidingWindowMaskBackward>(r, c, batch_size, window_size);
             grad_fn->add_next_edge(get_grad_edge(scores).function);
@@ -98,7 +100,7 @@ inline std::shared_ptr<Tensor> sliding_window_mask(const std::shared_ptr<Tensor>
         return out;
     }
 #endif
-    if (scores->device == Device::MPS) {
+    if (scores->device == Device::MPS && r == c) {
         MetalBackend::get().sliding_window_mask(scores->data_ptr<float>(), out->data_ptr<float>(),
                                                 batch_size, r, window_size);
         if (req_grad) {
@@ -144,12 +146,11 @@ struct PrefixCausalMaskBackward : public Node {
         if (grads.empty() || !grads[0]) return {nullptr};
         auto self_grad = grads[0];
         auto ga = std::make_shared<Tensor>(self_grad->shape, self_grad->device, self_grad->dtype, false);
-        ga->fill_(0.0f);
 
 #ifdef USE_CUDA
         if (self_grad->device == Device::CUDA) {
             cuda::prefix_causal_mask_backward(self_grad->data_ptr<float>(), ga->data_ptr<float>(),
-                                              batch_size, r, prefix_len);
+                                              batch_size, r, c, prefix_len);
             return {ga};
         }
 #endif
@@ -188,7 +189,7 @@ inline std::shared_ptr<Tensor> prefix_causal_mask(const std::shared_ptr<Tensor>&
 
 #ifdef USE_CUDA
     if (scores->device == Device::CUDA) {
-        cuda::prefix_causal_mask(scores->data_ptr<float>(), out->data_ptr<float>(), batch_size, r, prefix_len);
+        cuda::prefix_causal_mask(scores->data_ptr<float>(), out->data_ptr<float>(), batch_size, r, c, prefix_len);
         if (req_grad) {
             auto grad_fn = std::make_shared<PrefixCausalMaskBackward>(r, c, batch_size, prefix_len);
             grad_fn->add_next_edge(get_grad_edge(scores).function);

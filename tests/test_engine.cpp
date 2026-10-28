@@ -451,6 +451,13 @@ static std::vector<GradTest> build_grad_tests() {
              [](const Leaves& L, Device) { return softmax(masking::sliding_window_mask(L[0], 2)); });
     add_test("prefix_causal_mask", {leaf({2, 5, 5})},
              [](const Leaves& L, Device) { return softmax(masking::prefix_causal_mask(L[0], 2)); });
+    // Fewer queries than keys and the reverse (the CUDA kernels used to assume square scores)
+    add_test("causal_mask_wide", {leaf({2, 3, 5})}, [](const Leaves& L, Device) { return softmax(causal_mask(L[0])); });
+    add_test("causal_mask_tall", {leaf({2, 5, 3})}, [](const Leaves& L, Device) { return softmax(causal_mask(L[0])); });
+    add_test("sliding_window_mask_wide", {leaf({2, 3, 6})},
+             [](const Leaves& L, Device) { return softmax(masking::sliding_window_mask(L[0], 1)); });
+    add_test("prefix_causal_mask_tall", {leaf({2, 5, 3})},
+             [](const Leaves& L, Device) { return softmax(masking::prefix_causal_mask(L[0], 2)); });
 
     // --- More losses & affine ---
     {

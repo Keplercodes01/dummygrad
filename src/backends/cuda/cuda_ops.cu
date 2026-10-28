@@ -132,65 +132,59 @@ __global__ void k_tanh_backward(const float* out, const float* grad_out, float* 
     }
 }
 
-__global__ void k_causal_mask(const float* in, float* out, int total_rows, int seq_len) {
+__global__ void k_causal_mask(const float* in, float* out, int64_t total_elements, int rows, int cols) {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total_elements = (int64_t)total_rows * seq_len;
     if (idx < total_elements) {
-        int col = idx % seq_len;
-        int row = (idx / seq_len) % seq_len;
+        int col = (int)(idx % cols);
+        int row = (int)((idx / cols) % rows);
         out[idx] = (col > row) ? -1e9f : in[idx];
     }
 }
 
-__global__ void k_causal_mask_backward(const float* grad_out, float* grad_in, int total_rows, int seq_len) {
+__global__ void k_causal_mask_backward(const float* grad_out, float* grad_in, int64_t total_elements, int rows, int cols) {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total_elements = (int64_t)total_rows * seq_len;
     if (idx < total_elements) {
-        int col = idx % seq_len;
-        int row = (idx / seq_len) % seq_len;
+        int col = (int)(idx % cols);
+        int row = (int)((idx / cols) % rows);
         grad_in[idx] = (col <= row) ? grad_out[idx] : 0.0f;
     }
 }
 
-__global__ void k_sliding_window_mask(const float* in, float* out, int total_rows, int seq_len, int window_size) {
+__global__ void k_sliding_window_mask(const float* in, float* out, int64_t total_elements, int rows, int cols, int window_size) {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total_elements = (int64_t)total_rows * seq_len;
     if (idx < total_elements) {
-        int col = idx % seq_len;
-        int row = (idx / seq_len) % seq_len;
+        int col = (int)(idx % cols);
+        int row = (int)((idx / cols) % rows);
         bool valid = (col <= row) && (row - col <= window_size);
         out[idx] = valid ? in[idx] : -1e9f;
     }
 }
 
-__global__ void k_sliding_window_mask_backward(const float* grad_out, float* grad_in, int total_rows, int seq_len, int window_size) {
+__global__ void k_sliding_window_mask_backward(const float* grad_out, float* grad_in, int64_t total_elements, int rows, int cols, int window_size) {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total_elements = (int64_t)total_rows * seq_len;
     if (idx < total_elements) {
-        int col = idx % seq_len;
-        int row = (idx / seq_len) % seq_len;
+        int col = (int)(idx % cols);
+        int row = (int)((idx / cols) % rows);
         bool valid = (col <= row) && (row - col <= window_size);
         grad_in[idx] = valid ? grad_out[idx] : 0.0f;
     }
 }
 
-__global__ void k_prefix_causal_mask(const float* in, float* out, int total_rows, int seq_len, int prefix_len) {
+__global__ void k_prefix_causal_mask(const float* in, float* out, int64_t total_elements, int rows, int cols, int prefix_len) {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total_elements = (int64_t)total_rows * seq_len;
     if (idx < total_elements) {
-        int col = idx % seq_len;
-        int row = (idx / seq_len) % seq_len;
+        int col = (int)(idx % cols);
+        int row = (int)((idx / cols) % rows);
         bool valid = (row < prefix_len) ? (col < prefix_len) : (col <= row);
         out[idx] = valid ? in[idx] : -1e9f;
     }
 }
 
-__global__ void k_prefix_causal_mask_backward(const float* grad_out, float* grad_in, int total_rows, int seq_len, int prefix_len) {
+__global__ void k_prefix_causal_mask_backward(const float* grad_out, float* grad_in, int64_t total_elements, int rows, int cols, int prefix_len) {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total_elements = (int64_t)total_rows * seq_len;
     if (idx < total_elements) {
-        int col = idx % seq_len;
-        int row = (idx / seq_len) % seq_len;
+        int col = (int)(idx % cols);
+        int row = (int)((idx / cols) % rows);
         bool valid = (row < prefix_len) ? (col < prefix_len) : (col <= row);
         grad_in[idx] = valid ? grad_out[idx] : 0.0f;
     }
@@ -775,51 +769,57 @@ void softmax_backward(const float* out, const float* grad_out, float* grad_in, i
     CUDA_CHECK(cudaGetLastError());
 }
 
-void causal_mask(const float* in, float* out, int batch, int seq_len) {
-    int64_t total = (int64_t)batch * seq_len * seq_len;
+void causal_mask(const float* in, float* out, int batch, int rows, int cols) {
+    int64_t total = (int64_t)batch * rows * cols;
+    if (total == 0) return;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    k_causal_mask<<<blocks, threads>>>(in, out, batch * seq_len, seq_len);
+    k_causal_mask<<<blocks, threads>>>(in, out, total, rows, cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void causal_mask_backward(const float* grad_out, float* grad_in, int batch, int seq_len) {
-    int64_t total = (int64_t)batch * seq_len * seq_len;
+void causal_mask_backward(const float* grad_out, float* grad_in, int batch, int rows, int cols) {
+    int64_t total = (int64_t)batch * rows * cols;
+    if (total == 0) return;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    k_causal_mask_backward<<<blocks, threads>>>(grad_out, grad_in, batch * seq_len, seq_len);
+    k_causal_mask_backward<<<blocks, threads>>>(grad_out, grad_in, total, rows, cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void sliding_window_mask(const float* in, float* out, int batch, int seq_len, int window_size) {
-    int64_t total = (int64_t)batch * seq_len * seq_len;
+void sliding_window_mask(const float* in, float* out, int batch, int rows, int cols, int window_size) {
+    int64_t total = (int64_t)batch * rows * cols;
+    if (total == 0) return;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    k_sliding_window_mask<<<blocks, threads>>>(in, out, batch * seq_len, seq_len, window_size);
+    k_sliding_window_mask<<<blocks, threads>>>(in, out, total, rows, cols, window_size);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void sliding_window_mask_backward(const float* grad_out, float* grad_in, int batch, int seq_len, int window_size) {
-    int64_t total = (int64_t)batch * seq_len * seq_len;
+void sliding_window_mask_backward(const float* grad_out, float* grad_in, int batch, int rows, int cols, int window_size) {
+    int64_t total = (int64_t)batch * rows * cols;
+    if (total == 0) return;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    k_sliding_window_mask_backward<<<blocks, threads>>>(grad_out, grad_in, batch * seq_len, seq_len, window_size);
+    k_sliding_window_mask_backward<<<blocks, threads>>>(grad_out, grad_in, total, rows, cols, window_size);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void prefix_causal_mask(const float* in, float* out, int batch, int seq_len, int prefix_len) {
-    int64_t total = (int64_t)batch * seq_len * seq_len;
+void prefix_causal_mask(const float* in, float* out, int batch, int rows, int cols, int prefix_len) {
+    int64_t total = (int64_t)batch * rows * cols;
+    if (total == 0) return;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    k_prefix_causal_mask<<<blocks, threads>>>(in, out, batch * seq_len, seq_len, prefix_len);
+    k_prefix_causal_mask<<<blocks, threads>>>(in, out, total, rows, cols, prefix_len);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void prefix_causal_mask_backward(const float* grad_out, float* grad_in, int batch, int seq_len, int prefix_len) {
-    int64_t total = (int64_t)batch * seq_len * seq_len;
+void prefix_causal_mask_backward(const float* grad_out, float* grad_in, int batch, int rows, int cols, int prefix_len) {
+    int64_t total = (int64_t)batch * rows * cols;
+    if (total == 0) return;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    k_prefix_causal_mask_backward<<<blocks, threads>>>(grad_out, grad_in, batch * seq_len, seq_len, prefix_len);
+    k_prefix_causal_mask_backward<<<blocks, threads>>>(grad_out, grad_in, total, rows, cols, prefix_len);
     CUDA_CHECK(cudaGetLastError());
 }
 

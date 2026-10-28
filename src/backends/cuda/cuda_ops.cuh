@@ -68,16 +68,16 @@ namespace cuda {
     void tanh_forward(const float* in, float* out, int64_t size);
     void tanh_backward(const float* out, const float* grad_out, float* grad_in, int64_t size);
 
-    // Normalizations & Masking
+    // Normalizations & Masking. Masks act on [batch, rows, cols] scores: key j > query i is masked
     void softmax_forward(const float* in, float* out, int rows, int cols);
     void softmax_backward(const float* out, const float* grad_out, float* grad_in, int rows, int cols);
 
-    void causal_mask(const float* in, float* out, int batch, int seq_len);
-    void causal_mask_backward(const float* grad_out, float* grad_in, int batch, int seq_len);
-    void sliding_window_mask(const float* in, float* out, int batch, int seq_len, int window_size);
-    void sliding_window_mask_backward(const float* grad_out, float* grad_in, int batch, int seq_len, int window_size);
-    void prefix_causal_mask(const float* in, float* out, int batch, int seq_len, int prefix_len);
-    void prefix_causal_mask_backward(const float* grad_out, float* grad_in, int batch, int seq_len, int prefix_len);
+    void causal_mask(const float* in, float* out, int batch, int rows, int cols);
+    void causal_mask_backward(const float* grad_out, float* grad_in, int batch, int rows, int cols);
+    void sliding_window_mask(const float* in, float* out, int batch, int rows, int cols, int window_size);
+    void sliding_window_mask_backward(const float* grad_out, float* grad_in, int batch, int rows, int cols, int window_size);
+    void prefix_causal_mask(const float* in, float* out, int batch, int rows, int cols, int prefix_len);
+    void prefix_causal_mask_backward(const float* grad_out, float* grad_in, int batch, int rows, int cols, int prefix_len);
 
     // ---- cuda_core_ops.cu: deterministic training-step kernels ----
 
