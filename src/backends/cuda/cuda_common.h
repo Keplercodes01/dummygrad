@@ -79,37 +79,4 @@ inline void gemm_strided_batched(cublasOperation_t op_a, cublasOperation_t op_b,
     }
 }
 
-// -------------------------------------------------------------
-// CUDA Graph Execution (Hardware-level step capture & replay)
-// Eliminates 100% of CPU dispatch latency across training steps
-// -------------------------------------------------------------
-struct CUDAGraph {
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t instance = nullptr;
-    bool is_captured = false;
-
-    void begin_capture(cudaStream_t stream = nullptr) {
-        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-        is_captured = false;
-    }
-
-    void end_capture(cudaStream_t stream = nullptr) {
-        CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
-        CUDA_CHECK(cudaGraphInstantiate(&instance, graph, nullptr, nullptr, 0));
-        is_captured = true;
-    }
-
-    void replay(cudaStream_t stream = nullptr) {
-        if (!is_captured || !instance) {
-            throw std::runtime_error("CUDAGraph: graph not captured yet");
-        }
-        CUDA_CHECK(cudaGraphLaunch(instance, stream));
-    }
-
-    ~CUDAGraph() {
-        if (instance) cudaGraphExecDestroy(instance);
-        if (graph) cudaGraphDestroy(graph);
-    }
-};
-
 #endif

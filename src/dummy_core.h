@@ -8,7 +8,6 @@
 #include "core/autocast.h"
 #include "core/utils.h"
 #include "core/init.h"
-#include "core/dummy_ptr.h"
 #include "core/dummy_wrappers.h"
 
 // 2. Autograd DAG & Engine

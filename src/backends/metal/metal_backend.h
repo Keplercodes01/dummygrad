@@ -4,8 +4,9 @@
 #include <string>
 #include "core/types.h"
 
-// Pure C++ Interface for Apple Silicon Metal & MPS Acceleration
-// Zero-overhead dispatch to Apple Matrix Coprocessor (AMX) and Apple GPUs
+// Metal kernels for the MPS device. MPS tensors live in unified memory shared with the CPU; a few
+// elementwise ops, masks, loss gradients and AdamW run as Metal kernels here, and everything else
+// (matmuls included) computes on the CPU over the same memory.
 class MetalBackend {
 public:
     static MetalBackend& get();
@@ -18,29 +19,6 @@ public:
     // Zero-Copy Unified Memory Allocation (CPU and GPU share physical address space)
     virtual void* allocate_shared_buffer(size_t bytes) = 0;
     virtual void free_buffer(void* ptr, size_t bytes) = 0;
-
-    // Apple MPS Matrix Multiplication (AMX Hardware Accelerated)
-    virtual void matmul(
-        const float* A, const float* B, float* C,
-        int64_t M, int64_t K, int64_t N
-    ) = 0;
-
-    // Fused Bias + Activation Kernels
-    virtual void fused_add_bias_gelu(
-        const float* in, const float* bias, float* out,
-        size_t total_elems, size_t cols
-    ) = 0;
-
-    virtual void fused_add_bias_relu(
-        const float* in, const float* bias, float* out,
-        size_t total_elems, size_t cols
-    ) = 0;
-
-    // Fused LayerNorm with SIMD-Group Reductions
-    virtual void layernorm(
-        const float* in, const float* gamma, const float* beta, float* out,
-        size_t rows, size_t cols, float eps = 1e-5f
-    ) = 0;
 
     // Fused AdamW Optimizer
     virtual void adamw(
@@ -63,12 +41,6 @@ public:
     virtual void mse_backward(const float* pred, const float* target, float* grad_pred, size_t size, float scale) = 0;
     virtual void l1_loss_backward(const float* pred, const float* target, float* grad_pred, size_t size, float scale) = 0;
 
-    // Tiled FlashAttention Forward Pass
-    virtual void flash_attention(
-        const float* Q, const float* K, const float* V, float* Out,
-        size_t num_heads, size_t seq_len, size_t head_dim
-    ) = 0;
-
     // Attention & Modern Masking
     virtual void causal_mask(const float* in, float* out, size_t batch, size_t seq_len) = 0;
     virtual void causal_mask_backward(const float* grad_out, float* grad_in, size_t batch, size_t seq_len) = 0;
@@ -86,10 +58,6 @@ inline MetalBackend& MetalBackend::get() {
         std::string device_name() const override { return "Metal unavailable (built without USE_METAL)"; }
         void* allocate_shared_buffer(size_t) override { throw std::runtime_error("MetalBackend not supported on non-Apple platform"); }
         void free_buffer(void*, size_t) override {}
-        void matmul(const float*, const float*, float*, int64_t, int64_t, int64_t) override { throw std::runtime_error("MetalBackend not supported on non-Apple platform"); }
-        void fused_add_bias_gelu(const float*, const float*, float*, size_t, size_t) override {}
-        void fused_add_bias_relu(const float*, const float*, float*, size_t, size_t) override {}
-        void layernorm(const float*, const float*, const float*, float*, size_t, size_t, float) override {}
         void adamw(float*, const float*, float*, float*, size_t, float, float, float, float, float, int) override {}
         void sigmoid_forward(const float*, float*, size_t) override {}
         void sigmoid_backward(const float*, const float*, float*, size_t) override {}
@@ -99,7 +67,6 @@ inline MetalBackend& MetalBackend::get() {
         void leaky_relu_backward(const float*, const float*, float*, size_t, float) override {}
         void mse_backward(const float*, const float*, float*, size_t, float) override {}
         void l1_loss_backward(const float*, const float*, float*, size_t, float) override {}
-        void flash_attention(const float*, const float*, const float*, float*, size_t, size_t, size_t) override {}
         void causal_mask(const float*, float*, size_t, size_t) override {}
         void causal_mask_backward(const float*, float*, size_t, size_t) override {}
         void sliding_window_mask(const float*, float*, size_t, size_t, size_t) override {}

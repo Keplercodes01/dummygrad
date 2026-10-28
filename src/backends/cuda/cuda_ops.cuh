@@ -208,11 +208,6 @@ namespace cuda {
     void rope_backward(const float* grad_out, const float* cos_freqs, const float* sin_freqs,
                        float* grad_in, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos);
 
-    // Epilogue Fusion: Fused Bias + Activation
-    void add_bias(float* data, const float* bias, int rows, int cols);
-    void add_bias_and_gelu(const float* in, const float* bias, float* out, int rows, int cols);
-    void add_bias_and_relu(const float* in, const float* bias, float* out, int rows, int cols);
-
     // Fused AdamW optimizer update
     void adamw_step(float* param, const float* grad, float* m, float* v,
                     float lr, float beta1, float beta2, float eps, float weight_decay,

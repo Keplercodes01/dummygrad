@@ -190,39 +190,6 @@ __global__ void k_prefix_causal_mask_backward(const float* grad_out, float* grad
     }
 }
 
-// Fused Bias and Activations
-__global__ void k_add_bias(float* data, const float* bias, int rows, int cols) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = (int64_t)rows * cols;
-    if (idx < total) {
-        int c = idx % cols;
-        data[idx] += bias[c];
-    }
-}
-
-__global__ void k_add_bias_and_gelu(const float* in, const float* bias, float* out, int rows, int cols) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = (int64_t)rows * cols;
-    if (idx < total) {
-        int c = idx % cols;
-        float x = in[idx] + bias[c];
-        const float sqrt_2_over_pi = 0.7978845608f;
-        const float coeff = 0.044715f;
-        float inner = sqrt_2_over_pi * (x + coeff * x * x * x);
-        out[idx] = 0.5f * x * (1.0f + tanhf(inner));
-    }
-}
-
-__global__ void k_add_bias_and_relu(const float* in, const float* bias, float* out, int rows, int cols) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = (int64_t)rows * cols;
-    if (idx < total) {
-        int c = idx % cols;
-        float x = in[idx] + bias[c];
-        out[idx] = x > 0.0f ? x : 0.0f;
-    }
-}
-
 __global__ void k_softmax_forward(const float* in, float* out, int rows, int cols) {
     int row = blockIdx.x;
     if (row >= rows) return;
@@ -651,30 +618,6 @@ void prefix_causal_mask_backward(const float* grad_out, float* grad_in, int batc
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     k_prefix_causal_mask_backward<<<blocks, threads>>>(grad_out, grad_in, total, rows, cols, prefix_len);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void add_bias(float* data, const float* bias, int rows, int cols) {
-    int64_t total = (int64_t)rows * cols;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    k_add_bias<<<blocks, threads>>>(data, bias, rows, cols);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void add_bias_and_gelu(const float* in, const float* bias, float* out, int rows, int cols) {
-    int64_t total = (int64_t)rows * cols;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    k_add_bias_and_gelu<<<blocks, threads>>>(in, bias, out, rows, cols);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void add_bias_and_relu(const float* in, const float* bias, float* out, int rows, int cols) {
-    int64_t total = (int64_t)rows * cols;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    k_add_bias_and_relu<<<blocks, threads>>>(in, bias, out, rows, cols);
     CUDA_CHECK(cudaGetLastError());
 }
 

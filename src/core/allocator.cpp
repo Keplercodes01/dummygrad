@@ -114,20 +114,12 @@ void CUDACachingAllocator::empty_cache() {
 MemoryStats cuda_memory_stats() { return CUDACachingAllocator::get().memory_stats(); }
 void reset_peak_memory_stats() { CUDACachingAllocator::get().reset_peak(); }
 
-static thread_local bool g_arena_active = false;
-
-void set_arena_active(bool active) { g_arena_active = active; }
-bool is_arena_active() { return g_arena_active; }
-
 // Device dispatcher for memory requests
 void* get_memory(Device device, size_t bytes) {
     if (device == Device::CPU || device == Device::TPU) {
         return CPUCachingAllocator::get().allocate(bytes);
     }
     if (device == Device::CUDA) {
-        if (is_arena_active()) {
-            return CUDAScratchpadArena::get().allocate(bytes);
-        }
         return CUDACachingAllocator::get().allocate(bytes);
     }
     if (device == Device::MPS) {
@@ -142,9 +134,6 @@ void free_memory(Device device, void* ptr, size_t bytes) {
     if (device == Device::CPU || device == Device::TPU) {
         CPUCachingAllocator::get().free(ptr, bytes);
     } else if (device == Device::CUDA) {
-        if (CUDAScratchpadArena::get().contains(ptr)) {
-            return; // Managed by static scratchpad arena: instant zero-cost reset at step boundary!
-        }
         CUDACachingAllocator::get().free(ptr, bytes);
     } else if (device == Device::MPS) {
         if (!MetalBackend::get().is_available()) {
@@ -153,51 +142,4 @@ void free_memory(Device device, void* ptr, size_t bytes) {
             MetalBackend::get().free_buffer(ptr, bytes);
         }
     }
-}
-
-// -------------------------------------------------------------
-// CUDAScratchpadArena Implementation
-// -------------------------------------------------------------
-void CUDAScratchpadArena::init(size_t total_bytes) {
-    std::lock_guard<std::mutex> lock(mtx);
-#ifdef USE_CUDA
-    if (base_ptr) {
-        cudaFree(base_ptr);
-        base_ptr = nullptr;
-    }
-    capacity = (total_bytes + 511) & ~511;
-    offset = 0;
-    cudaError_t err = cudaMalloc(&base_ptr, capacity);
-    if (err != cudaSuccess || !base_ptr) {
-        throw std::runtime_error("CUDAScratchpadArena: failed to allocate " + std::to_string(capacity) + " bytes on GPU");
-    }
-#else
-    (void)total_bytes;
-#endif
-}
-
-void* CUDAScratchpadArena::allocate(size_t bytes) {
-    std::lock_guard<std::mutex> lock(mtx);
-    size_t aligned = (bytes + 511) & ~511;
-    if (offset + aligned > capacity) {
-        throw std::runtime_error("CUDAScratchpadArena out of memory: requested " + std::to_string(aligned) +
-                                 ", remaining " + std::to_string(capacity - offset));
-    }
-    void* res = static_cast<char*>(base_ptr) + offset;
-    offset += aligned;
-    return res;
-}
-
-void CUDAScratchpadArena::reset() {
-    std::lock_guard<std::mutex> lock(mtx);
-    offset = 0;
-}
-
-CUDAScratchpadArena::~CUDAScratchpadArena() {
-#ifdef USE_CUDA
-    if (base_ptr) {
-        cudaFree(base_ptr);
-        base_ptr = nullptr;
-    }
-#endif
 }
