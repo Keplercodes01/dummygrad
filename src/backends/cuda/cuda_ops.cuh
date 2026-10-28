@@ -122,6 +122,13 @@ namespace cuda {
     void repeat_kv_forward(const float* in, float* out, int64_t batch, int64_t kv_heads, int64_t group, int64_t head_elems);
     void repeat_kv_backward(const float* grad, float* gin, int64_t batch, int64_t kv_heads, int64_t group, int64_t head_elems);
 
+    // 2-D max pooling (no padding) over planes = B * C of [H, W]. argmax receives each window's
+    // winning offset kh * kW + kw as a float (-1 if all NaN); backward gathers deterministically.
+    void max_pool2d_forward(const float* x, float* out, float* argmax, int64_t planes, int H, int W, int H_out, int W_out,
+                            int kH, int kW, int sH, int sW);
+    void max_pool2d_backward(const float* grad, const float* argmax, float* gx, int64_t planes, int H, int W, int H_out,
+                             int W_out, int kH, int kW, int sH, int sW);
+
     // Column sums of a row-major [rows, cols] gradient: a Linear's bias gradient. Deterministic, and
     // bit-identical to the broadcast-add backward it replaces.
     void bias_grad(const float* grad, float* db, int64_t rows, int64_t cols);

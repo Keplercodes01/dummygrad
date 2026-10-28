@@ -1047,6 +1047,26 @@ static std::string module_modes_and_zero_grad() {
     return "";
 }
 
+// max_pool2d on an input of more than 2^24 elements: the winner of the last window sits at an odd
+// flat index above 2^24, which a float flat index (the old representation) cannot hold
+static std::string max_pool2d_large_input() {
+    const int64_t n = 4097;
+    auto x = std::make_shared<Tensor>(std::vector<int64_t>{1, 1, n, n}, Device::CPU, DType::Float32, true);
+    x->fill_(0.0f);
+    const int64_t winner = 4095 * n + 4094;  // 16781309
+    x->data_ptr<float>()[winner] = 1.0f;
+    auto out = max_pool2d(x, 2, 2, 2, 2);
+    if (out->data_ptr<float>()[out->size() - 1] != 1.0f) return "the last window's maximum is wrong";
+    scalar_sum(out)->backward();
+    float g = x->grad->data_ptr<float>()[winner];
+    float neighbour = x->grad->data_ptr<float>()[winner - 1];
+    if (g != 1.0f || neighbour != 0.0f) {
+        return "the gradient went to the wrong element (" + std::to_string(g) + " at the winner, " +
+               std::to_string(neighbour) + " next to it)";
+    }
+    return "";
+}
+
 // Out-of-range token ids must throw, never index memory: ids given on the host in forward, ids
 // already on the GPU in backward (before the gradient kernel writes their rows)
 static std::string embedding_rejects_bad_ids(Device dev) {
@@ -2037,6 +2057,7 @@ int main() {
     run_case(r, "module/strict_loading", module_strict_loading);
     run_case(r, "module/to_tied_and_frozen", module_to_tied_and_frozen);
     run_case(r, "module/modes_and_zero_grad", module_modes_and_zero_grad);
+    run_case(r, "module/max_pool2d_large_input", max_pool2d_large_input);
     run_case(r, "module/embedding_rejects_bad_ids", [] { return embedding_rejects_bad_ids(Device::CPU); });
     if (has_cuda) run_case(r, "module/embedding_rejects_bad_ids_cuda", [] { return embedding_rejects_bad_ids(Device::CUDA); });
 

@@ -502,6 +502,63 @@ __global__ void k_repeat_kv_backward(const float* grad, float* gin, int64_t batc
 }
 
 // ---------------------------------------------------------------------------------------------
+// 2-D max pooling over planes of [H, W]; argmax holds each window's winning offset kh * kW + kw
+// (-1 when every value was NaN). Mirrors maxpool_detail in nn/maxpool2d.h.
+// ---------------------------------------------------------------------------------------------
+
+__global__ void k_max_pool2d_forward(const float* x, float* out, float* argmax, int64_t planes, int H, int W, int H_out,
+                                     int W_out, int kH, int kW, int sH, int sW) {
+    int64_t total = planes * H_out * W_out;
+    for (int64_t o = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; o < total; o += (int64_t)gridDim.x * blockDim.x) {
+        int w = (int)(o % W_out);
+        int h = (int)((o / W_out) % H_out);
+        int64_t p = o / ((int64_t)H_out * W_out);
+        const float* xp = x + p * H * W;
+        float best = -INFINITY;
+        int offset = -1;
+        for (int kh = 0; kh < kH; ++kh) {
+            for (int kw = 0; kw < kW; ++kw) {
+                float v = xp[(int64_t)(h * sH + kh) * W + w * sW + kw];
+                if (v > best) {
+                    best = v;
+                    offset = kh * kW + kw;
+                }
+            }
+        }
+        out[o] = best;
+        argmax[o] = (float)offset;
+    }
+}
+
+// One thread per input element gathers the gradients of the windows it won, in window order: the
+// same terms in the same order as the host loop, which scatters by output
+__global__ void k_max_pool2d_backward(const float* grad, const float* argmax, float* gx, int64_t planes, int H, int W,
+                                      int H_out, int W_out, int kH, int kW, int sH, int sW) {
+    int64_t total = planes * H * W;
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (int64_t)gridDim.x * blockDim.x) {
+        int iw = (int)(i % W);
+        int ih = (int)((i / W) % H);
+        int64_t p = i / ((int64_t)H * W);
+        // Windows h with h * sH <= ih <= h * sH + kH - 1, and likewise for w
+        int h_lo = ih - kH + 1 <= 0 ? 0 : (ih - kH + sH) / sH;
+        int h_hi = min(H_out - 1, ih / sH);
+        int w_lo = iw - kW + 1 <= 0 ? 0 : (iw - kW + sW) / sW;
+        int w_hi = min(W_out - 1, iw / sW);
+        float acc = 0.0f;
+        for (int h = h_lo; h <= h_hi; ++h) {
+            for (int w = w_lo; w <= w_hi; ++w) {
+                int64_t o = (p * H_out + h) * W_out + w;
+                int offset = (int)argmax[o];
+                if (offset < 0) continue;
+                int kh = offset / kW, kw = offset - (offset / kW) * kW;
+                if (h * sH + kh == ih && w * sW + kw == iw) acc += grad[o];
+            }
+        }
+        gx[i] = acc;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Sum of squares in double precision: a fixed grid writes one partial per thread (strided, so
 // reads are coalesced), then one thread per buffer adds its partials in order.
 // ---------------------------------------------------------------------------------------------
@@ -694,6 +751,22 @@ void repeat_kv_backward(const float* grad, float* gin, int64_t batch, int64_t kv
     int64_t n = batch * kv_heads * head_elems;
     if (n == 0) return;
     k_repeat_kv_backward<<<grid_for(n), kThreads>>>(grad, gin, batch, kv_heads, group, head_elems);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void max_pool2d_forward(const float* x, float* out, float* argmax, int64_t planes, int H, int W, int H_out, int W_out,
+                        int kH, int kW, int sH, int sW) {
+    int64_t n = planes * H_out * W_out;
+    if (n == 0) return;
+    k_max_pool2d_forward<<<grid_for(n), kThreads>>>(x, out, argmax, planes, H, W, H_out, W_out, kH, kW, sH, sW);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void max_pool2d_backward(const float* grad, const float* argmax, float* gx, int64_t planes, int H, int W, int H_out,
+                         int W_out, int kH, int kW, int sH, int sW) {
+    int64_t n = planes * H * W;
+    if (n == 0) return;
+    k_max_pool2d_backward<<<grid_for(n), kThreads>>>(grad, argmax, gx, planes, H, W, H_out, W_out, kH, kW, sH, sW);
     CUDA_CHECK(cudaGetLastError());
 }
 

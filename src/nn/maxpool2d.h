@@ -4,121 +4,135 @@
 #include <limits>
 #include <stdexcept>
 
-struct MaxPool2dBackward : public Node {
-    std::shared_ptr<Tensor> x;
-    std::shared_ptr<Tensor> indices;
-    
-    MaxPool2dBackward(std::shared_ptr<Tensor> x, std::shared_ptr<Tensor> indices)
-        : x(x), indices(indices) {}
+// 2-D max pooling over [B, C, H, W] (no padding). Each output remembers which element of its window
+// won as the window offset kh * kW + kw (exact in float at any input size; -1 when every value was
+// NaN), so backward routes each output gradient to that element.
 
-    void release_variables() override { x = nullptr; indices = nullptr; }
+namespace maxpool_detail {
 
-    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
-        if (grads.empty() || !grads[0] || !x || !indices) return {nullptr};
-        auto grad_out = grads[0];
+struct Geometry {
+    int64_t planes;  // B * C
+    int H, W, H_out, W_out, kH, kW, sH, sW;
+};
 
-        if (x->device != Device::CPU) {
-            auto x_cpu = x->to(Device::CPU);
-            auto idx_cpu = indices->to(Device::CPU);
-            auto go_cpu = grad_out->to(Device::CPU);
-            MaxPool2dBackward cpu_node(x_cpu, idx_cpu);
-            auto cpu_grads = cpu_node.apply({go_cpu});
-            if (cpu_grads.empty() || !cpu_grads[0]) return {nullptr};
-            return {cpu_grads[0]->to(x->device)};
-        }
-
-        auto grad_x = std::make_shared<Tensor>(x->shape, x->device, x->dtype, false);
-        grad_x->fill_(0.0f);
-
-        const float* go_data = grad_out->data_ptr<float>();
-        const float* idx_data = indices->data_ptr<float>();
-        float* gx_data = grad_x->data_ptr<float>();
-
-        int size = grad_out->size();
-        int x_size = grad_x->size();
-        for (int i = 0; i < size; ++i) {
-            int max_idx = static_cast<int>(idx_data[i]);
-            if (max_idx >= 0 && max_idx < x_size) {
-                gx_data[max_idx] += go_data[i];
+inline void forward_host(const float* x, float* out, float* argmax, const Geometry& g) {
+    for (int64_t p = 0; p < g.planes; ++p) {
+        const float* xp = x + p * g.H * g.W;
+        for (int h = 0; h < g.H_out; ++h) {
+            for (int w = 0; w < g.W_out; ++w) {
+                float best = -std::numeric_limits<float>::infinity();
+                int offset = -1;
+                for (int kh = 0; kh < g.kH; ++kh) {
+                    for (int kw = 0; kw < g.kW; ++kw) {
+                        float v = xp[(int64_t)(h * g.sH + kh) * g.W + w * g.sW + kw];
+                        if (v > best) {
+                            best = v;
+                            offset = kh * g.kW + kw;
+                        }
+                    }
+                }
+                int64_t o = (p * g.H_out + h) * g.W_out + w;
+                out[o] = best;
+                argmax[o] = (float)offset;
             }
         }
-        
-        return {grad_x};
+    }
+}
+
+// gx must start zeroed. Outputs are visited in order, so each input sums its gradients in the same
+// order as the CUDA kernel, which gathers them by window.
+inline void backward_host(const float* grad, const float* argmax, float* gx, const Geometry& g) {
+    for (int64_t p = 0; p < g.planes; ++p) {
+        for (int h = 0; h < g.H_out; ++h) {
+            for (int w = 0; w < g.W_out; ++w) {
+                int64_t o = (p * g.H_out + h) * g.W_out + w;
+                int offset = (int)argmax[o];
+                if (offset < 0) continue;
+                int kh = offset / g.kW, kw = offset % g.kW;
+                gx[(p * g.H + h * g.sH + kh) * g.W + w * g.sW + kw] += grad[o];
+            }
+        }
+    }
+}
+
+}  // namespace maxpool_detail
+
+struct MaxPool2dBackward : public Node {
+    std::vector<int64_t> x_shape;
+    std::shared_ptr<Tensor> argmax;  // [B, C, H_out, W_out] window offsets, on the input's device
+    maxpool_detail::Geometry geom;
+
+    MaxPool2dBackward(std::vector<int64_t> x_shape, std::shared_ptr<Tensor> argmax, maxpool_detail::Geometry geom)
+        : x_shape(std::move(x_shape)), argmax(std::move(argmax)), geom(geom) {}
+
+    void release_variables() override { argmax = nullptr; }
+
+    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        if (grads.empty() || !grads[0] || !argmax) return {nullptr};
+        auto grad_out = grads[0];
+        Device dev = grad_out->device;
+#ifdef USE_CUDA
+        if (dev == Device::CUDA) {
+            auto gx = std::make_shared<Tensor>(x_shape, dev, DType::Float32, false);
+            cuda::max_pool2d_backward(grad_out->data_ptr<float>(), argmax->data_ptr<float>(), gx->data_ptr<float>(),
+                                      geom.planes, geom.H, geom.W, geom.H_out, geom.W_out, geom.kH, geom.kW, geom.sH, geom.sW);
+            return {gx};
+        }
+#endif
+        auto gh = (dev == Device::CPU) ? grad_out : grad_out->cpu();
+        auto ah = (argmax->device == Device::CPU) ? argmax : argmax->cpu();
+        auto gx = std::make_shared<Tensor>(x_shape, Device::CPU, DType::Float32, false);
+        gx->fill_(0.0f);
+        maxpool_detail::backward_host(gh->data_ptr<float>(), ah->data_ptr<float>(), gx->data_ptr<float>(), geom);
+        return {(dev == Device::CPU) ? gx : gx->to(dev)};
     }
 };
 
 inline std::shared_ptr<Tensor> max_pool2d(const std::shared_ptr<Tensor>& x_in, int kH, int kW, int strideH, int strideW) {
     DG_PROFILE_OP("max_pool2d");
+    if (!x_in) throw std::runtime_error("max_pool2d: input tensor is null");
     auto x = contiguous(float32_input(x_in));
-    if (!x) throw std::runtime_error("max_pool2d: input tensor is null");
     if (x->ndim() != 4) throw std::runtime_error("max_pool2d: x must be a 4D tensor (B, C, H, W)");
-    if (strideH <= 0 || strideW <= 0) throw std::runtime_error("max_pool2d: strides must be > 0");
+    if (kH <= 0 || kW <= 0 || strideH <= 0 || strideW <= 0) throw std::runtime_error("max_pool2d: kernel and strides must be > 0");
 
-    auto xc = make_contiguous(x);
-    int B = xc->shape[0];
-    int C = xc->shape[1];
-    int H = xc->shape[2];
-    int W = xc->shape[3];
+    maxpool_detail::Geometry g;
+    g.planes = x->shape[0] * x->shape[1];
+    g.H = (int)x->shape[2];
+    g.W = (int)x->shape[3];
+    if (g.H < kH || g.W < kW) throw std::runtime_error("max_pool2d: kernel size exceeds input spatial dimensions");
+    g.kH = kH;
+    g.kW = kW;
+    g.sH = strideH;
+    g.sW = strideW;
+    g.H_out = (g.H - kH) / strideH + 1;
+    g.W_out = (g.W - kW) / strideW + 1;
 
-    if (H < kH || W < kW) throw std::runtime_error("max_pool2d: kernel size exceeds input spatial dimensions");
-
-    int H_out = (H - kH) / strideH + 1;
-    int W_out = (W - kW) / strideW + 1;
-
-    if (xc->device != Device::CPU) {
-        auto xc_cpu = xc->to(Device::CPU);
-        auto out_cpu = max_pool2d(xc_cpu, kH, kW, strideH, strideW);
-        auto out_res = out_cpu->to(xc->device);
-        if (needs_grad(xc)) {
-            auto grad_fn_cpu = std::static_pointer_cast<MaxPool2dBackward>(out_cpu->grad_fn);
-            auto grad_fn = std::make_shared<MaxPool2dBackward>(xc, grad_fn_cpu->indices->to(xc->device));
-            grad_fn->add_next_edge(get_grad_edge(xc).function);
-            out_res->grad_fn = grad_fn;
-        }
-        return out_res;
-    }
-
-    auto out = std::make_shared<Tensor>(std::vector<int64_t>{B, C, H_out, W_out}, xc->device, xc->dtype, needs_grad(xc));
-    auto indices = std::make_shared<Tensor>(std::vector<int64_t>{B, C, H_out, W_out}, xc->device, xc->dtype, false);
-    indices->fill_(0.0f);
-
-    const float* x_data = xc->data_ptr<float>();
-    float* out_data = out->data_ptr<float>();
-    float* idx_data = indices->data_ptr<float>();
-
-    for (int b = 0; b < B; ++b) {
-        for (int c = 0; c < C; ++c) {
-            for (int h = 0; h < H_out; ++h) {
-                for (int w = 0; w < W_out; ++w) {
-                    float max_val = -std::numeric_limits<float>::infinity();
-                    int max_idx = -1;
-
-                    for (int kh = 0; kh < kH; ++kh) {
-                        for (int kw = 0; kw < kW; ++kw) {
-                            int ih = h * strideH + kh;
-                            int iw = w * strideW + kw;
-                            int flat_idx = ((b * C + c) * H + ih) * W + iw;
-                            float val = x_data[flat_idx];
-                            if (val > max_val) {
-                                max_val = val;
-                                max_idx = flat_idx;
-                            }
-                        }
-                    }
-
-                    int out_idx = ((b * C + c) * H_out + h) * W_out + w;
-                    out_data[out_idx] = max_val;
-                    idx_data[out_idx] = static_cast<float>(max_idx);
-                }
-            }
+    Device dev = x->device;
+    std::vector<int64_t> out_shape{x->shape[0], x->shape[1], g.H_out, g.W_out};
+    auto out = std::make_shared<Tensor>(out_shape, dev, DType::Float32, false);
+    auto argmax = std::make_shared<Tensor>(out_shape, dev, DType::Float32, false);
+#ifdef USE_CUDA
+    if (dev == Device::CUDA) {
+        cuda::max_pool2d_forward(x->data_ptr<float>(), out->data_ptr<float>(), argmax->data_ptr<float>(), g.planes, g.H,
+                                 g.W, g.H_out, g.W_out, g.kH, g.kW, g.sH, g.sW);
+    } else
+#endif
+    {
+        auto xh = (dev == Device::CPU) ? x : x->cpu();
+        auto oh = (dev == Device::CPU) ? out : std::make_shared<Tensor>(out_shape, Device::CPU, DType::Float32, false);
+        auto ah = (dev == Device::CPU) ? argmax : std::make_shared<Tensor>(out_shape, Device::CPU, DType::Float32, false);
+        maxpool_detail::forward_host(xh->data_ptr<float>(), oh->data_ptr<float>(), ah->data_ptr<float>(), g);
+        if (dev != Device::CPU) {
+            out = oh->to(dev);
+            argmax = ah->to(dev);
         }
     }
 
-    if (needs_grad(xc)) {
-        auto grad_fn = std::make_shared<MaxPool2dBackward>(xc, indices);
-        grad_fn->add_next_edge(get_grad_edge(xc).function);
+    out->requires_grad = needs_grad(x);
+    if (needs_grad(x)) {
+        auto grad_fn = std::make_shared<MaxPool2dBackward>(x->shape, argmax, g);
+        grad_fn->add_next_edge(get_grad_edge(x).function);
         out->grad_fn = grad_fn;
     }
-    
     return out;
 }
