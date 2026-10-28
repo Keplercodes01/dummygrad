@@ -1937,6 +1937,52 @@ static std::string linear_fused_cuda(DType compute) {
     return "";
 }
 
+// Under autocast a parameter converts to fp16 once and reuses the copy until it changes: a second
+// matmul does no conversion, and after an in-place write or an optimizer step the result equals a
+// computation with a fresh, never-cached copy of the new values
+static std::string amp_weight_cast_cache() {
+    auto x = upload(random_values(16 * 32, -1, 1), {16, 32}, Device::CUDA, false);
+    auto w = upload(random_values(32 * 8, -1, 1), {32, 8}, Device::CUDA, true);
+    auto casts = [] {
+        for (const auto& e : profile_report(ProfilePhase::Forward)) {
+            if (e.name == "autocast_cast") return e.calls;
+        }
+        return (int64_t)0;
+    };
+    auto fresh = [&] {  // the same values in a tensor that has never been converted
+        auto copy = upload(download(w), w->shape, Device::CUDA, false);
+        AutocastGuard autocast(DType::Float16);
+        return download(matmul(x, copy));
+    };
+    TensorPtr y;
+    {
+        AutocastGuard autocast(DType::Float16);
+        matmul(x, w);
+        reset_profile();
+        set_profiling(true);
+        y = matmul(x, w);
+        set_profiling(false);
+    }
+    if (casts() != 0) return "an unchanged weight was converted again (" + std::to_string(casts()) + " casts)";
+    if (download(y) != fresh()) return "the cached copy gives a different product";
+
+    w->fill_(0.25f);  // in-place write: the cached copy is stale
+    {
+        AutocastGuard autocast(DType::Float16);
+        y = matmul(x, w);
+    }
+    if (download(y) != fresh()) return "a stale cached copy was used after an in-place write";
+
+    Adam opt(0.1f);
+    w->grad = upload(random_values(32 * 8, -1, 1), {32, 8}, Device::CUDA, false);
+    opt.step({w});
+    {
+        AutocastGuard autocast(DType::Float16);
+        y = matmul(x, w);
+    }
+    return download(y) == fresh() ? "" : "a stale cached copy was used after an optimizer step";
+}
+
 // Attention under autocast against fp32: output, lse and the three gradients on the GEMM path,
 // causal and not, with a sequence length that is not a multiple of 8. The tiled kernels ignore
 // autocast, so there the results must be bit-identical.
@@ -2206,6 +2252,7 @@ int main() {
         run_case(r, "amp/matmul_frozen_operand_fp32_cuda", [] { return matmul_frozen_operand_cuda(DType::Float32); });
         run_case(r, "amp/matmul_frozen_operand_fp16_cuda", [] { return matmul_frozen_operand_cuda(DType::Float16); });
         run_case(r, "amp/matmul_parity_fp16_cuda", [] { return amp_matmul_parity(DType::Float16); });
+        run_case(r, "amp/weight_cast_cache_cuda", amp_weight_cast_cache);
         run_case(r, "amp/attention_parity_fp16_cuda", [] { return amp_attention_parity(DType::Float16); });
         if (cuda_has_bf16_tensor_cores()) {
             run_case(r, "amp/matmul_parity_bf16_cuda", [] { return amp_matmul_parity(DType::BFloat16); });

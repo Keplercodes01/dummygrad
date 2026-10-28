@@ -205,6 +205,7 @@ public:
         s.step++;
         int64_t n = p->size();
         float wd = decay_.get(p, weight_decay);
+        p->storage->bump_version();  // the update below changes p in place (cached casts go stale)
 
 #ifdef USE_CUDA
         if (p->device == Device::CUDA) {

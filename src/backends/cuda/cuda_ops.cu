@@ -657,11 +657,29 @@ static void check_compute_dtype(DType compute, const char* who) {
 
 // A contiguous tensor as a GEMM operand of the compute dtype: itself when it already has that
 // dtype, else a converted copy (rounded to nearest even when narrowing)
+// A leaf tensor (a parameter: no grad_fn) covering its whole storage keeps its converted copy in
+// the storage's cast cache, so a weight converts once per optimizer step instead of every forward
+// (and every backward that needs it). Activations convert every time; they are new each step.
 static std::shared_ptr<Tensor> gemm_operand(const std::shared_ptr<Tensor>& t, DType compute) {
     if (t->dtype == compute) return t;
+    Storage& st = *t->storage;
+    bool cacheable = !t->grad_fn && t->global_offset == 0 && t->is_contiguous() &&
+                     st.total_bytes == (size_t)t->size() * dtype_size(t->dtype);
+    std::unique_lock<std::mutex> lock(st.cast_mutex, std::defer_lock);
+    if (cacheable) {
+        lock.lock();
+        if (st.cast_copy && st.cast_dtype == compute && st.cast_version == st.version) {
+            return std::make_shared<Tensor>(st.cast_copy, t->shape, t->strides, 0, Device::CUDA, compute, false);
+        }
+    }
     DG_PROFILE_OP("autocast_cast");
     auto out = std::make_shared<Tensor>(t->shape, Device::CUDA, compute, false);
     convert(t->data_ptr<void>(), t->dtype, out->data_ptr<void>(), compute, t->size());
+    if (cacheable) {
+        st.cast_copy = out->storage;
+        st.cast_dtype = compute;
+        st.cast_version = st.version;
+    }
     return out;
 }
 
