@@ -16,6 +16,13 @@ No Python. No bindings. No GIL. No multi-layer dispatcher overhead. Just raw, fr
 
 Full details for every release are in [CHANGELOG.md](CHANGELOG.md).
 
+### v0.8.0: the audit release
+- **A full audit of the codebase, every finding fixed.** Graphs whose backward never ran leaked (a reference cycle in attention, softmax, tanh and sigmoid); a bad token id corrupted GPU memory; multi-GPU training dropped or raced gradients; non-square CUDA masks, large max-pool inputs, RoPE positions past `max_seq_len` and mismatched head counts read or wrote out of bounds. See [CHANGELOG.md](CHANGELOG.md).
+- **Faster:** 12-21% fp32 and 4-11% fp16 per step over v0.7.0 on a T4. Every op that round-tripped through the host on CUDA (sum, mean, var, mse, conv, max-pool, concat, ...) has a GPU kernel; the tied LM head no longer copies the embedding's transpose.
+- **Multi-GPU that works:** `MultiGPURunner` averages gradients GPU to GPU, tested on two T4s.
+- **New:** `set_allow_tf32` (off by default), per-parameter weight decay (`no_weight_decay_params`), `matmul_nt`.
+- **Removed:** features that were dead code or unsafe (`CUDAGraph`, `ArenaScope`), and README claims they backed.
+
 ### v0.7.0: PyTorch-level speed at 23M parameters, 6x faster at 0.4M
 - **fp16 on a T4: 50.5 vs PyTorch's 50.7 ms at 23M parameters, 14.4 vs 21.9 ms at 3.9M, 1.7 vs 10.8 ms at 0.4M.** See [Performance](#performance).
 - **Fused Linear:** the bias is added inside the matrix multiply instead of by a separate pass over the output, and one backward node returns all three gradients.
@@ -228,7 +235,7 @@ set(CMAKE_CXX_STANDARD 17)
 include(FetchContent)
 FetchContent_Declare(dummygrad
     GIT_REPOSITORY https://github.com/Keplercodes01/dummygrad.git
-    GIT_TAG        v0.7.0)
+    GIT_TAG        v0.8.0)
 FetchContent_MakeAvailable(dummygrad)
 
 add_executable(my_app main.cpp)
@@ -643,25 +650,27 @@ auto out = gpt.forward(input_ids, /*pos_ids=*/nullptr, /*mask=*/doc_mask);
 
 ## Performance
 
-Training-step time (forward, backward, AdamW) for the same ModernTransformer architecture (RMSNorm, RoPE, GQA, SwiGLU, tied embeddings) in dummygrad and eager PyTorch, float32, on a Colab T4 (measured with v0.5.1; v0.7.0's fused Linear and single-threaded GPU backward apply to fp32 too, so current numbers should be lower):
+Training-step time (forward, backward, AdamW) for the same ModernTransformer architecture (RMSNorm, RoPE, GQA, SwiGLU, tied embeddings) in dummygrad and PyTorch 2.11 (eager, and `torch.compile`d), v0.8.0 on a Kaggle T4. Median ms per step over at least 50 steps; all four columns from one session (`bench/compare.py`, as the notebook runs it). PyTorch runs at its best: fused AdamW, `F.rms_norm`, `scaled_dot_product_attention`.
 
-| config | params | dummygrad | PyTorch 2.11 | |
+**fp32** (TF32 enabled on both sides; the T4 has none):
+
+| config | params | dummygrad | PyTorch eager | PyTorch compile |
 |---|---|---|---|---|
-| tiny (d=128, 2 layers, batch 8x64) | 0.4M | **2.9 ms** | 8.6 ms | 3.0x faster |
-| small (d=256, 4 layers, batch 16x128) | 3.9M | **23.9 ms** | 27.6 ms | 13% faster |
-| medium (d=512, 6 layers, batch 8x256) | 23.1M | **103.6 ms** | 107.7 ms | 4% faster |
+| tiny (d=128, 2 layers, batch 8x64) | 0.4M | **1.54 ms** | 7.24 ms | 4.18 ms |
+| small (d=256, 4 layers, batch 16x128) | 3.9M | 22.1 ms | 23.5 ms | **20.9 ms** |
+| medium (d=512, 6 layers, batch 8x256) | 23.1M | **100.4 ms** | 110.1 ms | 104.1 ms |
+| large (d=768, 12 layers, batch 8x512) | 100.2M | **820 ms** | 910 ms | 855 ms |
 
-dummygrad's advantage is per-op overhead (no Python, no dispatcher), which dominates small models; at larger sizes both are bound by cuBLAS matrix multiplies (`MatmulBackward` is 47 of medium's 104 ms). Reproduce it with the [Colab notebook](notebooks/dummygrad_colab.ipynb), or run `./build/dg_bench` and `python bench/bench_torch.py` on your own GPU. `./build/dg_bench --profile` breaks forward and backward time down by op.
+**fp16 mixed precision** (`AutocastGuard` + `GradScaler`, against `torch.autocast` + `GradScaler`):
 
-With fp16 mixed precision (`dg_bench --fp16`: `AutocastGuard` + `GradScaler`, against `torch.autocast` + `GradScaler`), v0.7.0 on a Kaggle T4:
-
-| config | dummygrad fp16 | PyTorch 2.11 fp16 | |
+| config | dummygrad | PyTorch eager | PyTorch compile |
 |---|---|---|---|
-| tiny | **1.7 ms** | 10.8 ms | 6.4x faster |
-| small | **14.4 ms** | 21.9 ms | 34% faster |
-| medium | **50.5 ms** | **50.7 ms** | even |
+| tiny | **1.56 ms** | 9.65 ms | 5.21 ms |
+| small | 15.4 ms | 18.7 ms | **9.5 ms** |
+| medium | 53.9 ms | 46.2 ms | **33.6 ms** |
+| large | 324 ms | 257 ms | **202 ms** |
 
-At 23M parameters both are bound by the GPU: cuBLAS matrix multiplies are nearly half of dummygrad's step. dummygrad still converts every matmul input from fp32 (3.3 ms of medium's 18 ms forward pass, per `--profile`), while PyTorch's autocast keeps more of its activations in fp16; that is the next thing to remove.
+dummygrad's advantage is per-op overhead (no Python, no dispatcher), which dominates small models. In fp16 at larger sizes it is behind: it still converts every matmul's weights to fp16 each step (3.4 ms of medium's 20 ms forward pass, per `--profile`) and runs normalization and elementwise ops in fp32, where PyTorch's autocast keeps more in fp16. That is the next work. Reproduce with the [notebook](notebooks/dummygrad_colab.ipynb), or run `./build/dg_bench` and `python bench/bench_torch.py` on your own GPU; `--profile` breaks forward and backward time down by op.
 
 ---
 
