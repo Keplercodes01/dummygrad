@@ -667,13 +667,19 @@ void embedding_backward(const float* grad, const std::vector<int>& positions, co
                         const std::vector<int>& starts, float* grad_weight, int64_t vocab, int64_t dim) {
     CUDA_CHECK(cudaMemset(grad_weight, 0, (size_t)(vocab * dim) * sizeof(float)));
     if (unique_ids.empty()) return;
-    DeviceBuffer d_pos(positions.size() * sizeof(int)), d_ids(unique_ids.size() * sizeof(int)), d_starts(starts.size() * sizeof(int));
-    CUDA_CHECK(cudaMemcpy(d_pos.ptr, positions.data(), positions.size() * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_ids.ptr, unique_ids.data(), unique_ids.size() * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_starts.ptr, starts.data(), starts.size() * sizeof(int), cudaMemcpyHostToDevice));
+    // One upload (each is a synchronous copy from pageable memory): positions, unique ids, run starts
+    std::vector<int> packed;
+    packed.reserve(positions.size() + unique_ids.size() + starts.size());
+    packed.insert(packed.end(), positions.begin(), positions.end());
+    packed.insert(packed.end(), unique_ids.begin(), unique_ids.end());
+    packed.insert(packed.end(), starts.begin(), starts.end());
+    DeviceBuffer d_packed(packed.size() * sizeof(int));
+    CUDA_CHECK(cudaMemcpy(d_packed.ptr, packed.data(), packed.size() * sizeof(int), cudaMemcpyHostToDevice));
+    const int* d_pos = d_packed.as<int>();
+    const int* d_ids = d_pos + positions.size();
+    const int* d_starts = d_ids + unique_ids.size();
     int64_t n_unique = (int64_t)unique_ids.size();
-    k_embedding_backward<<<grid_for(n_unique * dim), kThreads>>>(grad, d_pos.as<int>(), d_ids.as<int>(), d_starts.as<int>(),
-                                                                 grad_weight, n_unique, dim);
+    k_embedding_backward<<<grid_for(n_unique * dim), kThreads>>>(grad, d_pos, d_ids, d_starts, grad_weight, n_unique, dim);
     CUDA_CHECK(cudaGetLastError());
 }
 

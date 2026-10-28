@@ -118,18 +118,13 @@ public:
         if (pos_ids) {
             pos_x = pos_emb.forward(pos_ids);
         } else {
-            // Automatically generate frame position indices [0, 1, ..., T-1] safely on CPU
+            // Positions 0..T-1 as one row on the host: the [T, d_model] embedding broadcasts over the
+            // batch, and the embedding keeps the host ids for its backward (no copy back from the GPU)
             int64_t T = (input_ids->ndim() >= 2) ? input_ids->shape[1] : input_ids->shape[0];
-            int64_t B = (input_ids->ndim() >= 2) ? input_ids->shape[0] : 1;
-            auto auto_pos = std::make_shared<Tensor>(std::vector<int64_t>{B, T}, Device::CPU, DType::Float32, false);
-            float* p_ptr = auto_pos->data_ptr<float>();
-            for (int64_t b = 0; b < B; ++b) {
-                for (int64_t t = 0; t < T; ++t) {
-                    p_ptr[b * T + t] = static_cast<float>(t);
-                }
-            }
-            auto p_dev = (input_ids->device != Device::CPU) ? auto_pos->to(input_ids->device) : auto_pos;
-            pos_x = pos_emb.forward(p_dev);
+            auto positions = std::make_shared<Tensor>(std::vector<int64_t>{T}, Device::CPU, DType::Float32, false);
+            float* p_ptr = positions->data_ptr<float>();
+            for (int64_t t = 0; t < T; ++t) p_ptr[t] = static_cast<float>(t);
+            pos_x = pos_emb.forward(positions);
         }
 
         auto x = add(tok_x, pos_x);

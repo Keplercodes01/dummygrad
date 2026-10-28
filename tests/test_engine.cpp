@@ -1040,6 +1040,35 @@ static std::string module_modes_and_zero_grad() {
     return "";
 }
 
+// Out-of-range token ids must throw, never index memory: ids given on the host in forward, ids
+// already on the GPU in backward (before the gradient kernel writes their rows)
+static std::string embedding_rejects_bad_ids(Device dev) {
+    Embedding emb(10, 4);
+    if (dev == Device::CUDA) emb.cuda();
+    auto throws_out_of_range = [](const std::function<void()>& f) {
+        try {
+            f();
+        } catch (const std::out_of_range&) {
+            return true;
+        }
+        return false;
+    };
+    for (float bad : {10.0f, -1.0f, -100.0f}) {
+        auto ids = upload({3, bad}, {2}, Device::CPU, false);
+        if (!throws_out_of_range([&] { emb.forward(ids); })) return "host id " + std::to_string(bad) + " was accepted";
+    }
+    if (dev == Device::CUDA) {
+        auto ids = upload({3, 12}, {2}, Device::CUDA, false);
+        TensorPtr out;
+        if (throws_out_of_range([&] { out = emb.forward(ids); })) return "a GPU id was checked in forward (that costs a sync)";
+        if (!throws_out_of_range([&] { scalar_sum(out)->backward(); })) return "backward accepted an out-of-range GPU id";
+    }
+    // Valid ids give the same rows whether they come from the host or the device
+    auto from_host = emb.forward(upload({3, 0, 9}, {3}, Device::CPU, false));
+    auto from_dev = emb.forward(upload({3, 0, 9}, {3}, dev, false));
+    return download(from_host) == download(from_dev) ? "" : "host and device ids gave different rows";
+}
+
 // ---------------------------------------------------------------------------
 // Workflow: determinism, checkpoints, data, logging
 // ---------------------------------------------------------------------------
@@ -1919,6 +1948,8 @@ int main() {
     run_case(r, "module/strict_loading", module_strict_loading);
     run_case(r, "module/to_tied_and_frozen", module_to_tied_and_frozen);
     run_case(r, "module/modes_and_zero_grad", module_modes_and_zero_grad);
+    run_case(r, "module/embedding_rejects_bad_ids", [] { return embedding_rejects_bad_ids(Device::CPU); });
+    if (has_cuda) run_case(r, "module/embedding_rejects_bad_ids_cuda", [] { return embedding_rejects_bad_ids(Device::CUDA); });
 
     std::cout << "\n-- workflow\n";
     run_case(r, "workflow/deterministic_backward", workflow_deterministic_backward);
