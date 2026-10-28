@@ -1045,6 +1045,20 @@ static std::shared_ptr<Tensor> matmul_impl(const std::shared_ptr<Tensor>& _a, co
                                            std::shared_ptr<Tensor>* saved_a, std::shared_ptr<Tensor>* saved_b) {
     check_matmul_inputs(*_a, *_b, "cuda::matmul");
     check_compute_dtype(compute, "cuda::matmul");
+    if (_a->ndim() < 2 || _b->ndim() < 2) throw std::runtime_error("cuda::matmul: tensors must be at least 2-D");
+    {
+        // Batch dimensions: equal (ignoring leading 1s), or one operand unbatched. Two batched
+        // operands of the same batch count but different shapes ([2, 3] vs [6]) do not broadcast.
+        auto batch_dims = [](const Tensor& t) {
+            std::vector<int64_t> d(t.shape.begin(), t.shape.end() - 2);
+            while (!d.empty() && d.front() == 1) d.erase(d.begin());
+            return d;
+        };
+        auto da = batch_dims(*_a), db = batch_dims(*_b);
+        if (!da.empty() && !db.empty() && da != db) {
+            throw std::runtime_error("cuda::matmul: batch dimensions do not match (only a whole unbatched operand broadcasts)");
+        }
+    }
     auto a = make_contiguous(_a);
     auto b = make_contiguous(_b);
     int n1 = a->ndim();

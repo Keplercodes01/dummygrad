@@ -6,6 +6,7 @@
 #include <vector>
 #include <memory>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -224,7 +225,7 @@ inline std::shared_ptr<Tensor> prefix_causal_mask(const std::shared_ptr<Tensor>&
 // ----------------------------------------------------------------------------
 // 3. ALiBi (Attention with Linear Biases) Slope Bias Matrix
 //    Computes additive geometric slope bias tensor [1, n_heads, seq_len, seq_len]
-//    bias[h, i, j] = -m_h * (i - j) for j <= i, -1e9 for j > i
+//    bias[h, i, j] = -m_h * |i - j|; with causal, -1e9 for j > i instead
 // ----------------------------------------------------------------------------
 inline std::shared_ptr<Tensor> alibi_bias(
     int n_heads, int seq_len, bool causal = true, Device device = Device::CPU
@@ -259,8 +260,8 @@ inline std::shared_ptr<Tensor> alibi_bias(
                 if (causal && j > i) {
                     ptr[idx] = -1e9f;
                 } else {
-                    // Distance penalty: linear bias is negative for keys further away
-                    ptr[idx] = -m * static_cast<float>(i - j);
+                    // Distance penalty, negative for keys further away in either direction
+                    ptr[idx] = -m * static_cast<float>(std::abs(i - j));
                 }
             }
         }

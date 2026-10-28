@@ -1047,6 +1047,39 @@ static std::string module_modes_and_zero_grad() {
     return "";
 }
 
+// Inputs that kernels would read out of bounds with must be rejected up front
+static std::string invalid_shapes_rejected(Device dev) {
+    auto throws = [](const std::function<void()>& f) {
+        try {
+            f();
+        } catch (const std::exception&) {
+            return true;
+        }
+        return false;
+    };
+    if (!throws([] { MultiHeadAttention bad(12, 4, 3); })) return "n_kv_heads that does not divide n_heads was accepted";
+    if (!throws([] { MultiHeadAttention bad(10, 4); })) return "d_model that n_heads does not divide was accepted";
+    if (!throws([] { MultiHeadAttention bad(8, 2, 4); })) return "more kv heads than query heads was accepted";
+
+    auto freqs = precompute_freqs_cis(4, 8);
+    auto cos_t = freqs.first->to(dev), sin_t = freqs.second->to(dev);
+    auto x = upload(random_values(2 * 8 * 4, -1, 1), {2, 8, 1, 4}, dev, false);
+    if (throws([&] { apply_rotary_emb(x, cos_t, sin_t, 0); })) return "RoPE rejected positions inside its tables";
+    if (!throws([&] { apply_rotary_emb(x, cos_t, sin_t, 1); })) return "RoPE read past the end of its tables";
+    auto x6 = upload(random_values(2 * 8 * 6, -1, 1), {2, 8, 1, 6}, dev, false);
+    if (!throws([&] { apply_rotary_emb(x6, cos_t, sin_t, 0); })) return "RoPE accepted tables of the wrong head dimension";
+
+    // Non-causal ALiBi penalizes distance in both directions
+    auto bias = download(masking::alibi_bias(1, 3, /*causal=*/false));
+    if (bias[0 * 3 + 2] != bias[2 * 3 + 0] || !(bias[0 * 3 + 2] < 0.0f)) return "non-causal ALiBi is not a symmetric penalty";
+
+    if (dev == Device::CUDA &&
+        !throws([] { matmul(upload({1, 2}, {2}, Device::CUDA, false), upload({1, 2, 3, 4}, {2, 2}, Device::CUDA, false)); })) {
+        return "a 1-D CUDA matmul operand was accepted";
+    }
+    return "";
+}
+
 // max_pool2d on an input of more than 2^24 elements: the winner of the last window sits at an odd
 // flat index above 2^24, which a float flat index (the old representation) cannot hold
 static std::string max_pool2d_large_input() {
@@ -2058,6 +2091,8 @@ int main() {
     run_case(r, "module/to_tied_and_frozen", module_to_tied_and_frozen);
     run_case(r, "module/modes_and_zero_grad", module_modes_and_zero_grad);
     run_case(r, "module/max_pool2d_large_input", max_pool2d_large_input);
+    run_case(r, "module/invalid_shapes_rejected", [] { return invalid_shapes_rejected(Device::CPU); });
+    if (has_cuda) run_case(r, "module/invalid_shapes_rejected_cuda", [] { return invalid_shapes_rejected(Device::CUDA); });
     run_case(r, "module/embedding_rejects_bad_ids", [] { return embedding_rejects_bad_ids(Device::CPU); });
     if (has_cuda) run_case(r, "module/embedding_rejects_bad_ids_cuda", [] { return embedding_rejects_bad_ids(Device::CUDA); });
 
