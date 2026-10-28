@@ -23,6 +23,12 @@ namespace cuda {
                                    DType compute = DType::Float32,
                                    std::shared_ptr<Tensor>* saved_a = nullptr,
                                    std::shared_ptr<Tensor>* saved_b = nullptr);
+    // a @ b^T for a 2-D b stored [N, K] (a tied LM head reading the [vocab, d] embedding), with no
+    // transposed copy: the GEMM reads b transposed. Backward: matmul_backward with trans_b.
+    std::shared_ptr<Tensor> matmul_nt(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b,
+                                      DType compute = DType::Float32,
+                                      std::shared_ptr<Tensor>* saved_a = nullptr,
+                                      std::shared_ptr<Tensor>* saved_b = nullptr);
     // out = x @ w + bias for a 2-D weight w [in, out] and a bias with one value per output feature.
     // The bias is added inside the GEMM (cuBLASLt epilogue) when cuBLASLt supports the case, else
     // by a separate kernel. saved_x / saved_w as for matmul; the gradients are matmul_backward's
@@ -35,14 +41,15 @@ namespace cuda {
     // not fuse it (no algorithm for the shape, or an unaligned pointer). Should stay 0 for
     // ordinary layers; a rising count means Linear is running slower than it should.
     int64_t linear_unfused_count();
-    // Gradients of out = a @ b for inputs of shapes a_shape and b_shape. a and b are Float32 or
+    // Gradients of out = a @ b for inputs of shapes a_shape and b_shape (trans_b: out = a @ b^T, with
+    // b_shape and grad_b in b's stored [N, K] layout). a and b are Float32 or
     // compute-dtype operands (normally matmul's saved ones). grad_a needs only b and grad_b only a:
     // a null grad_a / grad_b skips that GEMM, and the operand only it uses may then be null.
     void matmul_backward(const std::vector<int64_t>& a_shape, const std::vector<int64_t>& b_shape,
                          const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b,
                          const std::shared_ptr<Tensor>& grad_out,
                          std::shared_ptr<Tensor>* grad_a, std::shared_ptr<Tensor>* grad_b,
-                         DType compute = DType::Float32);
+                         DType compute = DType::Float32, bool trans_b = false);
 
     // Rounds n device floats to Float16 or BFloat16 (nearest even) into out
     void cast_from_float(const float* in, void* out, int64_t n, DType dtype);

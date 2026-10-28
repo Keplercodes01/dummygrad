@@ -3109,13 +3109,15 @@ struct CudaMatmulBackward : public Node {
     bool grad_a, grad_b, grad_bias;
     DType compute;  // GEMM precision the forward ran with (autocast)
 
+    bool trans_b = false;  // matmul_nt: b is stored [N, K] and the product is a @ b^T
+
     CudaMatmulBackward(std::vector<int64_t> a_shape, std::vector<int64_t> b_shape, DType a_dtype, DType b_dtype,
                        std::shared_ptr<Tensor> a, std::shared_ptr<Tensor> b,
                        bool grad_a, bool grad_b, DType compute,
-                       std::vector<int64_t> bias_shape = {}, bool grad_bias = false)
+                       std::vector<int64_t> bias_shape = {}, bool grad_bias = false, bool trans_b = false)
         : a_shape(std::move(a_shape)), b_shape(std::move(b_shape)), bias_shape(std::move(bias_shape)),
           a_dtype(a_dtype), b_dtype(b_dtype), a(std::move(a)), b(std::move(b)),
-          grad_a(grad_a), grad_b(grad_b), grad_bias(grad_bias), compute(compute) {}
+          grad_a(grad_a), grad_b(grad_b), grad_bias(grad_bias), compute(compute), trans_b(trans_b) {}
 
     // MatmulBackward is the CPU node's label too, so profiles stay comparable across devices
     std::string name() const override { return bias_shape.empty() ? "MatmulBackward" : "LinearBackward"; }
@@ -3133,7 +3135,7 @@ struct CudaMatmulBackward : public Node {
         }
         std::shared_ptr<Tensor> da, db;
         cuda::matmul_backward(a_shape, b_shape, a, b, grads[0], grad_a ? &da : nullptr, grad_b ? &db : nullptr,
-                              compute);
+                              compute, trans_b);
         // The GEMMs write fp32; a half-precision input gets its gradient in its own dtype
         if (da) da = da->to(Device::CUDA, a_dtype);
         if (db) db = db->to(Device::CUDA, b_dtype);
@@ -3174,6 +3176,36 @@ inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const st
     }
 #endif
     return manual_matmul(float32_input(a), float32_input(b));
+}
+
+// a @ b^T for a 2-D b [N, K]: a [..., K] -> [..., N]. A tied LM head multiplies by the [vocab, d]
+// embedding this way. On CUDA the GEMM reads b transposed in place and b's gradient is produced in
+// b's own layout, so neither direction materializes a transpose; elsewhere it is
+// matmul(a, transpose(b)).
+inline std::shared_ptr<Tensor> matmul_nt(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
+    DG_PROFILE_OP("matmul_nt");
+    if (!a || !b) throw std::invalid_argument("matmul_nt: null tensor");
+    if (b->ndim() != 2) throw std::invalid_argument("matmul_nt: b must be 2-D [N, K], got " + shape_string(b->shape));
+    if (a->device != b->device) throw std::invalid_argument("matmul_nt: tensors are on different devices");
+#ifdef USE_CUDA
+    if (a->device == Device::CUDA) {
+        DType compute = autocast_dtype();
+        bool grad_a = needs_grad(a), grad_b = needs_grad(b);
+        std::shared_ptr<Tensor> saved_a, saved_b;
+        auto out = cuda::matmul_nt(a, b, compute, grad_b ? &saved_a : nullptr, grad_a ? &saved_b : nullptr);
+        out->requires_grad = grad_a || grad_b;
+        if (grad_a || grad_b) {
+            auto grad_fn = std::make_shared<CudaMatmulBackward>(a->shape, b->shape, a->dtype, b->dtype, std::move(saved_a),
+                                                                std::move(saved_b), grad_a, grad_b, compute,
+                                                                std::vector<int64_t>{}, false, /*trans_b=*/true);
+            grad_fn->add_next_edge(get_grad_edge(a).function);
+            grad_fn->add_next_edge(get_grad_edge(b).function);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
+#endif
+    return matmul(a, transpose(b, 0, 1));
 }
 
 // y = x @ w + b: x [..., in], w [in, out], b [out] or [1, out], or null for no bias. On CUDA the

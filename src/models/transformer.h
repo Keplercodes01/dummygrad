@@ -138,9 +138,8 @@ public:
         auto x_norm = ln_f.forward(x);
         
         // GPT-2 Training Improvement: Weight Tying
-        // The output projection shares weights with the token embedding
-        auto tied_weights = transpose(token_emb.weight, 0, 1);
-        return matmul(x_norm, tied_weights);
+        // The output projection shares weights with the token embedding: x_norm @ weight^T, read in place
+        return matmul_nt(x_norm, token_emb.weight);
     }
 
     void visit(ModuleVisitor& v) override {
@@ -269,9 +268,8 @@ public:
         // Final RMSNorm
         auto x_norm = rms_f.forward(x);
 
-        // Tied LM head weights
-        auto tied_weights = transpose(token_emb.weight, 0, 1);
-        return matmul(x_norm, tied_weights);
+        // Tied LM head: x_norm @ embedding^T, without materializing the transpose
+        return matmul_nt(x_norm, token_emb.weight);
     }
 
     void visit(ModuleVisitor& v) override {

@@ -1039,13 +1039,16 @@ static void check_matmul_inputs(const Tensor& a, const Tensor& b, const char* wh
     }
 }
 
-// out = a @ b (+ bias over the last dimension); bias requires b to be a single 2-D matrix
+// out = a @ b (+ bias over the last dimension); bias requires b to be a single 2-D matrix. With
+// trans_b, b is a 2-D [N, K] matrix and out = a @ b^T, read in place by a transposed GEMM.
 static std::shared_ptr<Tensor> matmul_impl(const std::shared_ptr<Tensor>& _a, const std::shared_ptr<Tensor>& _b,
                                            const std::shared_ptr<Tensor>& bias, DType compute,
-                                           std::shared_ptr<Tensor>* saved_a, std::shared_ptr<Tensor>* saved_b) {
+                                           std::shared_ptr<Tensor>* saved_a, std::shared_ptr<Tensor>* saved_b,
+                                           bool trans_b = false) {
     check_matmul_inputs(*_a, *_b, "cuda::matmul");
     check_compute_dtype(compute, "cuda::matmul");
     if (_a->ndim() < 2 || _b->ndim() < 2) throw std::runtime_error("cuda::matmul: tensors must be at least 2-D");
+    if (trans_b && (_b->ndim() != 2 || bias)) throw std::runtime_error("cuda::matmul_nt: b must be one 2-D matrix, without a bias");
     {
         // Batch dimensions: equal (ignoring leading 1s), or one operand unbatched. Two batched
         // operands of the same batch count but different shapes ([2, 3] vs [6]) do not broadcast.
@@ -1065,8 +1068,9 @@ static std::shared_ptr<Tensor> matmul_impl(const std::shared_ptr<Tensor>& _a, co
     int n2 = b->ndim();
     int r1 = a->shape[n1 - 2];
     int c1 = a->shape[n1 - 1];
-    int r2 = b->shape[n2 - 2];
-    int c2 = b->shape[n2 - 1];
+    // b's logical (math) shape is [r2, c2] = [K, N]; with trans_b it is stored as [N, K]
+    int r2 = trans_b ? b->shape[1] : b->shape[n2 - 2];
+    int c2 = trans_b ? b->shape[0] : b->shape[n2 - 1];
 
     if (c1 != r2) throw std::runtime_error("cuda::matmul: inner dimensions mismatch");
 
@@ -1102,7 +1106,12 @@ static std::shared_ptr<Tensor> matmul_impl(const std::shared_ptr<Tensor>& _a, co
     bool fused = bias && batch_size == 1 &&
                  gemm_bias(c2, r1, c1, bh->data_ptr<void>(), ah->data_ptr<void>(), bias->data_ptr<float>(),
                            out->data_ptr<float>(), compute);
-    if (!fused) {
+    if (trans_b) {
+        // Col-major C^T = W A^T: the row-major [N, K] buffer is col-major W^T, so op T gives W
+        gemm(CUBLAS_OP_T, CUBLAS_OP_N, c2, r1, c1,
+             bh->data_ptr<void>(), c1, 0, ah->data_ptr<void>(), c1, stride_a,
+             0.0f, out->data_ptr<float>(), c2, stride_c, batch_size, compute);
+    } else if (!fused) {
         gemm(CUBLAS_OP_N, CUBLAS_OP_N, c2, r1, c1,
              bh->data_ptr<void>(), c2, stride_b, ah->data_ptr<void>(), c1, stride_a,
              0.0f, out->data_ptr<float>(), c2, stride_c, batch_size, compute);
@@ -1121,6 +1130,11 @@ static std::shared_ptr<Tensor> matmul_impl(const std::shared_ptr<Tensor>& _a, co
 std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b, DType compute,
                                std::shared_ptr<Tensor>* saved_a, std::shared_ptr<Tensor>* saved_b) {
     return matmul_impl(a, b, nullptr, compute, saved_a, saved_b);
+}
+
+std::shared_ptr<Tensor> matmul_nt(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b, DType compute,
+                                  std::shared_ptr<Tensor>* saved_a, std::shared_ptr<Tensor>* saved_b) {
+    return matmul_impl(a, b, nullptr, compute, saved_a, saved_b, /*trans_b=*/true);
 }
 
 std::shared_ptr<Tensor> linear(const std::shared_ptr<Tensor>& x, const std::shared_ptr<Tensor>& w,
@@ -1152,7 +1166,7 @@ static int64_t shape_numel(const std::vector<int64_t>& shape) {
 void matmul_backward(const std::vector<int64_t>& a_shape, const std::vector<int64_t>& b_shape,
                      const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b,
                      const std::shared_ptr<Tensor>& grad_out,
-                     std::shared_ptr<Tensor>* grad_a, std::shared_ptr<Tensor>* grad_b, DType compute) {
+                     std::shared_ptr<Tensor>* grad_a, std::shared_ptr<Tensor>* grad_b, DType compute, bool trans_b) {
     if (!grad_out || (!grad_a && !grad_b)) return;
     check_compute_dtype(compute, "cuda::matmul_backward");
     if (!is_float_dtype(grad_out->dtype)) {
@@ -1165,8 +1179,10 @@ void matmul_backward(const std::vector<int64_t>& a_shape, const std::vector<int6
 
     int r1 = a_shape[a_shape.size() - 2];
     int c1 = a_shape[a_shape.size() - 1];
-    int r2 = b_shape[b_shape.size() - 2];
-    int c2 = b_shape[b_shape.size() - 1];
+    if (trans_b && b_shape.size() != 2) throw std::runtime_error("cuda::matmul_backward: a transposed b must be 2-D");
+    // b's logical shape [r2, c2]; with trans_b, b_shape is its stored [c2, r2] layout
+    int r2 = trans_b ? b_shape[1] : b_shape[b_shape.size() - 2];
+    int c2 = trans_b ? b_shape[0] : b_shape[b_shape.size() - 1];
 
     int batch_size_a = shape_numel(a_shape) / ((int64_t)r1 * c1);
     int batch_size_b = shape_numel(b_shape) / ((int64_t)r2 * c2);
@@ -1204,6 +1220,12 @@ void matmul_backward(const std::vector<int64_t>& a_shape, const std::vector<int6
     float* dA = grad_a ? (*grad_a)->data_ptr<float>() : nullptr;
     float* dB = grad_b ? (*grad_b)->data_ptr<float>() : nullptr;
 
+    if (trans_b) {
+        // b is the shared [N, K] matrix W (folded above): dA = dC W, and dW = dC^T A in W's layout
+        if (dA) gemm(CUBLAS_OP_N, CUBLAS_OP_N, c1, r1, c2, B, c1, 0, G, c2, 0, 0.0f, dA, c1, 0, 1, compute);
+        if (dB) gemm(CUBLAS_OP_N, CUBLAS_OP_T, c1, c2, r1, A, c1, 0, G, c2, 0, 0.0f, dB, c1, 0, 1, compute);
+        return;
+    }
     if (batch_size_a == batch_size_b) {
         // dA = dC B^T, dB = A^T dC
         if (dA) gemm(CUBLAS_OP_T, CUBLAS_OP_N, c1, r1, c2, B, c2, stride_b, G, c2, stride_g,

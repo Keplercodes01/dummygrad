@@ -309,6 +309,13 @@ static std::vector<GradTest> build_grad_tests() {
         auto h = matmul(L[1], L[0]);                     // [5, 4]
         return matmul(h, transpose(L[0], 0, 1));         // [5, 6]
     });
+    // a @ b^T without a transposed copy (the tied LM head), alone and tied like an embedding
+    add_test("matmul_nt", {leaf({2, 3, 4}), leaf({5, 4})},
+             [](const Leaves& L, Device) { return matmul_nt(L[0], L[1]); });
+    add_test("tied_weight_nt", {leaf({6, 4}), leaf({5, 6})}, [](const Leaves& L, Device) {
+        auto h = matmul(L[1], L[0]);  // [5, 4]
+        return matmul_nt(h, L[0]);    // [5, 6]
+    });
     // Residual fan-out: AddBackward hands the same gradient tensor to several edges
     add_test("residual_fanout", {leaf({3, 4}, -1, 1, 0.1f)}, [](const Leaves& L, Device) {
         auto a = add(L[0], L[0]);
