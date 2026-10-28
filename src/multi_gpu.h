@@ -239,6 +239,7 @@ public:
                 CUDA_CHECK(cudaMemcpyPeer(dst->data_ptr<void>(), multi_gpu_detail::device_of(dst->data_ptr<void>()),
                                           src->data_ptr<void>(), multi_gpu_detail::device_of(src->data_ptr<void>()),
                                           (size_t)src->size() * dtype_size(src->dtype)));
+                dst->storage->bump_version();
             }
         }
     }

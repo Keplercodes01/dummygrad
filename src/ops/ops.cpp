@@ -1,10 +1,13 @@
 #include "ops.h"
 #include <stdexcept>
 
-// TPU tensors keep their authoritative copy in host memory (Storage::data); a TPU buffer
-// (tpu_handle) is a copy that host writes make stale, so every host write drops it
-static void host_written(Tensor& t) {
-    if (t.device == Device::TPU && t.storage) t.storage->tpu_handle.reset();
+// After an in-place write: bump the storage's version (cached casts are now stale) and, for a TPU
+// tensor, drop its TPU buffer. TPU tensors keep their authoritative copy in host memory; the buffer
+// is a copy that host writes make stale.
+static void written(Tensor& t) {
+    if (!t.storage) return;
+    t.storage->bump_version();
+    if (t.device == Device::TPU) t.storage->tpu_handle.reset();
 }
 
 // Forward declarations for the pure C++ CPU kernels
@@ -31,10 +34,10 @@ namespace ops {
             case Device::MPS:
             case Device::TPU:
                 cpu::fill(tensor, value);
-                host_written(tensor);
+                written(tensor);
                 break;
 #ifdef USE_CUDA
-            case Device::CUDA: cuda::fill(tensor, value); break;
+            case Device::CUDA: cuda::fill(tensor, value); written(tensor); break;
 #endif
             default: throw std::runtime_error("ops::fill: Device not supported");
         }
@@ -47,10 +50,10 @@ namespace ops {
             case Device::MPS:
             case Device::TPU:
                 cpu::add_inplace(dst, src);
-                host_written(dst);
+                written(dst);
                 break;
 #ifdef USE_CUDA
-            case Device::CUDA: cuda::add_inplace(dst, src); break;
+            case Device::CUDA: cuda::add_inplace(dst, src); written(dst); break;
 #endif
             default: throw std::runtime_error("ops::add_inplace: Device not supported");
         }
@@ -62,10 +65,10 @@ namespace ops {
             case Device::MPS:
             case Device::TPU:
                 cpu::copy_from_vector(tensor, values);
-                host_written(tensor);
+                written(tensor);
                 break;
 #ifdef USE_CUDA
-            case Device::CUDA: cuda::copy_from_vector(tensor, values); break;
+            case Device::CUDA: cuda::copy_from_vector(tensor, values); written(tensor); break;
 #endif
             default: throw std::runtime_error("ops::copy_from_vector: Device not supported");
         }
@@ -78,10 +81,10 @@ namespace ops {
             case Device::MPS:
             case Device::TPU:
                 cpu::make_contiguous(dst, src);
-                host_written(dst);
+                written(dst);
                 break;
 #ifdef USE_CUDA
-            case Device::CUDA: cuda::make_contiguous(dst, src); break;
+            case Device::CUDA: cuda::make_contiguous(dst, src); written(dst); break;
 #endif
             default: throw std::runtime_error("ops::make_contiguous: Device not supported");
         }
