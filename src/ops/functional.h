@@ -137,7 +137,6 @@ struct ReluBackward : public Node {
         if (grads.empty() || !grads[0] || !a) return {nullptr};
         std::shared_ptr<Tensor> grad = grads[0];
         auto da = std::make_shared<Tensor>(a->shape, a->device, a->dtype, false);
-        da->fill_(0.0f);
 #ifdef USE_CUDA
         if (a->device == Device::CUDA) {
             cuda::relu_backward(a->data_ptr<float>(), grad->data_ptr<float>(), da->data_ptr<float>(), a->size());
@@ -213,7 +212,6 @@ struct TanhBackward : public Node {
         auto grad_cpu = (dev == Device::CPU) ? grad : grad->cpu();
         auto out_cpu = (dev == Device::CPU) ? out_val : out_val->cpu();
         auto da = std::make_shared<Tensor>(out_cpu->shape, Device::CPU, out_cpu->dtype, false);
-        da->fill_(0.0f);
         const float* g_ptr = grad_cpu->data_ptr<float>();
         const float* out_ptr = out_cpu->data_ptr<float>();
         float* da_ptr = da->data_ptr<float>();
@@ -283,7 +281,6 @@ struct GeluBackward : public Node {
         if (grads.empty() || !grads[0] || !a) return {nullptr};
         std::shared_ptr<Tensor> grad = grads[0];
         auto da = std::make_shared<Tensor>(a->shape, a->device, a->dtype, false);
-        da->fill_(0.0f);
 #ifdef USE_CUDA
         if (a->device == Device::CUDA) {
             cuda::gelu_backward(a->data_ptr<float>(), grad->data_ptr<float>(), da->data_ptr<float>(), a->size());
@@ -361,7 +358,6 @@ struct SigmoidBackward : public Node {
         if (grads.empty() || !grads[0] || !out_val) return {nullptr};
         std::shared_ptr<Tensor> grad = grads[0];
         auto da = std::make_shared<Tensor>(out_val->shape, out_val->device, out_val->dtype, false);
-        da->fill_(0.0f);
 #ifdef USE_CUDA
         if (out_val->device == Device::CUDA) {
             cuda::sigmoid_backward(out_val->data_ptr<float>(), grad->data_ptr<float>(), da->data_ptr<float>(), out_val->size());
@@ -450,7 +446,6 @@ struct SiluBackward : public Node {
         if (grads.empty() || !grads[0] || !a) return {nullptr};
         std::shared_ptr<Tensor> grad = grads[0];
         auto da = std::make_shared<Tensor>(a->shape, a->device, a->dtype, false);
-        da->fill_(0.0f);
 #ifdef USE_CUDA
         if (a->device == Device::CUDA) {
             cuda::silu_backward(a->data_ptr<float>(), grad->data_ptr<float>(), da->data_ptr<float>(), a->size());
@@ -547,7 +542,6 @@ struct LeakyReluBackward : public Node {
         if (grads.empty() || !grads[0] || !a) return {nullptr};
         std::shared_ptr<Tensor> grad = grads[0];
         auto da = std::make_shared<Tensor>(a->shape, a->device, a->dtype, false);
-        da->fill_(0.0f);
 #ifdef USE_CUDA
         if (a->device == Device::CUDA) {
             cuda::leaky_relu_backward(a->data_ptr<float>(), grad->data_ptr<float>(), da->data_ptr<float>(), a->size(), negative_slope);
@@ -1970,27 +1964,23 @@ inline std::shared_ptr<Tensor> rdiv_scalar(float s, const std::shared_ptr<Tensor
 #include <stdexcept>
 
 struct SliceBackward : public Node {
-    std::shared_ptr<Tensor> original_tensor;
+    std::vector<int64_t> in_shape;  // the sliced tensor's shape (not the tensor: that would keep its memory alive)
     int dim;
     int start;
     int end;
-    
-    SliceBackward(std::shared_ptr<Tensor> original, int dim, int start, int end)
-        : original_tensor(original), dim(dim), start(start), end(end) {}
 
-    void release_variables() override {
-        original_tensor = nullptr;
-    }
+    SliceBackward(std::vector<int64_t> in_shape, int dim, int start, int end)
+        : in_shape(std::move(in_shape)), dim(dim), start(start), end(end) {}
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
-        if (grads.empty() || !grads[0] || !original_tensor) return {nullptr};
+        if (grads.empty() || !grads[0]) return {nullptr};
         const auto& grad_out = grads[0];  // dense: the engine densifies grads
         Device dev = grad_out->device;
 
         // Zero gradient for the full input; the sliced window receives grad_out. grad_in is dense,
         // so the window is `len` consecutive rows of `inner` elements inside each of `outer` blocks:
         // one strided 2-D copy of `outer` rows, in any dtype.
-        const auto& shape = original_tensor->shape;
+        const auto& shape = in_shape;
         auto grad_in = std::make_shared<Tensor>(shape, dev, grad_out->dtype, false);
         int64_t outer = 1, inner = 1;
         for (int d = 0; d < dim; ++d) outer *= shape[d];
@@ -2013,7 +2003,7 @@ struct SliceBackward : public Node {
 #endif
         if (dev != Device::CPU) {
             // Other accelerators: assemble on the host
-            auto host = SliceBackward(original_tensor, dim, start, end).apply({grad_out->cpu()});
+            auto host = SliceBackward(in_shape, dim, start, end).apply({grad_out->cpu()});
             return {host[0]->to(dev)};
         }
         std::memset(grad_in->data_ptr<void>(), 0, grad_in->size() * elem);
@@ -2037,7 +2027,7 @@ inline std::shared_ptr<Tensor> slice(const std::shared_ptr<Tensor>& x, int dim, 
     auto out = std::make_shared<Tensor>(x->storage, out_shape, x->strides, new_offset, x->device, x->dtype, needs_grad(x));
 
     if (needs_grad(x)) {
-        auto grad_fn = std::make_shared<SliceBackward>(x, dim, start, end);
+        auto grad_fn = std::make_shared<SliceBackward>(x->shape, dim, start, end);
         grad_fn->add_next_edge(get_grad_edge(x).function);
         out->grad_fn = grad_fn;
     }
