@@ -561,6 +561,189 @@ __global__ void k_max_pool2d_backward(const float* grad, const float* argmax, fl
 }
 
 // ---------------------------------------------------------------------------------------------
+// Reductions over one of the last two dims of [batch, rows, cols]: over_rows reduces dim -2
+// (one output per batch and column), else dim -1 (one per batch and row). Mirror the host loops of
+// sum, mean, var and std_dev in ops/functional.h.
+// ---------------------------------------------------------------------------------------------
+
+struct AxisSum {
+    const float* x;
+    int64_t rows, cols;
+    bool over_rows;
+    struct Ctx {
+        int64_t base, step;
+    };
+    __device__ Ctx context(int64_t t) const {
+        if (over_rows) {
+            int64_t b = t / cols;
+            return Ctx{b * rows * cols + (t - b * cols), cols};
+        }
+        return Ctx{t * cols, 1};
+    }
+    __device__ float operator()(const Ctx& c, int64_t k) const { return x[c.base + k * c.step]; }
+};
+
+// Squared deviation from each output's mean
+struct AxisSqDev {
+    const float* x;
+    const float* mean;
+    int64_t rows, cols;
+    bool over_rows;
+    struct Ctx {
+        int64_t base, step;
+        float m;
+    };
+    __device__ Ctx context(int64_t t) const {
+        if (over_rows) {
+            int64_t b = t / cols;
+            return Ctx{b * rows * cols + (t - b * cols), cols, mean[t]};
+        }
+        return Ctx{t * cols, 1, mean[t]};
+    }
+    __device__ float operator()(const Ctx& c, int64_t k) const {
+        float d = x[c.base + k * c.step] - c.m;
+        return d * d;
+    }
+};
+
+// Index of the output an input element of [batch, rows, cols] reduces into
+__device__ __forceinline__ int64_t axis_output(int64_t i, int64_t rows, int64_t cols, bool over_rows) {
+    int64_t b = i / (rows * cols);
+    int64_t rem = i - b * rows * cols;
+    int64_t r = rem / cols;
+    return over_rows ? b * cols + (rem - r * cols) : b * rows + r;
+}
+
+__global__ void k_reduce_axis_backward(const float* g, float* ga, int64_t n, int64_t rows, int64_t cols, bool over_rows,
+                                       float divisor) {
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        ga[i] = g[axis_output(i, rows, cols, over_rows)] / divisor;
+    }
+}
+
+// var: 2 (x - mean) / count * g;  std: (x - mean) / (count * (std + 1e-8)) * g, as the host code
+__global__ void k_moment_backward(const float* x, const float* mean, const float* stat, const float* g, float* ga,
+                                  int64_t n, int64_t rows, int64_t cols, bool over_rows, bool is_std, float count) {
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        int64_t o = axis_output(i, rows, cols, over_rows);
+        float d = x[i] - mean[o];
+        ga[i] = is_std ? (d / (count * (stat[o] + 1e-8f))) * g[o] : (2.0f * d / count) * g[o];
+    }
+}
+
+__global__ void k_sqrt_inplace(float* x, int64_t n) {
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        x[i] = sqrtf(x[i]);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Elementwise losses averaged over their elements (kind: 0 MSE, 1 L1, 2 cross entropy on
+// probabilities), mirroring mse, l1_loss and cross_entropy in ops/functional.h
+// ---------------------------------------------------------------------------------------------
+
+struct LossTerm {
+    int kind;
+    const float* p;
+    const float* t;
+    struct Ctx {};
+    __device__ Ctx context(int64_t) const { return Ctx{}; }
+    __device__ float operator()(const Ctx&, int64_t k) const {
+        float pv = p[k], tv = t[k];
+        if (kind == 0) {
+            float d = pv - tv;
+            return d * d;
+        }
+        if (kind == 1) return fabsf(pv - tv);
+        return -tv * logf(pv + 1e-8f);
+    }
+};
+
+__global__ void k_loss_backward(int kind, const float* p, const float* t, const float* dloss, float* grad, int64_t n,
+                                float divisor) {
+    float g = dloss[0];
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        float pv = p[i], tv = t[i];
+        if (kind == 0) {
+            grad[i] = (2.0f * (pv - tv) / divisor) * g;
+        } else if (kind == 1) {
+            float diff = pv - tv;
+            float sgn = (diff > 0.0f) ? 1.0f : ((diff < 0.0f) ? -1.0f : 0.0f);
+            grad[i] = (sgn / divisor) * g;
+        } else {
+            grad[i] = -(tv / ((pv + 1e-8f) * divisor)) * g;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Boolean mask: masked (m == 0) scores become -1e9 and pass no gradient
+// ---------------------------------------------------------------------------------------------
+
+__global__ void k_bool_mask_forward(const float* a, const float* m, float* out, int64_t n) {
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        out[i] = (m[i] == 0.0f) ? -1e9f : a[i];
+    }
+}
+
+__global__ void k_bool_mask_backward(const float* g, const float* m, float* ga, int64_t n) {
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        ga[i] = (m[i] != 0.0f) ? g[i] : 0.0f;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// im2col / col2im (dilation 1), laid out as im2col_cpu / col2im_cpu in ops/functional.h:
+// col [batch, C * kH * kW, H_out, W_out], channel c_col = (c * kH + kh) * kW + kw
+// ---------------------------------------------------------------------------------------------
+
+struct ConvGeometry {
+    int C, H, W, kH, kW, pH, pW, sH, sW, H_out, W_out;
+};
+
+__global__ void k_im2col(const float* x, float* col, int64_t batch, ConvGeometry g) {
+    int64_t cc = (int64_t)g.C * g.kH * g.kW;
+    int64_t n = batch * cc * g.H_out * g.W_out;
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        int w = (int)(i % g.W_out);
+        int h = (int)((i / g.W_out) % g.H_out);
+        int64_t c_col = (i / ((int64_t)g.W_out * g.H_out)) % cc;
+        int64_t b = i / ((int64_t)g.W_out * g.H_out * cc);
+        int kw = (int)(c_col % g.kW);
+        int kh = (int)((c_col / g.kW) % g.kH);
+        int64_t c = c_col / ((int64_t)g.kW * g.kH);
+        int row = kh + h * g.sH - g.pH;
+        int colx = kw + w * g.sW - g.pW;
+        col[i] = (row >= 0 && colx >= 0 && row < g.H && colx < g.W) ? x[((b * g.C + c) * g.H + row) * g.W + colx] : 0.0f;
+    }
+}
+
+// One thread per image element sums the columns that read it, in (kh, kw) order: the order in
+// which col2im_cpu adds them, so CPU and GPU agree bit for bit
+__global__ void k_col2im(const float* col, float* x, int64_t batch, ConvGeometry g) {
+    int64_t cc = (int64_t)g.C * g.kH * g.kW;
+    int64_t n = batch * g.C * g.H * g.W;
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        int iw = (int)(i % g.W);
+        int ih = (int)((i / g.W) % g.H);
+        int64_t c = (i / ((int64_t)g.W * g.H)) % g.C;
+        int64_t b = i / ((int64_t)g.W * g.H * g.C);
+        float acc = 0.0f;
+        for (int kh = 0; kh < g.kH; ++kh) {
+            int hs = ih + g.pH - kh;
+            if (hs < 0 || hs % g.sH != 0 || hs / g.sH >= g.H_out) continue;
+            for (int kw = 0; kw < g.kW; ++kw) {
+                int ws = iw + g.pW - kw;
+                if (ws < 0 || ws % g.sW != 0 || ws / g.sW >= g.W_out) continue;
+                int64_t c_col = (c * g.kH + kh) * g.kW + kw;
+                acc += col[((b * cc + c_col) * g.H_out + hs / g.sH) * g.W_out + ws / g.sW];
+            }
+        }
+        x[i] = acc;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Multi-tensor kernels: one launch covers a list of buffers. The list is uploaded as n pointers
 // followed by n sizes (uint64); blockIdx.y picks the buffer (offset by `first` for lists longer
 // than the grid's y limit) and the blocks along x stride through it.
@@ -796,6 +979,84 @@ void max_pool2d_backward(const float* grad, const float* argmax, float* gx, int6
     int64_t n = planes * H * W;
     if (n == 0) return;
     k_max_pool2d_backward<<<grid_for(n), kThreads>>>(grad, argmax, gx, planes, H, W, H_out, W_out, kH, kW, sH, sW);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void reduce_axis(const float* x, float* out, int64_t batch, int64_t rows, int64_t cols, bool over_rows, float divisor) {
+    int64_t n_out = batch * (over_rows ? cols : rows);
+    if (n_out == 0) return;
+    reduce_terms(AxisSum{x, rows, cols, over_rows}, n_out, over_rows ? rows : cols, out);
+    if (divisor != 1.0f) scalar_forward(3, out, divisor, out, n_out);
+}
+
+void reduce_axis_backward(const float* g, float* ga, int64_t batch, int64_t rows, int64_t cols, bool over_rows,
+                          float divisor) {
+    int64_t n = batch * rows * cols;
+    if (n == 0) return;
+    k_reduce_axis_backward<<<grid_for(n), kThreads>>>(g, ga, n, rows, cols, over_rows, divisor);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void moment_axis(const float* x, float* mean, float* out, int64_t batch, int64_t rows, int64_t cols, bool over_rows,
+                 bool take_sqrt) {
+    int64_t n_out = batch * (over_rows ? cols : rows);
+    if (n_out == 0) return;
+    float count = (float)(over_rows ? rows : cols);
+    reduce_axis(x, mean, batch, rows, cols, over_rows, count);
+    reduce_terms(AxisSqDev{x, mean, rows, cols, over_rows}, n_out, over_rows ? rows : cols, out);
+    scalar_forward(3, out, count, out, n_out);
+    if (take_sqrt) {
+        k_sqrt_inplace<<<grid_for(n_out), kThreads>>>(out, n_out);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+void moment_axis_backward(const float* x, const float* mean, const float* stat, const float* g, float* ga, int64_t batch,
+                          int64_t rows, int64_t cols, bool over_rows, bool is_std) {
+    int64_t n = batch * rows * cols;
+    if (n == 0) return;
+    float count = (float)(over_rows ? rows : cols);
+    k_moment_backward<<<grid_for(n), kThreads>>>(x, mean, stat, g, ga, n, rows, cols, over_rows, is_std, count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void pointwise_loss_forward(int kind, const float* pred, const float* target, float* loss, int64_t n, float divisor) {
+    reduce_terms(LossTerm{kind, pred, target}, 1, n, loss);
+    scalar_forward(3, loss, divisor, loss, 1);
+}
+
+void pointwise_loss_backward(int kind, const float* pred, const float* target, const float* dloss, float* grad, int64_t n,
+                             float divisor) {
+    if (n == 0) return;
+    k_loss_backward<<<grid_for(n), kThreads>>>(kind, pred, target, dloss, grad, n, divisor);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void bool_mask_forward(const float* a, const float* m, float* out, int64_t n) {
+    if (n == 0) return;
+    k_bool_mask_forward<<<grid_for(n), kThreads>>>(a, m, out, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void bool_mask_backward(const float* g, const float* m, float* ga, int64_t n) {
+    if (n == 0) return;
+    k_bool_mask_backward<<<grid_for(n), kThreads>>>(g, m, ga, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void im2col(const float* x, float* col, int64_t batch, int C, int H, int W, int kH, int kW, int pH, int pW, int sH, int sW,
+            int H_out, int W_out) {
+    int64_t n = batch * C * kH * kW * (int64_t)H_out * W_out;
+    if (n == 0) return;
+    k_im2col<<<grid_for(n), kThreads>>>(x, col, batch, ConvGeometry{C, H, W, kH, kW, pH, pW, sH, sW, H_out, W_out});
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void col2im(const float* col, float* x, int64_t batch, int C, int H, int W, int kH, int kW, int pH, int pW, int sH, int sW,
+            int H_out, int W_out) {
+    int64_t n = batch * C * (int64_t)H * W;
+    if (n == 0) return;
+    k_col2im<<<grid_for(n), kThreads>>>(col, x, batch, ConvGeometry{C, H, W, kH, kW, pH, pW, sH, sW, H_out, W_out});
     CUDA_CHECK(cudaGetLastError());
 }
 

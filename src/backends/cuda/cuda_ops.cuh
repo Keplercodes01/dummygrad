@@ -140,6 +140,37 @@ namespace cuda {
     // bit-identical to the broadcast-add backward it replaces.
     void bias_grad(const float* grad, float* db, int64_t rows, int64_t cols);
 
+    // Reductions over one of the last two dims of [batch, rows, cols]: over_rows reduces dim -2
+    // (out [batch, cols]), else dim -1 (out [batch, rows]). Deterministic. out = sum / divisor.
+    void reduce_axis(const float* x, float* out, int64_t batch, int64_t rows, int64_t cols, bool over_rows, float divisor);
+    // ga[i] = g[output of element i] / divisor (the gradient of reduce_axis)
+    void reduce_axis_backward(const float* g, float* ga, int64_t batch, int64_t rows, int64_t cols, bool over_rows,
+                              float divisor);
+    // Population variance along the axis (take_sqrt: standard deviation); mean receives the means
+    void moment_axis(const float* x, float* mean, float* out, int64_t batch, int64_t rows, int64_t cols, bool over_rows,
+                     bool take_sqrt);
+    // Its gradient given the means and the forward's variance or std (stat):
+    // var: 2 (x - mean) / n * g;  std: (x - mean) / (n (std + 1e-8)) * g
+    void moment_axis_backward(const float* x, const float* mean, const float* stat, const float* g, float* ga,
+                              int64_t batch, int64_t rows, int64_t cols, bool over_rows, bool is_std);
+
+    // Elementwise losses summed over n elements and divided by divisor into one device float.
+    // kind: 0 squared error, 1 absolute error, 2 cross entropy on probabilities (-t log(p + 1e-8))
+    void pointwise_loss_forward(int kind, const float* pred, const float* target, float* loss, int64_t n, float divisor);
+    void pointwise_loss_backward(int kind, const float* pred, const float* target, const float* dloss, float* grad,
+                                 int64_t n, float divisor);
+
+    // Boolean mask: out = (m == 0) ? -1e9 : a; the gradient passes where m != 0
+    void bool_mask_forward(const float* a, const float* m, float* out, int64_t n);
+    void bool_mask_backward(const float* g, const float* m, float* ga, int64_t n);
+
+    // im2col / col2im with dilation 1: col is [batch, C * kH * kW, H_out, W_out]. col2im writes
+    // (does not accumulate into) x, summing deterministically.
+    void im2col(const float* x, float* col, int64_t batch, int C, int H, int W, int kH, int kW, int pH, int pW, int sH,
+                int sW, int H_out, int W_out);
+    void col2im(const float* col, float* x, int64_t batch, int C, int H, int W, int kH, int kW, int pH, int pW, int sH,
+                int sW, int H_out, int W_out);
+
     // Sum of squares over several device buffers, in double precision (gradient clipping): one
     // launch for all of them, deterministic, one host sync
     double sum_of_squares(const std::vector<const float*>& buffers, const std::vector<int64_t>& sizes);
