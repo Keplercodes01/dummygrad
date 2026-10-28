@@ -53,6 +53,14 @@ inline bool needs_grad(const std::shared_ptr<Tensor>& t) {
     return grad_enabled() && t && t->requires_grad;
 }
 
+// What a backward node keeps of its op's output: the same memory and shape, without the grad_fn.
+// Saving the output tensor itself would form a cycle (output -> grad_fn -> output) that keeps the
+// node, and through its edges the whole graph, alive whenever backward never runs on it.
+inline std::shared_ptr<Tensor> saved_output(const std::shared_ptr<Tensor>& out) {
+    return std::make_shared<Tensor>(out->storage, out->shape, out->strides, out->global_offset, out->device, out->dtype,
+                                    false);
+}
+
 // Dense copy of a strided view (transpose, slice) that stays connected to the autograd graph.
 // Ops whose kernels index raw memory call this on every tensor input; it returns the input
 // itself when it is already contiguous, so the common case costs nothing.
@@ -229,7 +237,7 @@ inline std::shared_ptr<Tensor> tanh(const std::shared_ptr<Tensor>& a_in) {
         auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
         cuda::tanh_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size());
         if (req_grad) {
-            auto grad_fn = std::make_shared<TanhBackward>(out);
+            auto grad_fn = std::make_shared<TanhBackward>(saved_output(out));
             grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
@@ -251,7 +259,7 @@ inline std::shared_ptr<Tensor> tanh(const std::shared_ptr<Tensor>& a_in) {
     out->requires_grad = req_grad;
 
     if (req_grad) {
-        auto grad_fn = std::make_shared<TanhBackward>(out);
+        auto grad_fn = std::make_shared<TanhBackward>(saved_output(out));
         grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
@@ -387,7 +395,7 @@ inline std::shared_ptr<Tensor> sigmoid(const std::shared_ptr<Tensor>& a_in) {
     if (a->device == Device::CUDA) {
         cuda::sigmoid_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size());
         if (req_grad) {
-            auto grad_fn = std::make_shared<SigmoidBackward>(out);
+            auto grad_fn = std::make_shared<SigmoidBackward>(saved_output(out));
             grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
@@ -397,7 +405,7 @@ inline std::shared_ptr<Tensor> sigmoid(const std::shared_ptr<Tensor>& a_in) {
     if (a->device == Device::MPS) {
         MetalBackend::get().sigmoid_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size());
         if (req_grad) {
-            auto grad_fn = std::make_shared<SigmoidBackward>(out);
+            auto grad_fn = std::make_shared<SigmoidBackward>(saved_output(out));
             grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
@@ -406,7 +414,7 @@ inline std::shared_ptr<Tensor> sigmoid(const std::shared_ptr<Tensor>& a_in) {
     if (a->device == Device::TPU && a->storage->tpu_handle) {
         out->storage->tpu_handle = TPUEngine::get().sigmoid(a->storage->tpu_handle, a->shape, a->dtype);
         if (req_grad) {
-            auto grad_fn = std::make_shared<SigmoidBackward>(out);
+            auto grad_fn = std::make_shared<SigmoidBackward>(saved_output(out));
             grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
@@ -421,7 +429,7 @@ inline std::shared_ptr<Tensor> sigmoid(const std::shared_ptr<Tensor>& a_in) {
     }
 
     if (req_grad) {
-        auto grad_fn = std::make_shared<SigmoidBackward>(out);
+        auto grad_fn = std::make_shared<SigmoidBackward>(saved_output(out));
         grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }
@@ -2113,7 +2121,7 @@ inline std::shared_ptr<Tensor> softmax(const std::shared_ptr<Tensor>& a_in, int 
         auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
         cuda::softmax_forward(a->data_ptr<float>(), out->data_ptr<float>(), batch_size * r, c);
         if (req_grad) {
-            auto grad_fn = std::make_shared<SoftmaxBackward>(out, r, c, batch_size, ndim);
+            auto grad_fn = std::make_shared<SoftmaxBackward>(saved_output(out), r, c, batch_size, ndim);
             grad_fn->add_next_edge(get_grad_edge(a).function);
             out->grad_fn = grad_fn;
         }
@@ -2126,7 +2134,7 @@ inline std::shared_ptr<Tensor> softmax(const std::shared_ptr<Tensor>& a_in, int 
         auto out_cpu = softmax(a_cpu, axis);
         auto out_res = out_cpu->to(a->device);
         if (req_grad) {
-            auto grad_fn = std::make_shared<SoftmaxBackward>(out_res, r, c, batch_size, ndim);
+            auto grad_fn = std::make_shared<SoftmaxBackward>(saved_output(out_res), r, c, batch_size, ndim);
             grad_fn->add_next_edge(get_grad_edge(a).function);
             out_res->grad_fn = grad_fn;
         }
@@ -2154,7 +2162,7 @@ inline std::shared_ptr<Tensor> softmax(const std::shared_ptr<Tensor>& a_in, int 
     }
 
     if (req_grad) {
-        auto grad_fn = std::make_shared<SoftmaxBackward>(out, r, c, batch_size, ndim);
+        auto grad_fn = std::make_shared<SoftmaxBackward>(saved_output(out), r, c, batch_size, ndim);
         grad_fn->add_next_edge(get_grad_edge(a).function);
         out->grad_fn = grad_fn;
     }

@@ -50,7 +50,16 @@ int64_t Tensor::flat_idx(const std::vector<int64_t>& idx) const {
     return pos;
 }
 
-bool Tensor::is_contiguous() const { return strides == make_strides(shape); }
+// Row-major strides, checked in place: this runs several times per op, so it must not allocate
+bool Tensor::is_contiguous() const {
+    if (strides.size() != shape.size()) return false;
+    int64_t expected = 1;
+    for (int64_t d = (int64_t)shape.size() - 1; d >= 0; --d) {
+        if (strides[d] != expected) return false;
+        expected *= shape[d];
+    }
+    return true;
+}
 int64_t Tensor::ndim() const { return (int64_t)shape.size(); }
 int64_t Tensor::size() const {
     int64_t total = 1;
@@ -193,6 +202,11 @@ void tensor_add_inplace(std::shared_ptr<Tensor>& dst, const std::shared_ptr<Tens
         return;
     }
     ops::add_inplace(*dst, *src);
+}
+
+bool grad_is_exclusive(const std::shared_ptr<Tensor>& g) {
+    return g && g.use_count() == 1 && g->storage && g->storage.use_count() == 1 && g->is_contiguous() &&
+           g->global_offset == 0 && g->storage->total_bytes == (size_t)g->size() * dtype_size(g->dtype);
 }
 
 Edge get_grad_edge(const std::shared_ptr<Tensor>& t) {

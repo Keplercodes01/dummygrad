@@ -25,6 +25,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 using TensorPtr = std::shared_ptr<Tensor>;
@@ -812,6 +813,69 @@ static std::string engine_deep_chain() {
     for (int i = 0; i < 3000; ++i) y = add_scalar(y, 0.001f);
     scalar_sum(y)->backward();
     return expect_all(x, 1.0f, "3000-op chain");
+}
+
+// Every node reachable from t's grad_fn, except the leaves' AccumulateGrad nodes (the leaves own those)
+static std::vector<std::weak_ptr<Node>> graph_nodes(const TensorPtr& t) {
+    std::vector<std::weak_ptr<Node>> out;
+    std::vector<std::shared_ptr<Node>> stack;
+    std::unordered_set<Node*> seen;
+    if (t->grad_fn) stack.push_back(t->grad_fn);
+    while (!stack.empty()) {
+        auto node = stack.back();
+        stack.pop_back();
+        if (!seen.insert(node.get()).second) continue;
+        if (!dynamic_cast<AccumulateGrad*>(node.get())) out.push_back(node);
+        for (const auto& edge : node->next_edges) {
+            if (edge.function) stack.push_back(edge.function);
+        }
+    }
+    return out;
+}
+
+// A graph whose backward never runs (evaluation without NoGradGuard, a skipped step) must be freed
+// with its output. A backward node that keeps its own op's output forms a reference cycle instead,
+// which leaks the node, its saved tensors and every node upstream of it.
+static std::string expect_graph_freed(const std::string& what, const std::function<TensorPtr()>& build) {
+    std::weak_ptr<Tensor> out_ref;
+    std::vector<std::weak_ptr<Node>> nodes;
+    {
+        auto out = build();
+        out_ref = out;
+        nodes = graph_nodes(out);
+    }
+    if (nodes.empty()) return what + ": built no graph";
+    if (!out_ref.expired()) return what + ": the output outlived its last reference";
+    for (const auto& n : nodes) {
+        if (auto alive = n.lock()) return what + ": " + alive->name() + " outlived its graph";
+    }
+    return "";
+}
+
+static std::string engine_graph_freed_without_backward(Device dev) {
+    auto input = [dev](std::vector<int64_t> shape) { return upload(random_values(numel(shape), -1, 1), shape, dev, true); };
+    MultiHeadAttention mha(8, 2, 0, true);
+    manual_seed(4);
+    ModernTransformer model(16, 8, 16, 2, 1, 1);
+    if (dev == Device::CUDA) {
+        mha.cuda();
+        model.cuda();
+    }
+    const std::vector<std::pair<std::string, std::function<TensorPtr()>>> cases = {
+        {"tanh", [&] { return tanh(input({3, 4})); }},
+        {"sigmoid", [&] { return sigmoid(input({3, 4})); }},
+        {"softmax", [&] { return softmax(input({3, 4})); }},
+        {"attention", [&] { return mha.forward(input({2, 3, 8})); }},
+        {"transformer + loss", [&] {
+             return fused_cross_entropy(model.forward(upload({1, 2, 3, 4}, {1, 4}, dev, false)),
+                                        upload({2, 3, 4, 5}, {1, 4}, dev, false));
+         }},
+    };
+    for (const auto& [name, build] : cases) {
+        auto err = expect_graph_freed(name, build);
+        if (!err.empty()) return err;
+    }
+    return "";
 }
 
 // ---------------------------------------------------------------------------
@@ -1840,6 +1904,11 @@ int main() {
     run_case(r, "engine/concurrent_fanin", engine_concurrent_fanin);
     run_case(r, "engine/adopted_grads_do_not_alias", engine_adopted_grads_do_not_alias);
     run_case(r, "engine/deep_chain", engine_deep_chain);
+    run_case(r, "engine/graph_freed_without_backward", [] { return engine_graph_freed_without_backward(Device::CPU); });
+    if (has_cuda) {
+        run_case(r, "engine/graph_freed_without_backward_cuda",
+                 [] { return engine_graph_freed_without_backward(Device::CUDA); });
+    }
     run_case(r, "engine/calling_thread", [] { return engine_calling_thread(Device::CPU); });
     if (has_cuda) run_case(r, "engine/calling_thread_cuda", [] { return engine_calling_thread(Device::CUDA); });
 

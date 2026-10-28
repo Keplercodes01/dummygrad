@@ -120,14 +120,21 @@ void AutogradEngine::execute(std::shared_ptr<Node> root, const std::vector<int64
 
     auto sum_slot = [](Slot& slot) -> std::shared_ptr<Tensor> {
         if (slot.empty()) return nullptr;
-        if (slot.size() == 1) return slot[0].grad;
+        if (slot.size() == 1) return std::move(slot[0].grad);
         std::sort(slot.begin(), slot.end(), [](const Contribution& a, const Contribution& b) {
             return a.producer != b.producer ? a.producer < b.producer : a.edge < b.edge;
         });
-        // Producers may hand one tensor to several edges (AddBackward, views), so accumulate into
-        // a fresh copy rather than into any contribution.
+        // Accumulate into one of the first two contributions when nothing else references it,
+        // which saves copying it (a residual merge usually brings one fresh gradient). Float
+        // addition is commutative, so a + b and b + a are bit-identical and the fixed order holds.
+        // Producers may hand one tensor to several edges (AddBackward, views): grad_is_exclusive
+        // rules those out, and without an exclusive one the sum goes into a fresh copy.
+        size_t into = grad_is_exclusive(slot[0].grad) ? 0 : grad_is_exclusive(slot[1].grad) ? 1 : slot.size();
         std::shared_ptr<Tensor> total;
-        for (auto& c : slot) tensor_add_inplace(total, c.grad);
+        if (into < slot.size()) total = std::move(slot[into].grad);
+        for (size_t k = 0; k < slot.size(); ++k) {
+            if (k != into) tensor_add_inplace(total, slot[k].grad);
+        }
         return total;
     };
 

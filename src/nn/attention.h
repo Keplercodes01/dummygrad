@@ -88,7 +88,7 @@ public:
                                                 out_4d->data_ptr<float>(), lse->data_ptr<float>(), B, 1, S, d_k, causal, scale,
                                                 compute);
             if (qkv_grad) {
-                auto grad_fn = std::make_shared<FlashAttentionBackward>(Q_4d, K_4d, V_4d, out_4d, lse,
+                auto grad_fn = std::make_shared<FlashAttentionBackward>(Q_4d, K_4d, V_4d, saved_output(out_4d), lse,
                                                                         B, 1, S, d_k, causal, scale, impl, compute);
                 grad_fn->add_next_edge(get_grad_edge(Q).function);
                 grad_fn->add_next_edge(get_grad_edge(K).function);
@@ -284,7 +284,7 @@ public:
                                                 attn_out->data_ptr<float>(), lse->data_ptr<float>(), B, n_heads, S, d_k,
                                                 causal, scale, compute);
             if (qkv_grad) {
-                auto grad_fn = std::make_shared<FlashAttentionBackward>(Q_c, K_c, V_c, attn_out, lse,
+                auto grad_fn = std::make_shared<FlashAttentionBackward>(Q_c, K_c, V_c, saved_output(attn_out), lse,
                                                                         B, n_heads, S, d_k, causal, scale, impl, compute);
                 grad_fn->add_next_edge(get_grad_edge(Q_split).function);
                 grad_fn->add_next_edge(get_grad_edge(K_split).function);
