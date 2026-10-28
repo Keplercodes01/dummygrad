@@ -1244,6 +1244,88 @@ static std::string workflow_clip_grad_norm() {
     return std::fabs(unclipped - 1.0f) < 1e-4f ? "" : "a norm under the limit was changed";
 }
 
+// Data-parallel reduction: every replica ends with the average (or sum) of all replicas' gradients,
+// and a replica that had no gradient counts as zero and still receives the result
+static std::string workflow_all_reduce_gradients() {
+    auto param = [](std::vector<float> grad) {
+        auto p = upload({0, 0, 0}, {3}, Device::CPU, true);
+        if (!grad.empty()) p->grad = upload(grad, {3}, Device::CPU, false);
+        return p;
+    };
+    std::vector<std::vector<TensorPtr>> four = {{param({1, 2, 3})}, {param({3, 4, 5})}, {param({})}, {param({4, 6, 8})}};
+    all_reduce_gradients(four);
+    for (size_t r = 0; r < four.size(); ++r) {
+        if (!four[r][0]->grad || download(four[r][0]->grad) != std::vector<float>{2, 3, 4}) {
+            return "replica " + std::to_string(r) + " did not receive the average";
+        }
+    }
+    std::vector<std::vector<TensorPtr>> two = {{param({1, 2, 3})}, {param({3, 4, 5})}};
+    all_reduce_gradients(two, /*average=*/false);
+    if (download(two[1][0]->grad) != std::vector<float>{4, 6, 8}) return "average=false did not sum";
+    std::vector<std::vector<TensorPtr>> mismatched = {{param({1, 2, 3})}, {upload({0, 0}, {2}, Device::CPU, true)}};
+    try {
+        all_reduce_gradients(mismatched);
+    } catch (const std::runtime_error&) {
+        return "";
+    }
+    return "replicas with different parameter shapes were accepted";
+}
+
+#ifdef USE_CUDA
+static int cuda_device_count() {
+    int n = 0;
+    return cudaGetDeviceCount(&n) == cudaSuccess ? n : 0;
+}
+
+// Two GPUs (Kaggle's T4 x2): after parallel_step both replicas hold the average of the gradients each
+// would have computed alone, and identical optimizer steps keep their weights identical
+static std::string multi_gpu_parallel_step() {
+    MultiGPURunner<ModernTransformer> runner(2, [](int) {
+        ModernTransformer model(16, 8, 16, 2, 1, 1);
+        model.cuda();
+        return model;
+    });
+    const std::vector<std::vector<float>> in = {{1, 2, 3, 4}, {5, 6, 7, 8}}, tg = {{2, 3, 4, 5}, {6, 7, 8, 9}};
+    auto step = [&](int rank, ModernTransformer& model) {
+        model.zero_grad();
+        fused_cross_entropy(model.forward(upload(in[rank], {1, 4}, Device::CUDA, false)),
+                            upload(tg[rank], {1, 4}, Device::CUDA, false))->backward();
+    };
+    // Reference: each rank's batch alone through replica 0, on GPU 0
+    std::vector<std::vector<std::vector<float>>> alone;
+    CUDA_CHECK(cudaSetDevice(0));
+    for (int rank = 0; rank < 2; ++rank) {
+        step(rank, *runner.replicas[0]);
+        alone.push_back(all_grads(*runner.replicas[0]));
+    }
+    runner.parallel_step(step);
+    for (int rank = 0; rank < 2; ++rank) {
+        auto got = all_grads(*runner.replicas[rank]);
+        for (size_t k = 0; k < got.size(); ++k) {
+            std::vector<float> expected(alone[0][k].size());
+            for (size_t e = 0; e < expected.size(); ++e) expected[e] = (alone[0][k][e] + alone[1][k][e]) / 2.0f;
+            auto err = compare(expected, got[k], 1e-5f);
+            if (!err.empty()) return "replica " + std::to_string(rank) + ", parameter " + std::to_string(k) + ": " + err;
+        }
+    }
+    std::vector<Adam> opts(2, Adam(1e-2f));
+    runner.for_each_replica([&](int rank, ModernTransformer& model) { opts[rank].step(model.parameters()); });
+    auto p0 = runner.replicas[0]->parameters(), p1 = runner.replicas[1]->parameters();
+    for (size_t k = 0; k < p0.size(); ++k) {
+        if (download(p0[k]) != download(p1[k])) return "replica weights diverged after one step (parameter " + std::to_string(k) + ")";
+    }
+    // An exception on one GPU reaches the caller instead of terminating the process
+    try {
+        runner.for_each_replica([](int rank, ModernTransformer&) {
+            if (rank == 1) throw std::runtime_error("boom");
+        });
+    } catch (const std::runtime_error& e) {
+        return std::string(e.what()) == "boom" ? "" : std::string("unexpected exception: ") + e.what();
+    }
+    return "an exception thrown on GPU 1 was not rethrown";
+}
+#endif
+
 static std::string workflow_dataloader() {
     const int64_t n = 10;
     std::vector<float> xs(n * 3), ys(n);
@@ -1961,6 +2043,14 @@ int main() {
     run_case(r, "workflow/resume_sgd_momentum", workflow_resume_sgd_momentum);
     run_case(r, "workflow/checkpoint_scalars", workflow_checkpoint_scalars);
     run_case(r, "workflow/clip_grad_norm", workflow_clip_grad_norm);
+    run_case(r, "workflow/all_reduce_gradients", workflow_all_reduce_gradients);
+#ifdef USE_CUDA
+    if (cuda_device_count() >= 2) {
+        run_case(r, "workflow/multi_gpu_parallel_step", multi_gpu_parallel_step);
+    } else if (has_cuda) {
+        std::cout << "[SKIP] workflow/multi_gpu_parallel_step (needs 2 GPUs, e.g. Kaggle's T4 x2)\n";
+    }
+#endif
     run_case(r, "workflow/dataloader", workflow_dataloader);
     run_case(r, "workflow/token_dataset", workflow_token_dataset);
     run_case(r, "workflow/metrics_logger", workflow_metrics_logger);
