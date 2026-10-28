@@ -227,12 +227,12 @@ public:
 
     // Copies replica 0's parameter values into every other replica
     void broadcast_weights() {
-        auto params = replica_parameters();
+        std::vector<std::vector<std::shared_ptr<Tensor>>> params = replica_parameters();
         for (int rank = 1; rank < world_size; ++rank) {
             if (params[rank].size() != params[0].size()) throw std::runtime_error("MultiGPURunner: replicas have different parameters");
             for (size_t i = 0; i < params[0].size(); ++i) {
-                const auto& src = params[0][i];
-                const auto& dst = params[rank][i];
+                const std::shared_ptr<Tensor>& src = params[0][i];
+                const std::shared_ptr<Tensor>& dst = params[rank][i];
                 if (src->shape != dst->shape || src->dtype != dst->dtype || !src->is_contiguous() || !dst->is_contiguous()) {
                     throw std::runtime_error("MultiGPURunner: parameter " + std::to_string(i) + " differs between replicas");
                 }
