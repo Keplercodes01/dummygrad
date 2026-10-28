@@ -7,8 +7,8 @@
 //   if (!err.empty()) std::cerr << err << "\n";   // e.g. "input 1 element 5: analytic 0.12 vs numeric 0.48"
 //
 // Compares the gradients autograd computes against central finite differences of the forward
-// pass. Run it on CPU inputs: finite differences need full float32 precision, which TF32
-// tensor-core matmuls on the GPU don't provide. Inputs near a kink (relu at 0, abs at 0, max
+// pass. Run it on CPU inputs: finite differences need full float32 precision, which GPU matmuls
+// don't provide under set_allow_tf32(true) or autocast. Inputs near a kink (relu at 0, abs at 0, max
 // ties) can fail spuriously; keep them away from such points.
 
 #include "tensor.h"

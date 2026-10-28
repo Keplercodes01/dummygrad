@@ -84,6 +84,11 @@ int main(int argc, char** argv) {
     int gpus = 0;
     if (cudaGetDeviceCount(&gpus) == cudaSuccess && gpus > 0) device = Device::CUDA;
 #endif
+    // bench_torch.py enables TF32 too (torch.backends.cuda.matmul.allow_tf32), so fp32 rows compare
+    // like for like on GPUs that have it (older versions always used it)
+#ifdef DUMMYGRAD_HAS_TF32_SWITCH
+    set_allow_tf32(true);
+#endif
     const int warmup = 10, min_steps = 50, max_steps = 5000;
     BackwardExecution mode = backward_execution();
     if (mode == BackwardExecution::Auto) {

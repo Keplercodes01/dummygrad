@@ -694,7 +694,7 @@ void adamw_step(float* param, const float* grad, float* m, float* v,
 // -------------------------------------------------------------
 // cuBLAS Matrix Multiplication (Row-Major via Column-Major Trick)
 // fp32 tensors in and out. The compute dtype (from AutocastGuard) picks the GEMM: Float32 runs
-// SGEMM (TF32 tensor cores where the GPU has them); Float16/BFloat16 round the operands to that
+// SGEMM (TF32 tensor cores only with set_allow_tf32); Float16/BFloat16 round the operands to that
 // type and run on tensor cores, accumulating and writing fp32.
 // -------------------------------------------------------------
 
@@ -738,12 +738,13 @@ static void gemm(cublasOperation_t op_a, cublasOperation_t op_b, int m, int n, i
 
 struct LtKey {
     int m, n, k, dtype;
-    bool operator==(const LtKey& o) const { return m == o.m && n == o.n && k == o.k && dtype == o.dtype; }
+    bool tf32;
+    bool operator==(const LtKey& o) const { return m == o.m && n == o.n && k == o.k && dtype == o.dtype && tf32 == o.tf32; }
 };
 struct LtKeyHash {
     size_t operator()(const LtKey& key) const {
         size_t h = (size_t)key.m;
-        for (int v : {key.n, key.k, key.dtype}) h = h * 1000003u ^ (size_t)v;
+        for (int v : {key.n, key.k, key.dtype, (int)key.tf32}) h = h * 1000003u ^ (size_t)v;
         return h;
     }
 };
@@ -774,14 +775,15 @@ static LtContext& lt_context() {
 }
 
 static LtPlan& lt_bias_plan(LtContext& ctx, int m, int n, int k, DType compute) {
-    LtKey key{m, n, k, (int)compute};
+    bool tf32 = compute == DType::Float32 && allow_tf32();
+    LtKey key{m, n, k, (int)compute, tf32};
     auto it = ctx.plans.find(key);
     if (it != ctx.plans.end()) return it->second;
     LtPlan& p = ctx.plans[key];
 
     cudaDataType_t in_type = compute == DType::Float16 ? CUDA_R_16F : compute == DType::BFloat16 ? CUDA_R_16BF : CUDA_R_32F;
-    // fp32 inputs use TF32 tensor cores where the GPU has them, like the SGEMM path's math mode
-    cublasComputeType_t compute_type = compute == DType::Float32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+    // fp32 inputs use TF32 tensor cores only when allowed, like the SGEMM path's math mode
+    cublasComputeType_t compute_type = tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     CUBLAS_CHECK(cublasLtMatmulDescCreate(&p.op, compute_type, CUDA_R_32F));
     cublasOperation_t no_trans = CUBLAS_OP_N;
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSA, &no_trans, sizeof(no_trans)));
