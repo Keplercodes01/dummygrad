@@ -16,7 +16,9 @@
 //   };
 //
 // visit() is called on demand rather than recording pointers at construction, so modules stay
-// safe to copy and move (models are returned by value, e.g. from MultiGPURunner factories).
+// safe to move (models are returned by value, e.g. from MultiGPURunner factories). Copying is
+// disabled: tensors and submodules are held by shared_ptr, so a copy would share its parameters
+// with the original, and moving one to another device would move parts of the other.
 
 #include "tensor.h"
 #include "ops.h"
@@ -47,7 +49,12 @@ using NamedTensors = std::vector<std::pair<std::string, std::shared_ptr<Tensor>>
 
 class Module {
 public:
+    Module() = default;
     virtual ~Module() = default;
+    Module(const Module&) = delete;
+    Module& operator=(const Module&) = delete;
+    Module(Module&&) = default;
+    Module& operator=(Module&&) = default;
 
     // Declare parameters, buffers and child modules. Names compose into dotted paths
     // ("blocks.0.attn.W_q.weight").
@@ -98,24 +105,35 @@ public:
         return n;
     }
 
-    // Move parameters and buffers. requires_grad is preserved, so frozen parameters stay frozen,
-    // and tied references keep pointing at one shared tensor.
-    void to(Device device, DType dtype = DType::Float32) {
+    // Move parameters and buffers to device, each keeping its dtype. requires_grad is preserved, so
+    // frozen parameters stay frozen, and tied references keep pointing at one shared tensor.
+    void to(Device device) { move_to(device, nullptr); }
+    // Move and convert: floating-point tensors become dtype (Float32, Float16 or BFloat16); others
+    // (Int8) keep theirs.
+    void to(Device device, DType dtype) { move_to(device, &dtype); }
+    void cuda() { to(Device::CUDA); }
+    void cpu() { to(Device::CPU); }
+    void mps() { to(Device::MPS); }
+
+private:
+    void move_to(Device device, const DType* dtype) {
         std::unordered_map<Tensor*, std::shared_ptr<Tensor>> moved;
         walk([&](const std::string&, std::shared_ptr<Tensor>& t, Kind) {
-            if (!t || (t->device == device && t->dtype == dtype)) return;
+            if (!t) return;
+            bool is_float = t->dtype == DType::Float32 || t->dtype == DType::Float16 || t->dtype == DType::BFloat16;
+            DType target = (dtype && is_float) ? *dtype : t->dtype;
+            if (t->device == device && t->dtype == target) return;
             auto it = moved.find(t.get());
             if (it == moved.end()) {
-                auto copy = t->to(device, dtype);
+                auto copy = t->to(device, target);
                 copy->requires_grad = t->requires_grad;
                 it = moved.emplace(t.get(), copy).first;
             }
             t = it->second;
         });
     }
-    void cuda() { to(Device::CUDA); }
-    void cpu() { to(Device::CPU); }
-    void mps() { to(Device::MPS); }
+
+public:
 
     // Train/eval mode for this module and all children (for layers like dropout that differ).
     void train(bool mode = true) {

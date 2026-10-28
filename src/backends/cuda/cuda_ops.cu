@@ -132,269 +132,61 @@ __global__ void k_tanh_backward(const float* out, const float* grad_out, float* 
     }
 }
 
-__global__ void k_causal_mask(const float* in, float* out, int total_rows, int seq_len) {
+__global__ void k_causal_mask(const float* in, float* out, int64_t total_elements, int rows, int cols) {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total_elements = (int64_t)total_rows * seq_len;
     if (idx < total_elements) {
-        int col = idx % seq_len;
-        int row = (idx / seq_len) % seq_len;
+        int col = (int)(idx % cols);
+        int row = (int)((idx / cols) % rows);
         out[idx] = (col > row) ? -1e9f : in[idx];
     }
 }
 
-__global__ void k_causal_mask_backward(const float* grad_out, float* grad_in, int total_rows, int seq_len) {
+__global__ void k_causal_mask_backward(const float* grad_out, float* grad_in, int64_t total_elements, int rows, int cols) {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total_elements = (int64_t)total_rows * seq_len;
     if (idx < total_elements) {
-        int col = idx % seq_len;
-        int row = (idx / seq_len) % seq_len;
+        int col = (int)(idx % cols);
+        int row = (int)((idx / cols) % rows);
         grad_in[idx] = (col <= row) ? grad_out[idx] : 0.0f;
     }
 }
 
-__global__ void k_sliding_window_mask(const float* in, float* out, int total_rows, int seq_len, int window_size) {
+__global__ void k_sliding_window_mask(const float* in, float* out, int64_t total_elements, int rows, int cols, int window_size) {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total_elements = (int64_t)total_rows * seq_len;
     if (idx < total_elements) {
-        int col = idx % seq_len;
-        int row = (idx / seq_len) % seq_len;
+        int col = (int)(idx % cols);
+        int row = (int)((idx / cols) % rows);
         bool valid = (col <= row) && (row - col <= window_size);
         out[idx] = valid ? in[idx] : -1e9f;
     }
 }
 
-__global__ void k_sliding_window_mask_backward(const float* grad_out, float* grad_in, int total_rows, int seq_len, int window_size) {
+__global__ void k_sliding_window_mask_backward(const float* grad_out, float* grad_in, int64_t total_elements, int rows, int cols, int window_size) {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total_elements = (int64_t)total_rows * seq_len;
     if (idx < total_elements) {
-        int col = idx % seq_len;
-        int row = (idx / seq_len) % seq_len;
+        int col = (int)(idx % cols);
+        int row = (int)((idx / cols) % rows);
         bool valid = (col <= row) && (row - col <= window_size);
         grad_in[idx] = valid ? grad_out[idx] : 0.0f;
     }
 }
 
-__global__ void k_prefix_causal_mask(const float* in, float* out, int total_rows, int seq_len, int prefix_len) {
+__global__ void k_prefix_causal_mask(const float* in, float* out, int64_t total_elements, int rows, int cols, int prefix_len) {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total_elements = (int64_t)total_rows * seq_len;
     if (idx < total_elements) {
-        int col = idx % seq_len;
-        int row = (idx / seq_len) % seq_len;
+        int col = (int)(idx % cols);
+        int row = (int)((idx / cols) % rows);
         bool valid = (row < prefix_len) ? (col < prefix_len) : (col <= row);
         out[idx] = valid ? in[idx] : -1e9f;
     }
 }
 
-__global__ void k_prefix_causal_mask_backward(const float* grad_out, float* grad_in, int total_rows, int seq_len, int prefix_len) {
+__global__ void k_prefix_causal_mask_backward(const float* grad_out, float* grad_in, int64_t total_elements, int rows, int cols, int prefix_len) {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total_elements = (int64_t)total_rows * seq_len;
     if (idx < total_elements) {
-        int col = idx % seq_len;
-        int row = (idx / seq_len) % seq_len;
+        int col = (int)(idx % cols);
+        int row = (int)((idx / cols) % rows);
         bool valid = (row < prefix_len) ? (col < prefix_len) : (col <= row);
         grad_in[idx] = valid ? grad_out[idx] : 0.0f;
-    }
-}
-
-// Frontier Tiled FlashAttention forward kernel (online softmax, O(1) intermediate GPU memory)
-// Each thread owns head-dim indices d = threadIdx.x + s * blockDim.x. Launches use
-// >= FA_MIN_THREADS threads, so a thread needs at most FA_MAX_DK / FA_MIN_THREADS slots.
-constexpr int FA_MAX_DK = 512;
-constexpr int FA_MIN_THREADS = 32;
-constexpr int FA_SLOTS = FA_MAX_DK / FA_MIN_THREADS;
-
-__global__ void k_flash_attention_forward(const float* __restrict__ q,
-                                          const float* __restrict__ k,
-                                          const float* __restrict__ v,
-                                          float* __restrict__ out,
-                                          int batch_size, int num_heads, int seq_len, int d_k,
-                                          bool causal, float scale) {
-    int bh = blockIdx.x; // index in [0, batch_size * num_heads)
-    int i = blockIdx.y;  // query token index in [0, seq_len)
-
-    if (bh >= batch_size * num_heads || i >= seq_len) return;
-
-    int64_t head_stride = (int64_t)seq_len * d_k;
-    const float* q_row = q + bh * head_stride + (int64_t)i * d_k;
-    const float* k_head = k + bh * head_stride;
-    const float* v_head = v + bh * head_stride;
-    float* out_row = out + bh * head_stride + (int64_t)i * d_k;
-
-    extern __shared__ float s_q[];
-    for (int d = threadIdx.x; d < d_k; d += blockDim.x) {
-        s_q[d] = q_row[d];
-    }
-    __syncthreads();
-
-    float m_i = -1e20f;
-    float l_i = 0.0f;
-    float acc_o[FA_SLOTS];
-    #pragma unroll
-    for (int s = 0; s < FA_SLOTS; ++s) acc_o[s] = 0.0f;
-
-    int max_j = causal ? (i + 1) : seq_len;
-
-    for (int j = 0; j < max_j; ++j) {
-        const float* k_j = k_head + (int64_t)j * d_k;
-        const float* v_j = v_head + (int64_t)j * d_k;
-
-        float score = 0.0f;
-        for (int d = 0; d < d_k; ++d) {
-            score += s_q[d] * k_j[d];
-        }
-        score *= scale;
-
-        float m_new = fmaxf(m_i, score);
-        float alpha = expf(m_i - m_new);
-        float beta = expf(score - m_new);
-
-        l_i = l_i * alpha + beta;
-
-        for (int d = threadIdx.x, s = 0; d < d_k; d += blockDim.x, ++s) {
-            acc_o[s] = acc_o[s] * alpha + beta * v_j[d];
-        }
-
-        m_i = m_new;
-    }
-
-    float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
-    for (int d = threadIdx.x, s = 0; d < d_k; d += blockDim.x, ++s) {
-        out_row[d] = acc_o[s] * inv_l;
-    }
-}
-
-// Frontier Tiled FlashAttention backward kernel (online stats, O(1) intermediate memory)
-__global__ void k_flash_attention_backward(const float* __restrict__ q,
-                                           const float* __restrict__ k,
-                                           const float* __restrict__ v,
-                                           const float* __restrict__ out,
-                                           const float* __restrict__ grad_out,
-                                           float* __restrict__ grad_q,
-                                           float* __restrict__ grad_k,
-                                           float* __restrict__ grad_v,
-                                           int batch_size, int num_heads, int seq_len, int d_k,
-                                           bool causal, float scale) {
-    int bh = blockIdx.x;
-    int i = blockIdx.y;
-
-    if (bh >= batch_size * num_heads || i >= seq_len) return;
-
-    int64_t head_stride = (int64_t)seq_len * d_k;
-    const float* q_row = q + bh * head_stride + (int64_t)i * d_k;
-    const float* o_row = out + bh * head_stride + (int64_t)i * d_k;
-    const float* do_row = grad_out + bh * head_stride + (int64_t)i * d_k;
-    const float* k_head = k + bh * head_stride;
-    const float* v_head = v + bh * head_stride;
-
-    float* dq_row = grad_q + bh * head_stride + (int64_t)i * d_k;
-    float* dk_head = grad_k + bh * head_stride;
-    float* dv_head = grad_v + bh * head_stride;
-
-    extern __shared__ float s_mem_bwd[];
-    float* s_q = s_mem_bwd;
-    float* s_do = s_mem_bwd + d_k;
-
-    for (int d = threadIdx.x; d < d_k; d += blockDim.x) {
-        s_q[d] = q_row[d];
-        s_do[d] = do_row[d];
-    }
-    __syncthreads();
-
-    // 1. Compute Di = sum_d (dO_i,d * O_i,d)
-    float d_i = 0.0f;
-    for (int d = 0; d < d_k; ++d) {
-        d_i += s_do[d] * o_row[d];
-    }
-
-    // 2. Recompute log-sum-exp (L_i) for query token i
-    float m_i = -1e20f;
-    float l_i = 0.0f;
-    int max_j = causal ? (i + 1) : seq_len;
-
-    for (int j = 0; j < max_j; ++j) {
-        const float* k_j = k_head + (int64_t)j * d_k;
-        float score = 0.0f;
-        for (int d = 0; d < d_k; ++d) {
-            score += s_q[d] * k_j[d];
-        }
-        score *= scale;
-
-        float m_new = fmaxf(m_i, score);
-        float alpha = expf(m_i - m_new);
-        float beta = expf(score - m_new);
-        l_i = l_i * alpha + beta;
-        m_i = m_new;
-    }
-    float l_inv = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
-
-    // 3. Compute gradients dQ_i and accumulate dK_j, dV_j
-    float acc_dq[FA_SLOTS];
-    #pragma unroll
-    for (int s = 0; s < FA_SLOTS; ++s) acc_dq[s] = 0.0f;
-
-    for (int j = 0; j < max_j; ++j) {
-        const float* k_j = k_head + (int64_t)j * d_k;
-        const float* v_j = v_head + (int64_t)j * d_k;
-        float* dk_j = dk_head + (int64_t)j * d_k;
-        float* dv_j = dv_head + (int64_t)j * d_k;
-
-        float score = 0.0f;
-        for (int d = 0; d < d_k; ++d) {
-            score += s_q[d] * k_j[d];
-        }
-        score *= scale;
-
-        float p_ij = expf(score - m_i) * l_inv;
-
-        float dp_ij = 0.0f;
-        for (int d = 0; d < d_k; ++d) {
-            dp_ij += s_do[d] * v_j[d];
-        }
-
-        float ds_ij = p_ij * (dp_ij - d_i) * scale;
-
-        for (int d = threadIdx.x, s = 0; d < d_k; d += blockDim.x, ++s) {
-            acc_dq[s] += ds_ij * k_j[d];
-            atomicAdd(&dk_j[d], ds_ij * s_q[d]);
-            atomicAdd(&dv_j[d], p_ij * s_do[d]);
-        }
-    }
-
-    for (int d = threadIdx.x, s = 0; d < d_k; d += blockDim.x, ++s) {
-        dq_row[d] = acc_dq[s];
-    }
-}
-
-// Fused Bias and Activations
-__global__ void k_add_bias(float* data, const float* bias, int rows, int cols) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = (int64_t)rows * cols;
-    if (idx < total) {
-        int c = idx % cols;
-        data[idx] += bias[c];
-    }
-}
-
-__global__ void k_add_bias_and_gelu(const float* in, const float* bias, float* out, int rows, int cols) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = (int64_t)rows * cols;
-    if (idx < total) {
-        int c = idx % cols;
-        float x = in[idx] + bias[c];
-        const float sqrt_2_over_pi = 0.7978845608f;
-        const float coeff = 0.044715f;
-        float inner = sqrt_2_over_pi * (x + coeff * x * x * x);
-        out[idx] = 0.5f * x * (1.0f + tanhf(inner));
-    }
-}
-
-__global__ void k_add_bias_and_relu(const float* in, const float* bias, float* out, int rows, int cols) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = (int64_t)rows * cols;
-    if (idx < total) {
-        int c = idx % cols;
-        float x = in[idx] + bias[c];
-        out[idx] = x > 0.0f ? x : 0.0f;
     }
 }
 
@@ -775,112 +567,57 @@ void softmax_backward(const float* out, const float* grad_out, float* grad_in, i
     CUDA_CHECK(cudaGetLastError());
 }
 
-void causal_mask(const float* in, float* out, int batch, int seq_len) {
-    int64_t total = (int64_t)batch * seq_len * seq_len;
+void causal_mask(const float* in, float* out, int batch, int rows, int cols) {
+    int64_t total = (int64_t)batch * rows * cols;
+    if (total == 0) return;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    k_causal_mask<<<blocks, threads>>>(in, out, batch * seq_len, seq_len);
+    k_causal_mask<<<blocks, threads>>>(in, out, total, rows, cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void causal_mask_backward(const float* grad_out, float* grad_in, int batch, int seq_len) {
-    int64_t total = (int64_t)batch * seq_len * seq_len;
+void causal_mask_backward(const float* grad_out, float* grad_in, int batch, int rows, int cols) {
+    int64_t total = (int64_t)batch * rows * cols;
+    if (total == 0) return;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    k_causal_mask_backward<<<blocks, threads>>>(grad_out, grad_in, batch * seq_len, seq_len);
+    k_causal_mask_backward<<<blocks, threads>>>(grad_out, grad_in, total, rows, cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void sliding_window_mask(const float* in, float* out, int batch, int seq_len, int window_size) {
-    int64_t total = (int64_t)batch * seq_len * seq_len;
+void sliding_window_mask(const float* in, float* out, int batch, int rows, int cols, int window_size) {
+    int64_t total = (int64_t)batch * rows * cols;
+    if (total == 0) return;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    k_sliding_window_mask<<<blocks, threads>>>(in, out, batch * seq_len, seq_len, window_size);
+    k_sliding_window_mask<<<blocks, threads>>>(in, out, total, rows, cols, window_size);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void sliding_window_mask_backward(const float* grad_out, float* grad_in, int batch, int seq_len, int window_size) {
-    int64_t total = (int64_t)batch * seq_len * seq_len;
+void sliding_window_mask_backward(const float* grad_out, float* grad_in, int batch, int rows, int cols, int window_size) {
+    int64_t total = (int64_t)batch * rows * cols;
+    if (total == 0) return;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    k_sliding_window_mask_backward<<<blocks, threads>>>(grad_out, grad_in, batch * seq_len, seq_len, window_size);
+    k_sliding_window_mask_backward<<<blocks, threads>>>(grad_out, grad_in, total, rows, cols, window_size);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void prefix_causal_mask(const float* in, float* out, int batch, int seq_len, int prefix_len) {
-    int64_t total = (int64_t)batch * seq_len * seq_len;
+void prefix_causal_mask(const float* in, float* out, int batch, int rows, int cols, int prefix_len) {
+    int64_t total = (int64_t)batch * rows * cols;
+    if (total == 0) return;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    k_prefix_causal_mask<<<blocks, threads>>>(in, out, batch * seq_len, seq_len, prefix_len);
+    k_prefix_causal_mask<<<blocks, threads>>>(in, out, total, rows, cols, prefix_len);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void prefix_causal_mask_backward(const float* grad_out, float* grad_in, int batch, int seq_len, int prefix_len) {
-    int64_t total = (int64_t)batch * seq_len * seq_len;
+void prefix_causal_mask_backward(const float* grad_out, float* grad_in, int batch, int rows, int cols, int prefix_len) {
+    int64_t total = (int64_t)batch * rows * cols;
+    if (total == 0) return;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    k_prefix_causal_mask_backward<<<blocks, threads>>>(grad_out, grad_in, batch * seq_len, seq_len, prefix_len);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void flash_attention_forward(const float* q, const float* k, const float* v,
-                             float* out,
-                             int batch_size, int num_heads, int seq_len, int d_k,
-                             bool causal, float scale) {
-    if (d_k > FA_MAX_DK) throw std::runtime_error("flash_attention_forward: head dim " + std::to_string(d_k) + " exceeds " + std::to_string(FA_MAX_DK));
-    dim3 grid(batch_size * num_heads, seq_len);
-    int threads = std::min(128, d_k);
-    if (threads < FA_MIN_THREADS) threads = FA_MIN_THREADS;
-    size_t smem = d_k * sizeof(float);
-    k_flash_attention_forward<<<grid, threads, smem>>>(q, k, v, out,
-                                                       batch_size, num_heads, seq_len, d_k,
-                                                       causal, scale);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void flash_attention_backward(const float* q, const float* k, const float* v,
-                              const float* out, const float* grad_out,
-                              float* grad_q, float* grad_k, float* grad_v,
-                              int batch_size, int num_heads, int seq_len, int d_k,
-                              bool causal, float scale) {
-    if (d_k > FA_MAX_DK) throw std::runtime_error("flash_attention_backward: head dim " + std::to_string(d_k) + " exceeds " + std::to_string(FA_MAX_DK));
-    int64_t head_stride = (int64_t)seq_len * d_k;
-    int64_t total_elements = (int64_t)batch_size * num_heads * head_stride;
-    CUDA_CHECK(cudaMemset(grad_k, 0, total_elements * sizeof(float)));
-    CUDA_CHECK(cudaMemset(grad_v, 0, total_elements * sizeof(float)));
-
-    dim3 grid(batch_size * num_heads, seq_len);
-    int threads = std::min(128, d_k);
-    if (threads < FA_MIN_THREADS) threads = FA_MIN_THREADS;
-    size_t smem = 2 * d_k * sizeof(float);
-    k_flash_attention_backward<<<grid, threads, smem>>>(q, k, v, out, grad_out,
-                                                        grad_q, grad_k, grad_v,
-                                                        batch_size, num_heads, seq_len, d_k,
-                                                        causal, scale);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void add_bias(float* data, const float* bias, int rows, int cols) {
-    int64_t total = (int64_t)rows * cols;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    k_add_bias<<<blocks, threads>>>(data, bias, rows, cols);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void add_bias_and_gelu(const float* in, const float* bias, float* out, int rows, int cols) {
-    int64_t total = (int64_t)rows * cols;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    k_add_bias_and_gelu<<<blocks, threads>>>(in, bias, out, rows, cols);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void add_bias_and_relu(const float* in, const float* bias, float* out, int rows, int cols) {
-    int64_t total = (int64_t)rows * cols;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    k_add_bias_and_relu<<<blocks, threads>>>(in, bias, out, rows, cols);
+    k_prefix_causal_mask_backward<<<blocks, threads>>>(grad_out, grad_in, total, rows, cols, prefix_len);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -900,7 +637,7 @@ void adamw_step(float* param, const float* grad, float* m, float* v,
 // -------------------------------------------------------------
 // cuBLAS Matrix Multiplication (Row-Major via Column-Major Trick)
 // fp32 tensors in and out. The compute dtype (from AutocastGuard) picks the GEMM: Float32 runs
-// SGEMM (TF32 tensor cores where the GPU has them); Float16/BFloat16 round the operands to that
+// SGEMM (TF32 tensor cores only with set_allow_tf32); Float16/BFloat16 round the operands to that
 // type and run on tensor cores, accumulating and writing fp32.
 // -------------------------------------------------------------
 
@@ -944,12 +681,13 @@ static void gemm(cublasOperation_t op_a, cublasOperation_t op_b, int m, int n, i
 
 struct LtKey {
     int m, n, k, dtype;
-    bool operator==(const LtKey& o) const { return m == o.m && n == o.n && k == o.k && dtype == o.dtype; }
+    bool tf32;
+    bool operator==(const LtKey& o) const { return m == o.m && n == o.n && k == o.k && dtype == o.dtype && tf32 == o.tf32; }
 };
 struct LtKeyHash {
     size_t operator()(const LtKey& key) const {
         size_t h = (size_t)key.m;
-        for (int v : {key.n, key.k, key.dtype}) h = h * 1000003u ^ (size_t)v;
+        for (int v : {key.n, key.k, key.dtype, (int)key.tf32}) h = h * 1000003u ^ (size_t)v;
         return h;
     }
 };
@@ -980,14 +718,15 @@ static LtContext& lt_context() {
 }
 
 static LtPlan& lt_bias_plan(LtContext& ctx, int m, int n, int k, DType compute) {
-    LtKey key{m, n, k, (int)compute};
+    bool tf32 = compute == DType::Float32 && allow_tf32();
+    LtKey key{m, n, k, (int)compute, tf32};
     auto it = ctx.plans.find(key);
     if (it != ctx.plans.end()) return it->second;
     LtPlan& p = ctx.plans[key];
 
     cudaDataType_t in_type = compute == DType::Float16 ? CUDA_R_16F : compute == DType::BFloat16 ? CUDA_R_16BF : CUDA_R_32F;
-    // fp32 inputs use TF32 tensor cores where the GPU has them, like the SGEMM path's math mode
-    cublasComputeType_t compute_type = compute == DType::Float32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+    // fp32 inputs use TF32 tensor cores only when allowed, like the SGEMM path's math mode
+    cublasComputeType_t compute_type = tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     CUBLAS_CHECK(cublasLtMatmulDescCreate(&p.op, compute_type, CUDA_R_32F));
     cublasOperation_t no_trans = CUBLAS_OP_N;
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSA, &no_trans, sizeof(no_trans)));
@@ -1039,20 +778,38 @@ static void check_matmul_inputs(const Tensor& a, const Tensor& b, const char* wh
     }
 }
 
-// out = a @ b (+ bias over the last dimension); bias requires b to be a single 2-D matrix
+// out = a @ b (+ bias over the last dimension); bias requires b to be a single 2-D matrix. With
+// trans_b, b is a 2-D [N, K] matrix and out = a @ b^T, read in place by a transposed GEMM.
 static std::shared_ptr<Tensor> matmul_impl(const std::shared_ptr<Tensor>& _a, const std::shared_ptr<Tensor>& _b,
                                            const std::shared_ptr<Tensor>& bias, DType compute,
-                                           std::shared_ptr<Tensor>* saved_a, std::shared_ptr<Tensor>* saved_b) {
+                                           std::shared_ptr<Tensor>* saved_a, std::shared_ptr<Tensor>* saved_b,
+                                           bool trans_b = false) {
     check_matmul_inputs(*_a, *_b, "cuda::matmul");
     check_compute_dtype(compute, "cuda::matmul");
+    if (_a->ndim() < 2 || _b->ndim() < 2) throw std::runtime_error("cuda::matmul: tensors must be at least 2-D");
+    if (trans_b && (_b->ndim() != 2 || bias)) throw std::runtime_error("cuda::matmul_nt: b must be one 2-D matrix, without a bias");
+    {
+        // Batch dimensions: equal (ignoring leading 1s), or one operand unbatched. Two batched
+        // operands of the same batch count but different shapes ([2, 3] vs [6]) do not broadcast.
+        auto batch_dims = [](const Tensor& t) {
+            std::vector<int64_t> d(t.shape.begin(), t.shape.end() - 2);
+            while (!d.empty() && d.front() == 1) d.erase(d.begin());
+            return d;
+        };
+        auto da = batch_dims(*_a), db = batch_dims(*_b);
+        if (!da.empty() && !db.empty() && da != db) {
+            throw std::runtime_error("cuda::matmul: batch dimensions do not match (only a whole unbatched operand broadcasts)");
+        }
+    }
     auto a = make_contiguous(_a);
     auto b = make_contiguous(_b);
     int n1 = a->ndim();
     int n2 = b->ndim();
     int r1 = a->shape[n1 - 2];
     int c1 = a->shape[n1 - 1];
-    int r2 = b->shape[n2 - 2];
-    int c2 = b->shape[n2 - 1];
+    // b's logical (math) shape is [r2, c2] = [K, N]; with trans_b it is stored as [N, K]
+    int r2 = trans_b ? b->shape[1] : b->shape[n2 - 2];
+    int c2 = trans_b ? b->shape[0] : b->shape[n2 - 1];
 
     if (c1 != r2) throw std::runtime_error("cuda::matmul: inner dimensions mismatch");
 
@@ -1088,7 +845,12 @@ static std::shared_ptr<Tensor> matmul_impl(const std::shared_ptr<Tensor>& _a, co
     bool fused = bias && batch_size == 1 &&
                  gemm_bias(c2, r1, c1, bh->data_ptr<void>(), ah->data_ptr<void>(), bias->data_ptr<float>(),
                            out->data_ptr<float>(), compute);
-    if (!fused) {
+    if (trans_b) {
+        // Col-major C^T = W A^T: the row-major [N, K] buffer is col-major W^T, so op T gives W
+        gemm(CUBLAS_OP_T, CUBLAS_OP_N, c2, r1, c1,
+             bh->data_ptr<void>(), c1, 0, ah->data_ptr<void>(), c1, stride_a,
+             0.0f, out->data_ptr<float>(), c2, stride_c, batch_size, compute);
+    } else if (!fused) {
         gemm(CUBLAS_OP_N, CUBLAS_OP_N, c2, r1, c1,
              bh->data_ptr<void>(), c2, stride_b, ah->data_ptr<void>(), c1, stride_a,
              0.0f, out->data_ptr<float>(), c2, stride_c, batch_size, compute);
@@ -1107,6 +869,11 @@ static std::shared_ptr<Tensor> matmul_impl(const std::shared_ptr<Tensor>& _a, co
 std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b, DType compute,
                                std::shared_ptr<Tensor>* saved_a, std::shared_ptr<Tensor>* saved_b) {
     return matmul_impl(a, b, nullptr, compute, saved_a, saved_b);
+}
+
+std::shared_ptr<Tensor> matmul_nt(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b, DType compute,
+                                  std::shared_ptr<Tensor>* saved_a, std::shared_ptr<Tensor>* saved_b) {
+    return matmul_impl(a, b, nullptr, compute, saved_a, saved_b, /*trans_b=*/true);
 }
 
 std::shared_ptr<Tensor> linear(const std::shared_ptr<Tensor>& x, const std::shared_ptr<Tensor>& w,
@@ -1138,7 +905,7 @@ static int64_t shape_numel(const std::vector<int64_t>& shape) {
 void matmul_backward(const std::vector<int64_t>& a_shape, const std::vector<int64_t>& b_shape,
                      const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b,
                      const std::shared_ptr<Tensor>& grad_out,
-                     std::shared_ptr<Tensor>* grad_a, std::shared_ptr<Tensor>* grad_b, DType compute) {
+                     std::shared_ptr<Tensor>* grad_a, std::shared_ptr<Tensor>* grad_b, DType compute, bool trans_b) {
     if (!grad_out || (!grad_a && !grad_b)) return;
     check_compute_dtype(compute, "cuda::matmul_backward");
     if (!is_float_dtype(grad_out->dtype)) {
@@ -1151,8 +918,10 @@ void matmul_backward(const std::vector<int64_t>& a_shape, const std::vector<int6
 
     int r1 = a_shape[a_shape.size() - 2];
     int c1 = a_shape[a_shape.size() - 1];
-    int r2 = b_shape[b_shape.size() - 2];
-    int c2 = b_shape[b_shape.size() - 1];
+    if (trans_b && b_shape.size() != 2) throw std::runtime_error("cuda::matmul_backward: a transposed b must be 2-D");
+    // b's logical shape [r2, c2]; with trans_b, b_shape is its stored [c2, r2] layout
+    int r2 = trans_b ? b_shape[1] : b_shape[b_shape.size() - 2];
+    int c2 = trans_b ? b_shape[0] : b_shape[b_shape.size() - 1];
 
     int batch_size_a = shape_numel(a_shape) / ((int64_t)r1 * c1);
     int batch_size_b = shape_numel(b_shape) / ((int64_t)r2 * c2);
@@ -1190,6 +959,12 @@ void matmul_backward(const std::vector<int64_t>& a_shape, const std::vector<int6
     float* dA = grad_a ? (*grad_a)->data_ptr<float>() : nullptr;
     float* dB = grad_b ? (*grad_b)->data_ptr<float>() : nullptr;
 
+    if (trans_b) {
+        // b is the shared [N, K] matrix W (folded above): dA = dC W, and dW = dC^T A in W's layout
+        if (dA) gemm(CUBLAS_OP_N, CUBLAS_OP_N, c1, r1, c2, B, c1, 0, G, c2, 0, 0.0f, dA, c1, 0, 1, compute);
+        if (dB) gemm(CUBLAS_OP_N, CUBLAS_OP_T, c1, c2, r1, A, c1, 0, G, c2, 0, 0.0f, dB, c1, 0, 1, compute);
+        return;
+    }
     if (batch_size_a == batch_size_b) {
         // dA = dC B^T, dB = A^T dC
         if (dA) gemm(CUBLAS_OP_T, CUBLAS_OP_N, c1, r1, c2, B, c2, stride_b, G, c2, stride_g,

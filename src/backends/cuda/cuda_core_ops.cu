@@ -11,6 +11,8 @@
 #include "allocator.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <memory>
 #include <cmath>
 #include <vector>
 
@@ -502,35 +504,302 @@ __global__ void k_repeat_kv_backward(const float* grad, float* gin, int64_t batc
 }
 
 // ---------------------------------------------------------------------------------------------
-// Sum of squares in double precision: a fixed grid writes one partial per thread (strided, so
-// reads are coalesced), then one thread per buffer adds its partials in order.
+// 2-D max pooling over planes of [H, W]; argmax holds each window's winning offset kh * kW + kw
+// (-1 when every value was NaN). Mirrors maxpool_detail in nn/maxpool2d.h.
 // ---------------------------------------------------------------------------------------------
 
-constexpr int kSqBlocks = 64;
-constexpr int64_t kSqPartials = (int64_t)kSqBlocks * kThreads;
-
-__global__ void k_sum_squares_partials(const float* x, int64_t n, double* partial) {
-    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    double acc = 0.0;
-    for (int64_t i = tid; i < n; i += kSqPartials) acc += (double)x[i] * (double)x[i];
-    partial[tid] = acc;
+__global__ void k_max_pool2d_forward(const float* x, float* out, float* argmax, int64_t planes, int H, int W, int H_out,
+                                     int W_out, int kH, int kW, int sH, int sW) {
+    int64_t total = planes * H_out * W_out;
+    for (int64_t o = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; o < total; o += (int64_t)gridDim.x * blockDim.x) {
+        int w = (int)(o % W_out);
+        int h = (int)((o / W_out) % H_out);
+        int64_t p = o / ((int64_t)H_out * W_out);
+        const float* xp = x + p * H * W;
+        float best = -INFINITY;
+        int offset = -1;
+        for (int kh = 0; kh < kH; ++kh) {
+            for (int kw = 0; kw < kW; ++kw) {
+                float v = xp[(int64_t)(h * sH + kh) * W + w * sW + kw];
+                if (v > best) {
+                    best = v;
+                    offset = kh * kW + kw;
+                }
+            }
+        }
+        out[o] = best;
+        argmax[o] = (float)offset;
+    }
 }
 
-__global__ void k_sum_squares_finish(const double* partial, double* out, int buffers) {
-    int b = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= buffers) return;
+// One thread per input element gathers the gradients of the windows it won, in window order: the
+// same terms in the same order as the host loop, which scatters by output
+__global__ void k_max_pool2d_backward(const float* grad, const float* argmax, float* gx, int64_t planes, int H, int W,
+                                      int H_out, int W_out, int kH, int kW, int sH, int sW) {
+    int64_t total = planes * H * W;
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (int64_t)gridDim.x * blockDim.x) {
+        int iw = (int)(i % W);
+        int ih = (int)((i / W) % H);
+        int64_t p = i / ((int64_t)H * W);
+        // Windows h with h * sH <= ih <= h * sH + kH - 1, and likewise for w
+        int h_lo = ih - kH + 1 <= 0 ? 0 : (ih - kH + sH) / sH;
+        int h_hi = min(H_out - 1, ih / sH);
+        int w_lo = iw - kW + 1 <= 0 ? 0 : (iw - kW + sW) / sW;
+        int w_hi = min(W_out - 1, iw / sW);
+        float acc = 0.0f;
+        for (int h = h_lo; h <= h_hi; ++h) {
+            for (int w = w_lo; w <= w_hi; ++w) {
+                int64_t o = (p * H_out + h) * W_out + w;
+                int offset = (int)argmax[o];
+                if (offset < 0) continue;
+                int kh = offset / kW, kw = offset - (offset / kW) * kW;
+                if (h * sH + kh == ih && w * sW + kw == iw) acc += grad[o];
+            }
+        }
+        gx[i] = acc;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reductions over one of the last two dims of [batch, rows, cols]: over_rows reduces dim -2
+// (one output per batch and column), else dim -1 (one per batch and row). Mirror the host loops of
+// sum, mean, var and std_dev in ops/functional.h.
+// ---------------------------------------------------------------------------------------------
+
+struct AxisSum {
+    const float* x;
+    int64_t rows, cols;
+    bool over_rows;
+    struct Ctx {
+        int64_t base, step;
+    };
+    __device__ Ctx context(int64_t t) const {
+        if (over_rows) {
+            int64_t b = t / cols;
+            return Ctx{b * rows * cols + (t - b * cols), cols};
+        }
+        return Ctx{t * cols, 1};
+    }
+    __device__ float operator()(const Ctx& c, int64_t k) const { return x[c.base + k * c.step]; }
+};
+
+// Squared deviation from each output's mean
+struct AxisSqDev {
+    const float* x;
+    const float* mean;
+    int64_t rows, cols;
+    bool over_rows;
+    struct Ctx {
+        int64_t base, step;
+        float m;
+    };
+    __device__ Ctx context(int64_t t) const {
+        if (over_rows) {
+            int64_t b = t / cols;
+            return Ctx{b * rows * cols + (t - b * cols), cols, mean[t]};
+        }
+        return Ctx{t * cols, 1, mean[t]};
+    }
+    __device__ float operator()(const Ctx& c, int64_t k) const {
+        float d = x[c.base + k * c.step] - c.m;
+        return d * d;
+    }
+};
+
+// Index of the output an input element of [batch, rows, cols] reduces into
+__device__ __forceinline__ int64_t axis_output(int64_t i, int64_t rows, int64_t cols, bool over_rows) {
+    int64_t b = i / (rows * cols);
+    int64_t rem = i - b * rows * cols;
+    int64_t r = rem / cols;
+    return over_rows ? b * cols + (rem - r * cols) : b * rows + r;
+}
+
+__global__ void k_reduce_axis_backward(const float* g, float* ga, int64_t n, int64_t rows, int64_t cols, bool over_rows,
+                                       float divisor) {
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        ga[i] = g[axis_output(i, rows, cols, over_rows)] / divisor;
+    }
+}
+
+// var: 2 (x - mean) / count * g;  std: (x - mean) / (count * (std + 1e-8)) * g, as the host code
+__global__ void k_moment_backward(const float* x, const float* mean, const float* stat, const float* g, float* ga,
+                                  int64_t n, int64_t rows, int64_t cols, bool over_rows, bool is_std, float count) {
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        int64_t o = axis_output(i, rows, cols, over_rows);
+        float d = x[i] - mean[o];
+        ga[i] = is_std ? (d / (count * (stat[o] + 1e-8f))) * g[o] : (2.0f * d / count) * g[o];
+    }
+}
+
+__global__ void k_sqrt_inplace(float* x, int64_t n) {
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        x[i] = sqrtf(x[i]);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Elementwise losses averaged over their elements (kind: 0 MSE, 1 L1, 2 cross entropy on
+// probabilities), mirroring mse, l1_loss and cross_entropy in ops/functional.h
+// ---------------------------------------------------------------------------------------------
+
+struct LossTerm {
+    int kind;
+    const float* p;
+    const float* t;
+    struct Ctx {};
+    __device__ Ctx context(int64_t) const { return Ctx{}; }
+    __device__ float operator()(const Ctx&, int64_t k) const {
+        float pv = p[k], tv = t[k];
+        if (kind == 0) {
+            float d = pv - tv;
+            return d * d;
+        }
+        if (kind == 1) return fabsf(pv - tv);
+        return -tv * logf(pv + 1e-8f);
+    }
+};
+
+__global__ void k_loss_backward(int kind, const float* p, const float* t, const float* dloss, float* grad, int64_t n,
+                                float divisor) {
+    float g = dloss[0];
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        float pv = p[i], tv = t[i];
+        if (kind == 0) {
+            grad[i] = (2.0f * (pv - tv) / divisor) * g;
+        } else if (kind == 1) {
+            float diff = pv - tv;
+            float sgn = (diff > 0.0f) ? 1.0f : ((diff < 0.0f) ? -1.0f : 0.0f);
+            grad[i] = (sgn / divisor) * g;
+        } else {
+            grad[i] = -(tv / ((pv + 1e-8f) * divisor)) * g;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Boolean mask: masked (m == 0) scores become -1e9 and pass no gradient
+// ---------------------------------------------------------------------------------------------
+
+__global__ void k_bool_mask_forward(const float* a, const float* m, float* out, int64_t n) {
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        out[i] = (m[i] == 0.0f) ? -1e9f : a[i];
+    }
+}
+
+__global__ void k_bool_mask_backward(const float* g, const float* m, float* ga, int64_t n) {
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        ga[i] = (m[i] != 0.0f) ? g[i] : 0.0f;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// im2col / col2im (dilation 1), laid out as im2col_cpu / col2im_cpu in ops/functional.h:
+// col [batch, C * kH * kW, H_out, W_out], channel c_col = (c * kH + kh) * kW + kw
+// ---------------------------------------------------------------------------------------------
+
+struct ConvGeometry {
+    int C, H, W, kH, kW, pH, pW, sH, sW, H_out, W_out;
+};
+
+__global__ void k_im2col(const float* x, float* col, int64_t batch, ConvGeometry g) {
+    int64_t cc = (int64_t)g.C * g.kH * g.kW;
+    int64_t n = batch * cc * g.H_out * g.W_out;
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        int w = (int)(i % g.W_out);
+        int h = (int)((i / g.W_out) % g.H_out);
+        int64_t c_col = (i / ((int64_t)g.W_out * g.H_out)) % cc;
+        int64_t b = i / ((int64_t)g.W_out * g.H_out * cc);
+        int kw = (int)(c_col % g.kW);
+        int kh = (int)((c_col / g.kW) % g.kH);
+        int64_t c = c_col / ((int64_t)g.kW * g.kH);
+        int row = kh + h * g.sH - g.pH;
+        int colx = kw + w * g.sW - g.pW;
+        col[i] = (row >= 0 && colx >= 0 && row < g.H && colx < g.W) ? x[((b * g.C + c) * g.H + row) * g.W + colx] : 0.0f;
+    }
+}
+
+// One thread per image element sums the columns that read it, in (kh, kw) order: the order in
+// which col2im_cpu adds them, so CPU and GPU agree bit for bit
+__global__ void k_col2im(const float* col, float* x, int64_t batch, ConvGeometry g) {
+    int64_t cc = (int64_t)g.C * g.kH * g.kW;
+    int64_t n = batch * g.C * g.H * g.W;
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        int iw = (int)(i % g.W);
+        int ih = (int)((i / g.W) % g.H);
+        int64_t c = (i / ((int64_t)g.W * g.H)) % g.C;
+        int64_t b = i / ((int64_t)g.W * g.H * g.C);
+        float acc = 0.0f;
+        for (int kh = 0; kh < g.kH; ++kh) {
+            int hs = ih + g.pH - kh;
+            if (hs < 0 || hs % g.sH != 0 || hs / g.sH >= g.H_out) continue;
+            for (int kw = 0; kw < g.kW; ++kw) {
+                int ws = iw + g.pW - kw;
+                if (ws < 0 || ws % g.sW != 0 || ws / g.sW >= g.W_out) continue;
+                int64_t c_col = (c * g.kH + kh) * g.kW + kw;
+                acc += col[((b * cc + c_col) * g.H_out + hs / g.sH) * g.W_out + ws / g.sW];
+            }
+        }
+        x[i] = acc;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Multi-tensor kernels: one launch covers a list of buffers. The list is uploaded as n pointers
+// followed by n sizes (uint64); blockIdx.y picks the buffer (offset by `first` for lists longer
+// than the grid's y limit) and the blocks along x stride through it.
+// ---------------------------------------------------------------------------------------------
+
+constexpr int kSqBlocks = 64;  // partial sums per buffer
+
+__device__ __forceinline__ double block_reduce_sum_double(double v) {
+    __shared__ double s_warp[32];
+    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) v += __shfl_down_sync(0xffffffff, v, offset);
+    if (lane == 0) s_warp[warp] = v;
+    __syncthreads();
+    int warps = (blockDim.x + 31) / 32;
+    v = (threadIdx.x < warps) ? s_warp[threadIdx.x] : 0.0;
+    if (warp == 0) {
+#pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) v += __shfl_down_sync(0xffffffff, v, offset);
+    }
+    return v;  // the block's sum, in thread 0
+}
+
+// partial[b * kSqBlocks + block] = sum of squares of the block's strided share of buffer b, in
+// double: a fixed partition reduced in a fixed order, so the result is deterministic
+__global__ void k_sum_squares_partials(const uint64_t* list, int n, int first, double* partial) {
+    int b = first + blockIdx.y;
+    const float* x = reinterpret_cast<const float*>(list[b]);
+    int64_t size = (int64_t)list[n + b];
     double acc = 0.0;
-    for (int64_t i = 0; i < kSqPartials; ++i) acc += partial[(int64_t)b * kSqPartials + i];
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < size; i += (int64_t)gridDim.x * blockDim.x) {
+        double v = (double)x[i];
+        acc += v * v;
+    }
+    acc = block_reduce_sum_double(acc);
+    if (threadIdx.x == 0) partial[(int64_t)b * kSqBlocks + blockIdx.x] = acc;
+}
+
+__global__ void k_sum_squares_finish(const double* partial, double* out, int n) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n) return;
+    double acc = 0.0;
+    for (int k = 0; k < kSqBlocks; ++k) acc += partial[(int64_t)b * kSqBlocks + k];
     out[b] = acc;
 }
 
-// x *= inv_scale, raising *found_nonfinite if any input was inf or NaN. Every writer stores the
-// same 1, so the race is benign and the result deterministic.
-__global__ void k_unscale(float* x, int64_t n, float inv_scale, int* found_nonfinite) {
-    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+// x *= scale for every buffer. With found_nonfinite, also raises the flag if any input was inf or
+// NaN (every writer stores the same 1, so the race is benign and the result deterministic).
+__global__ void k_scale_buffers(const uint64_t* list, int n, int first, float scale, int* found_nonfinite) {
+    int b = first + blockIdx.y;
+    float* x = reinterpret_cast<float*>(list[b]);
+    int64_t size = (int64_t)list[n + b];
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < size; i += (int64_t)gridDim.x * blockDim.x) {
         float v = x[i];
-        if (!isfinite(v)) *found_nonfinite = 1;
-        x[i] = v * inv_scale;
+        if (found_nonfinite && !isfinite(v)) *found_nonfinite = 1;
+        x[i] = v * scale;
     }
 }
 
@@ -667,13 +936,19 @@ void embedding_backward(const float* grad, const std::vector<int>& positions, co
                         const std::vector<int>& starts, float* grad_weight, int64_t vocab, int64_t dim) {
     CUDA_CHECK(cudaMemset(grad_weight, 0, (size_t)(vocab * dim) * sizeof(float)));
     if (unique_ids.empty()) return;
-    DeviceBuffer d_pos(positions.size() * sizeof(int)), d_ids(unique_ids.size() * sizeof(int)), d_starts(starts.size() * sizeof(int));
-    CUDA_CHECK(cudaMemcpy(d_pos.ptr, positions.data(), positions.size() * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_ids.ptr, unique_ids.data(), unique_ids.size() * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_starts.ptr, starts.data(), starts.size() * sizeof(int), cudaMemcpyHostToDevice));
+    // One upload (each is a synchronous copy from pageable memory): positions, unique ids, run starts
+    std::vector<int> packed;
+    packed.reserve(positions.size() + unique_ids.size() + starts.size());
+    packed.insert(packed.end(), positions.begin(), positions.end());
+    packed.insert(packed.end(), unique_ids.begin(), unique_ids.end());
+    packed.insert(packed.end(), starts.begin(), starts.end());
+    DeviceBuffer d_packed(packed.size() * sizeof(int));
+    CUDA_CHECK(cudaMemcpy(d_packed.ptr, packed.data(), packed.size() * sizeof(int), cudaMemcpyHostToDevice));
+    const int* d_pos = d_packed.as<int>();
+    const int* d_ids = d_pos + positions.size();
+    const int* d_starts = d_ids + unique_ids.size();
     int64_t n_unique = (int64_t)unique_ids.size();
-    k_embedding_backward<<<grid_for(n_unique * dim), kThreads>>>(grad, d_pos.as<int>(), d_ids.as<int>(), d_starts.as<int>(),
-                                                                 grad_weight, n_unique, dim);
+    k_embedding_backward<<<grid_for(n_unique * dim), kThreads>>>(grad, d_pos, d_ids, d_starts, grad_weight, n_unique, dim);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -691,30 +966,162 @@ void repeat_kv_backward(const float* grad, float* gin, int64_t batch, int64_t kv
     CUDA_CHECK(cudaGetLastError());
 }
 
-double sum_of_squares(const std::vector<const float*>& buffers, const std::vector<int64_t>& sizes) {
-    int count = (int)buffers.size();
-    if (count == 0) return 0.0;
-    DeviceBuffer partial((size_t)(count * kSqPartials) * sizeof(double)), sums((size_t)count * sizeof(double));
-    for (int b = 0; b < count; ++b) {
-        k_sum_squares_partials<<<kSqBlocks, kThreads>>>(buffers[b], sizes[b], partial.as<double>() + (int64_t)b * kSqPartials);
+void max_pool2d_forward(const float* x, float* out, float* argmax, int64_t planes, int H, int W, int H_out, int W_out,
+                        int kH, int kW, int sH, int sW) {
+    int64_t n = planes * H_out * W_out;
+    if (n == 0) return;
+    k_max_pool2d_forward<<<grid_for(n), kThreads>>>(x, out, argmax, planes, H, W, H_out, W_out, kH, kW, sH, sW);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void max_pool2d_backward(const float* grad, const float* argmax, float* gx, int64_t planes, int H, int W, int H_out,
+                         int W_out, int kH, int kW, int sH, int sW) {
+    int64_t n = planes * H * W;
+    if (n == 0) return;
+    k_max_pool2d_backward<<<grid_for(n), kThreads>>>(grad, argmax, gx, planes, H, W, H_out, W_out, kH, kW, sH, sW);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void reduce_axis(const float* x, float* out, int64_t batch, int64_t rows, int64_t cols, bool over_rows, float divisor) {
+    int64_t n_out = batch * (over_rows ? cols : rows);
+    if (n_out == 0) return;
+    reduce_terms(AxisSum{x, rows, cols, over_rows}, n_out, over_rows ? rows : cols, out);
+    if (divisor != 1.0f) scalar_forward(3, out, divisor, out, n_out);
+}
+
+void reduce_axis_backward(const float* g, float* ga, int64_t batch, int64_t rows, int64_t cols, bool over_rows,
+                          float divisor) {
+    int64_t n = batch * rows * cols;
+    if (n == 0) return;
+    k_reduce_axis_backward<<<grid_for(n), kThreads>>>(g, ga, n, rows, cols, over_rows, divisor);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void moment_axis(const float* x, float* mean, float* out, int64_t batch, int64_t rows, int64_t cols, bool over_rows,
+                 bool take_sqrt) {
+    int64_t n_out = batch * (over_rows ? cols : rows);
+    if (n_out == 0) return;
+    float count = (float)(over_rows ? rows : cols);
+    reduce_axis(x, mean, batch, rows, cols, over_rows, count);
+    reduce_terms(AxisSqDev{x, mean, rows, cols, over_rows}, n_out, over_rows ? rows : cols, out);
+    scalar_forward(3, out, count, out, n_out);
+    if (take_sqrt) {
+        k_sqrt_inplace<<<grid_for(n_out), kThreads>>>(out, n_out);
         CUDA_CHECK(cudaGetLastError());
     }
-    k_sum_squares_finish<<<(count + kThreads - 1) / kThreads, kThreads>>>(partial.as<double>(), sums.as<double>(), count);
+}
+
+void moment_axis_backward(const float* x, const float* mean, const float* stat, const float* g, float* ga, int64_t batch,
+                          int64_t rows, int64_t cols, bool over_rows, bool is_std) {
+    int64_t n = batch * rows * cols;
+    if (n == 0) return;
+    float count = (float)(over_rows ? rows : cols);
+    k_moment_backward<<<grid_for(n), kThreads>>>(x, mean, stat, g, ga, n, rows, cols, over_rows, is_std, count);
     CUDA_CHECK(cudaGetLastError());
-    std::vector<double> host(count);
-    CUDA_CHECK(cudaMemcpy(host.data(), sums.ptr, count * sizeof(double), cudaMemcpyDeviceToHost));
+}
+
+void pointwise_loss_forward(int kind, const float* pred, const float* target, float* loss, int64_t n, float divisor) {
+    reduce_terms(LossTerm{kind, pred, target}, 1, n, loss);
+    scalar_forward(3, loss, divisor, loss, 1);
+}
+
+void pointwise_loss_backward(int kind, const float* pred, const float* target, const float* dloss, float* grad, int64_t n,
+                             float divisor) {
+    if (n == 0) return;
+    k_loss_backward<<<grid_for(n), kThreads>>>(kind, pred, target, dloss, grad, n, divisor);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void bool_mask_forward(const float* a, const float* m, float* out, int64_t n) {
+    if (n == 0) return;
+    k_bool_mask_forward<<<grid_for(n), kThreads>>>(a, m, out, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void bool_mask_backward(const float* g, const float* m, float* ga, int64_t n) {
+    if (n == 0) return;
+    k_bool_mask_backward<<<grid_for(n), kThreads>>>(g, m, ga, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void im2col(const float* x, float* col, int64_t batch, int C, int H, int W, int kH, int kW, int pH, int pW, int sH, int sW,
+            int H_out, int W_out) {
+    int64_t n = batch * C * kH * kW * (int64_t)H_out * W_out;
+    if (n == 0) return;
+    k_im2col<<<grid_for(n), kThreads>>>(x, col, batch, ConvGeometry{C, H, W, kH, kW, pH, pW, sH, sW, H_out, W_out});
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void col2im(const float* col, float* x, int64_t batch, int C, int H, int W, int kH, int kW, int pH, int pW, int sH, int sW,
+            int H_out, int W_out) {
+    int64_t n = batch * C * (int64_t)H * W;
+    if (n == 0) return;
+    k_col2im<<<grid_for(n), kThreads>>>(col, x, batch, ConvGeometry{C, H, W, kH, kW, pH, pW, sH, sW, H_out, W_out});
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Uploads a buffer list for the multi-tensor kernels: n pointers, then n sizes
+template <typename Ptr>
+static std::unique_ptr<DeviceBuffer> upload_buffer_list(const std::vector<Ptr>& buffers, const std::vector<int64_t>& sizes) {
+    size_t n = buffers.size();
+    std::vector<uint64_t> packed(2 * n);
+    for (size_t b = 0; b < n; ++b) {
+        packed[b] = (uint64_t)reinterpret_cast<uintptr_t>(buffers[b]);
+        packed[n + b] = (uint64_t)sizes[b];
+    }
+    auto list = std::make_unique<DeviceBuffer>(packed.size() * sizeof(uint64_t));
+    CUDA_CHECK(cudaMemcpy(list->ptr, packed.data(), packed.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    return list;
+}
+
+constexpr int kMaxGridY = 65535;
+
+// Grid width for the scaling kernels: enough blocks for the largest buffer, at most 1024
+static int scale_blocks(const std::vector<int64_t>& sizes) {
+    int64_t largest = 1;
+    for (int64_t s : sizes) largest = std::max(largest, s);
+    return (int)std::min<int64_t>(1024, (largest + kThreads - 1) / kThreads);
+}
+
+double sum_of_squares(const std::vector<const float*>& buffers, const std::vector<int64_t>& sizes) {
+    int n = (int)buffers.size();
+    if (n == 0) return 0.0;
+    auto list = upload_buffer_list(buffers, sizes);
+    DeviceBuffer partial((size_t)n * kSqBlocks * sizeof(double)), sums((size_t)n * sizeof(double));
+    for (int first = 0; first < n; first += kMaxGridY) {
+        dim3 grid(kSqBlocks, std::min(kMaxGridY, n - first));
+        k_sum_squares_partials<<<grid, kThreads>>>(list->as<uint64_t>(), n, first, partial.as<double>());
+        CUDA_CHECK(cudaGetLastError());
+    }
+    k_sum_squares_finish<<<(n + kThreads - 1) / kThreads, kThreads>>>(partial.as<double>(), sums.as<double>(), n);
+    CUDA_CHECK(cudaGetLastError());
+    std::vector<double> host(n);
+    CUDA_CHECK(cudaMemcpy(host.data(), sums.ptr, n * sizeof(double), cudaMemcpyDeviceToHost));
     double total = 0.0;
     for (double v : host) total += v;
     return total;
 }
 
+void scale_buffers(const std::vector<float*>& buffers, const std::vector<int64_t>& sizes, float scale) {
+    int n = (int)buffers.size();
+    if (n == 0) return;
+    auto list = upload_buffer_list(buffers, sizes);
+    for (int first = 0; first < n; first += kMaxGridY) {
+        dim3 grid(scale_blocks(sizes), std::min(kMaxGridY, n - first));
+        k_scale_buffers<<<grid, kThreads>>>(list->as<uint64_t>(), n, first, scale, nullptr);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
 bool unscale_and_check(const std::vector<float*>& buffers, const std::vector<int64_t>& sizes, float inv_scale) {
-    if (buffers.empty()) return false;
+    int n = (int)buffers.size();
+    if (n == 0) return false;
+    auto list = upload_buffer_list(buffers, sizes);
     DeviceBuffer flag(sizeof(int));
     CUDA_CHECK(cudaMemset(flag.ptr, 0, sizeof(int)));
-    for (size_t b = 0; b < buffers.size(); ++b) {
-        if (sizes[b] == 0) continue;
-        k_unscale<<<grid_for(sizes[b]), kThreads>>>(buffers[b], sizes[b], inv_scale, flag.as<int>());
+    for (int first = 0; first < n; first += kMaxGridY) {
+        dim3 grid(scale_blocks(sizes), std::min(kMaxGridY, n - first));
+        k_scale_buffers<<<grid, kThreads>>>(list->as<uint64_t>(), n, first, inv_scale, flag.as<int>());
         CUDA_CHECK(cudaGetLastError());
     }
     int found = 0;

@@ -6,6 +6,7 @@
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
 #include "types.h"
+#include "autocast.h"
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -33,19 +34,21 @@ inline cublasHandle_t get_cublas_handle() {
     cudaGetDevice(&dev);
     static thread_local std::unordered_map<int, cublasHandle_t> handles;
     auto it = handles.find(dev);
+    cublasHandle_t handle = nullptr;
     if (it == handles.end()) {
-        cublasHandle_t handle = nullptr;
         CUBLAS_CHECK(cublasCreate(&handle));
-        cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
         handles[dev] = handle;
-        return handle;
+    } else {
+        handle = it->second;
     }
-    return it->second;
+    // TF32 tensor cores for Float32 GEMMs only when allowed (set_allow_tf32)
+    CUBLAS_CHECK(cublasSetMathMode(handle, allow_tf32() ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH));
+    return handle;
 }
 
 // cuBLAS strided-batched GEMM, column-major: C = alpha op_a(A) op_b(B) + beta C. C is fp32; A and
 // B are fp32, or both of the compute dtype: Float16/BFloat16 run on tensor cores and accumulate in
-// fp32. Float32 runs SGEMM, which uses TF32 tensor cores where the GPU has them (see the math mode
+// fp32. Float32 runs SGEMM, on TF32 tensor cores only with set_allow_tf32(true) (see the math mode
 // above). batch == 1 ignores the strides.
 inline void gemm_strided_batched(cublasOperation_t op_a, cublasOperation_t op_b, int m, int n, int k, float alpha,
                                  const void* A, int lda, long long stride_a, const void* B, int ldb, long long stride_b,
@@ -75,38 +78,5 @@ inline void gemm_strided_batched(cublasOperation_t op_a, cublasOperation_t op_b,
                                                 batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
     }
 }
-
-// -------------------------------------------------------------
-// CUDA Graph Execution (Hardware-level step capture & replay)
-// Eliminates 100% of CPU dispatch latency across training steps
-// -------------------------------------------------------------
-struct CUDAGraph {
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t instance = nullptr;
-    bool is_captured = false;
-
-    void begin_capture(cudaStream_t stream = nullptr) {
-        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-        is_captured = false;
-    }
-
-    void end_capture(cudaStream_t stream = nullptr) {
-        CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
-        CUDA_CHECK(cudaGraphInstantiate(&instance, graph, nullptr, nullptr, 0));
-        is_captured = true;
-    }
-
-    void replay(cudaStream_t stream = nullptr) {
-        if (!is_captured || !instance) {
-            throw std::runtime_error("CUDAGraph: graph not captured yet");
-        }
-        CUDA_CHECK(cudaGraphLaunch(instance, stream));
-    }
-
-    ~CUDAGraph() {
-        if (instance) cudaGraphExecDestroy(instance);
-        if (graph) cudaGraphDestroy(graph);
-    }
-};
 
 #endif

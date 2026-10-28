@@ -8,6 +8,7 @@
 #include <vector>
 #include <memory>
 #include <algorithm>
+#include <unordered_set>
 
 // ============================================================================
 // 1. RMSNorm (Root Mean Square Layer Normalization)
@@ -185,90 +186,77 @@ inline std::pair<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>> precompute_fr
     return {cos_t, sin_t};
 }
 
-// Autograd Node for Rotary Position Embedding
+namespace rope_detail {
+
+// Rotates interleaved pairs (2j, 2j + 1) of each head vector by position * freq_j; inverse = true
+// rotates by the negative angle (the backward pass: R(-theta) = R(theta)^T)
+inline void rotate_host(const float* in, const float* cos_t, const float* sin_t, float* out, int batch_size, int seq_len,
+                        int n_heads, int head_dim, int start_pos, bool inverse) {
+    int half_dim = head_dim / 2;
+    float sign = inverse ? -1.0f : 1.0f;
+    for (int b = 0; b < batch_size; ++b) {
+        for (int s = 0; s < seq_len; ++s) {
+            int64_t freq_offset = (int64_t)(start_pos + s) * half_dim;
+            for (int h = 0; h < n_heads; ++h) {
+                int64_t base = ((int64_t)(b * seq_len + s) * n_heads + h) * head_dim;
+                for (int j = 0; j < half_dim; ++j) {
+                    float c = cos_t[freq_offset + j];
+                    float sn = sign * sin_t[freq_offset + j];
+                    float x0 = in[base + 2 * j];
+                    float x1 = in[base + 2 * j + 1];
+                    out[base + 2 * j] = x0 * c - x1 * sn;
+                    out[base + 2 * j + 1] = x0 * sn + x1 * c;
+                }
+            }
+        }
+    }
+}
+
+}  // namespace rope_detail
+
+// Autograd Node for Rotary Position Embedding. Needs only the tables and the input's shape.
 struct RoPEBackward : public Node {
-    std::shared_ptr<Tensor> x, cos_freqs, sin_freqs;
+    std::vector<int64_t> x_shape;
+    std::shared_ptr<Tensor> cos_freqs, sin_freqs;
     int start_pos;
     int batch_size, seq_len, n_heads, head_dim;
 
-    RoPEBackward(std::shared_ptr<Tensor> x,
-                 std::shared_ptr<Tensor> cos_freqs,
-                 std::shared_ptr<Tensor> sin_freqs,
-                 int start_pos,
-                 int batch_size, int seq_len, int n_heads, int head_dim)
-        : x(x), cos_freqs(cos_freqs), sin_freqs(sin_freqs), start_pos(start_pos),
-          batch_size(batch_size), seq_len(seq_len), n_heads(n_heads), head_dim(head_dim) {}
+    RoPEBackward(std::vector<int64_t> x_shape, std::shared_ptr<Tensor> cos_freqs, std::shared_ptr<Tensor> sin_freqs,
+                 int start_pos, int batch_size, int seq_len, int n_heads, int head_dim)
+        : x_shape(std::move(x_shape)), cos_freqs(std::move(cos_freqs)), sin_freqs(std::move(sin_freqs)),
+          start_pos(start_pos), batch_size(batch_size), seq_len(seq_len), n_heads(n_heads), head_dim(head_dim) {}
 
     void release_variables() override {
-        x.reset();
         cos_freqs.reset();
         sin_freqs.reset();
     }
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
-        if (grads.empty() || !grads[0] || !x || !cos_freqs || !sin_freqs) return {nullptr};
-        auto dout = grads[0];
+        if (grads.empty() || !grads[0] || !cos_freqs || !sin_freqs) return {nullptr};
+        auto dout = grads[0];  // dense: the engine densifies grads
+        Device dev = dout->device;
 
 #ifdef USE_CUDA
-        if (x->device == Device::CUDA && cos_freqs->device == Device::CUDA && sin_freqs->device == Device::CUDA) {
-            auto dout_c = make_contiguous(dout);
-            auto dx = std::make_shared<Tensor>(x->shape, Device::CUDA, x->dtype, false);
-            cuda::rope_backward(dout_c->data_ptr<float>(), cos_freqs->data_ptr<float>(), sin_freqs->data_ptr<float>(),
+        if (dev == Device::CUDA && cos_freqs->device == Device::CUDA && sin_freqs->device == Device::CUDA) {
+            auto dx = std::make_shared<Tensor>(x_shape, Device::CUDA, DType::Float32, false);
+            cuda::rope_backward(dout->data_ptr<float>(), cos_freqs->data_ptr<float>(), sin_freqs->data_ptr<float>(),
                                 dx->data_ptr<float>(), batch_size, seq_len, n_heads, head_dim, start_pos);
             return {dx};
         }
 #endif
-
-        if (x->device != Device::CPU) {
-            auto dout_cpu = dout->to(Device::CPU);
-            auto x_cpu = x->to(Device::CPU);
-            auto cos_cpu = cos_freqs->to(Device::CPU);
-            auto sin_cpu = sin_freqs->to(Device::CPU);
-            RoPEBackward cpu_node(x_cpu, cos_cpu, sin_cpu, start_pos, batch_size, seq_len, n_heads, head_dim);
-            auto cpu_grads = cpu_node.apply({dout_cpu});
-            if (cpu_grads.empty() || !cpu_grads[0]) return {nullptr};
-            return {cpu_grads[0]->to(x->device)};
-        }
-
-        auto dx = std::make_shared<Tensor>(x->shape, x->device, x->dtype, false);
-
-        const float* dout_ptr = dout->data_ptr<float>();
-        const float* cos_ptr = cos_freqs->data_ptr<float>();
-        const float* sin_ptr = sin_freqs->data_ptr<float>();
-        float* dx_ptr = dx->data_ptr<float>();
-
-        int half_dim = head_dim / 2;
-
-        // Backward of orthogonal 2D rotation matrix R(theta) is R(-theta) = R(theta)^T
-        // dx_0 = dout_0 * cos + dout_1 * sin
-        // dx_1 = -dout_0 * sin + dout_1 * cos
-        for (int b = 0; b < batch_size; ++b) {
-            for (int s = 0; s < seq_len; ++s) {
-                int pos = start_pos + s;
-                int freq_offset = pos * half_dim;
-
-                for (int h = 0; h < n_heads; ++h) {
-                    int base_offset = ((b * seq_len + s) * n_heads + h) * head_dim;
-
-                    for (int j = 0; j < half_dim; ++j) {
-                        float c = cos_ptr[freq_offset + j];
-                        float s_val = sin_ptr[freq_offset + j];
-
-                        float d0 = dout_ptr[base_offset + 2 * j];
-                        float d1 = dout_ptr[base_offset + 2 * j + 1];
-
-                        dx_ptr[base_offset + 2 * j]     = d0 * c + d1 * s_val;
-                        dx_ptr[base_offset + 2 * j + 1] = -d0 * s_val + d1 * c;
-                    }
-                }
-            }
-        }
-        return {dx};
+        auto host = [](const std::shared_ptr<Tensor>& t) { return t->device == Device::CPU ? t : t->cpu(); };
+        auto dh = host(dout), ch = host(cos_freqs), sh = host(sin_freqs);
+        auto dx = std::make_shared<Tensor>(x_shape, Device::CPU, DType::Float32, false);
+        rope_detail::rotate_host(dh->data_ptr<float>(), ch->data_ptr<float>(), sh->data_ptr<float>(), dx->data_ptr<float>(),
+                                 batch_size, seq_len, n_heads, head_dim, start_pos, /*inverse=*/true);
+        return {(dev == Device::CPU) ? dx : dx->to(dev)};
     }
 };
 
 // Applies Rotary Position Embedding to Query or Key tensor x
-// Supports 4D [batch, seq_len, n_heads, head_dim], 3D [batch, seq_len, head_dim], and 2D [seq_len, head_dim]
+// Supports 4D [batch, seq_len, n_heads, head_dim], 3D [batch, seq_len, head_dim], and 2D [seq_len, head_dim].
+// cos_freqs and sin_freqs are [max_seq_len, head_dim / 2] (precompute_freqs_cis); positions
+// start_pos .. start_pos + seq_len - 1 must lie inside them.
 inline std::shared_ptr<Tensor> apply_rotary_emb(
     const std::shared_ptr<Tensor>& x_in,
     const std::shared_ptr<Tensor>& cos_freqs_in,
@@ -276,90 +264,58 @@ inline std::shared_ptr<Tensor> apply_rotary_emb(
     int start_pos = 0
 ) {
     DG_PROFILE_OP("rope");
+    if (!x_in || !cos_freqs_in || !sin_freqs_in) throw std::runtime_error("apply_rotary_emb: null tensor passed");
     auto x = contiguous(float32_input(x_in));
-    auto cos_freqs = contiguous(float32_input(cos_freqs_in));
-    auto sin_freqs = contiguous(float32_input(sin_freqs_in));
-    if (!x || !cos_freqs || !sin_freqs) throw std::runtime_error("apply_rotary_emb: null tensor passed");
+    auto cos_freqs = make_contiguous(float32_input(cos_freqs_in));
+    auto sin_freqs = make_contiguous(float32_input(sin_freqs_in));
     int ndim = x->ndim();
     if (ndim < 2) throw std::runtime_error("apply_rotary_emb: tensor must be at least 2D (seq_len, head_dim)");
     int head_dim = x->shape[ndim - 1];
     int n_heads = (ndim == 4) ? x->shape[2] : 1;
-    int seq_len = (ndim >= 2) ? x->shape[ndim - 2 - (ndim == 4 ? 1 : 0)] : 1;
-    int batch_size = x->size() / (seq_len * n_heads * head_dim);
+    int seq_len = x->shape[ndim - 2 - (ndim == 4 ? 1 : 0)];
+    int batch_size = (int)(x->size() / ((int64_t)seq_len * n_heads * head_dim));
 
     if (head_dim % 2 != 0) {
         throw std::invalid_argument("RoPE head dimension must be even, got: " + std::to_string(head_dim));
     }
+    // The kernels read table row start_pos + s for every position s, unchecked
+    if (cos_freqs->ndim() != 2 || cos_freqs->shape != sin_freqs->shape || cos_freqs->shape[1] != head_dim / 2) {
+        throw std::invalid_argument("apply_rotary_emb: cos/sin tables must both be [max_seq_len, " + std::to_string(head_dim / 2) +
+                                    "] for head dimension " + std::to_string(head_dim));
+    }
+    if (start_pos < 0 || (int64_t)start_pos + seq_len > cos_freqs->shape[0]) {
+        throw std::out_of_range("apply_rotary_emb: positions " + std::to_string(start_pos) + ".." +
+                                std::to_string((int64_t)start_pos + seq_len - 1) + " exceed the RoPE tables' " +
+                                std::to_string(cos_freqs->shape[0]) + " positions (max_seq_len)");
+    }
+    if (cos_freqs->device != x->device || sin_freqs->device != x->device) {
+        throw std::invalid_argument("apply_rotary_emb: input and tables are on different devices");
+    }
 
+    Device dev = x->device;
+    auto out = std::make_shared<Tensor>(x->shape, dev, DType::Float32, false);
 #ifdef USE_CUDA
-    if (x->device == Device::CUDA && cos_freqs->device == Device::CUDA && sin_freqs->device == Device::CUDA) {
-        auto xc = make_contiguous(x);
-        auto out = std::make_shared<Tensor>(x->shape, Device::CUDA, x->dtype, needs_grad(x));
-        cuda::rope_forward(xc->data_ptr<float>(), cos_freqs->data_ptr<float>(), sin_freqs->data_ptr<float>(),
+    if (dev == Device::CUDA) {
+        cuda::rope_forward(x->data_ptr<float>(), cos_freqs->data_ptr<float>(), sin_freqs->data_ptr<float>(),
                            out->data_ptr<float>(), batch_size, seq_len, n_heads, head_dim, start_pos);
-        if (needs_grad(x)) {
-            auto grad_fn = std::make_shared<RoPEBackward>(xc, cos_freqs, sin_freqs, start_pos,
-                                                          batch_size, seq_len, n_heads, head_dim);
-            grad_fn->add_next_edge(get_grad_edge(x).function);
-            out->grad_fn = grad_fn;
-        }
-        return out;
-    }
+    } else
 #endif
-
-    if (x->device != Device::CPU) {
-        auto x_cpu = x->to(Device::CPU);
-        auto cos_cpu = cos_freqs->to(Device::CPU);
-        auto sin_cpu = sin_freqs->to(Device::CPU);
-        auto out_cpu = apply_rotary_emb(x_cpu, cos_cpu, sin_cpu, start_pos);
-        auto out_res = out_cpu->to(x->device);
-        if (needs_grad(x)) {
-            auto grad_fn = std::make_shared<RoPEBackward>(x, cos_freqs, sin_freqs, start_pos,
-                                                          batch_size, seq_len, n_heads, head_dim);
-            grad_fn->add_next_edge(get_grad_edge(x).function);
-            out_res->grad_fn = grad_fn;
-        }
-        return out_res;
+    {
+        auto host = [](const std::shared_ptr<Tensor>& t) { return t->device == Device::CPU ? t : t->cpu(); };
+        auto xh = host(x), ch = host(cos_freqs), sh = host(sin_freqs);
+        auto oh = (dev == Device::CPU) ? out : std::make_shared<Tensor>(x->shape, Device::CPU, DType::Float32, false);
+        rope_detail::rotate_host(xh->data_ptr<float>(), ch->data_ptr<float>(), sh->data_ptr<float>(), oh->data_ptr<float>(),
+                                 batch_size, seq_len, n_heads, head_dim, start_pos, /*inverse=*/false);
+        if (dev != Device::CPU) out = oh->to(dev);
     }
 
-    auto out = std::make_shared<Tensor>(x->shape, x->device, x->dtype, needs_grad(x));
-
-    const float* x_ptr = x->data_ptr<float>();
-    const float* cos_ptr = cos_freqs->data_ptr<float>();
-    const float* sin_ptr = sin_freqs->data_ptr<float>();
-    float* out_ptr = out->data_ptr<float>();
-
-    int half_dim = head_dim / 2;
-
-    for (int b = 0; b < batch_size; ++b) {
-        for (int s = 0; s < seq_len; ++s) {
-            int pos = start_pos + s;
-            int freq_offset = pos * half_dim;
-
-            for (int h = 0; h < n_heads; ++h) {
-                int base_offset = ((b * seq_len + s) * n_heads + h) * head_dim;
-
-                for (int j = 0; j < half_dim; ++j) {
-                    float c = cos_ptr[freq_offset + j];
-                    float s_val = sin_ptr[freq_offset + j];
-
-                    float x0 = x_ptr[base_offset + 2 * j];
-                    float x1 = x_ptr[base_offset + 2 * j + 1];
-
-                    out_ptr[base_offset + 2 * j]     = x0 * c - x1 * s_val;
-                    out_ptr[base_offset + 2 * j + 1] = x0 * s_val + x1 * c;
-                }
-            }
-        }
-    }
-
+    out->requires_grad = needs_grad(x);
     if (needs_grad(x)) {
-        auto grad_fn = std::make_shared<RoPEBackward>(x, cos_freqs, sin_freqs, start_pos,
-                                                      batch_size, seq_len, n_heads, head_dim);
+        auto grad_fn = std::make_shared<RoPEBackward>(x->shape, cos_freqs, sin_freqs, start_pos, batch_size, seq_len,
+                                                      n_heads, head_dim);
         grad_fn->add_next_edge(get_grad_edge(x).function);
         out->grad_fn = grad_fn;
     }
-
     return out;
 }
 
@@ -406,28 +362,38 @@ public:
 // ============================================================================
 
 inline float clip_grad_norm_(const std::vector<std::shared_ptr<Tensor>>& parameters, float max_norm) {
+    // Each gradient once (a tied weight may be listed twice), dense, so it can be scaled in place.
+    // Gradients belong to their parameters (adopted or accumulated into fresh buffers), so
+    // scaling them in place changes nothing else.
+    std::vector<std::shared_ptr<Tensor>> grads;
+    std::unordered_set<const Tensor*> seen;
+    for (const auto& p : parameters) {
+        if (!p || !p->grad || !seen.insert(p.get()).second) continue;
+        if (p->grad->dtype != DType::Float32) throw std::runtime_error("clip_grad_norm_: gradients must be Float32");
+        if (!p->grad->is_contiguous()) p->grad = make_contiguous(p->grad);
+        grads.push_back(p->grad);
+    }
+
     // Accumulate in double: summing millions of squared floats in float loses precision
     double total_sq = 0.0;
 #ifdef USE_CUDA
-    std::vector<std::shared_ptr<Tensor>> keep_alive;
     std::vector<const float*> device_grads;
+    std::vector<float*> device_targets;
     std::vector<int64_t> device_sizes;
 #endif
-    for (const auto& p : parameters) {
-        if (!p || !p->grad) continue;
-        auto g = make_contiguous(p->grad);
+    for (const auto& g : grads) {
 #ifdef USE_CUDA
         if (g->device == Device::CUDA) {
-            // Reduced on the GPU below, all parameters in one pass with a single host copy
+            // Reduced on the GPU below, all gradients in one launch with a single host copy
             device_grads.push_back(g->data_ptr<float>());
+            device_targets.push_back(g->data_ptr<float>());
             device_sizes.push_back(g->size());
-            keep_alive.push_back(g);
             continue;
         }
 #endif
-        if (g->device != Device::CPU) g = g->cpu();
-        const float* d = g->data_ptr<float>();
-        for (int64_t i = 0; i < g->size(); ++i) total_sq += (double)d[i] * (double)d[i];
+        auto h = (g->device == Device::CPU) ? g : g->cpu();
+        const float* d = h->data_ptr<float>();
+        for (int64_t i = 0; i < h->size(); ++i) total_sq += (double)d[i] * (double)d[i];
     }
 #ifdef USE_CUDA
     total_sq += cuda::sum_of_squares(device_grads, device_sizes);
@@ -436,9 +402,18 @@ inline float clip_grad_norm_(const std::vector<std::shared_ptr<Tensor>>& paramet
 
     if (total_norm > max_norm) {
         float scale = max_norm / (total_norm + 1e-6f);
-        NoGradGuard no_grad;
-        for (const auto& p : parameters) {
-            if (p && p->grad) p->grad = mul_scalar(p->grad, scale);
+#ifdef USE_CUDA
+        cuda::scale_buffers(device_targets, device_sizes, scale);
+#endif
+        for (const auto& g : grads) {
+            if (g->device == Device::CUDA) continue;
+            if (g->device == Device::CPU || g->device == Device::MPS) {
+                float* d = g->data_ptr<float>();
+                for (int64_t i = 0; i < g->size(); ++i) d[i] *= scale;
+            } else {
+                NoGradGuard no_grad;
+                ops::make_contiguous(*g, *mul_scalar(g, scale));
+            }
         }
     }
     return total_norm;

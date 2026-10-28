@@ -1,5 +1,6 @@
 #pragma once
 #include "types.h"
+#include <atomic>
 #include <stdexcept>
 
 // Mixed precision: while an AutocastGuard is alive, CUDA matmuls and the products inside attention
@@ -29,3 +30,13 @@ struct AutocastGuard {
     AutocastGuard(const AutocastGuard&) = delete;
     AutocastGuard& operator=(const AutocastGuard&) = delete;
 };
+
+// TF32: on Ampere and newer GPUs, Float32 matmuls (and the Float32 attention GEMMs) can round their
+// inputs to TF32 (10 mantissa bits) on tensor cores, several times faster. Off by default, as in
+// PyTorch, so Float32 means Float32; turn it on for speed when that precision is enough. Applies to
+// the GEMMs launched after the call, process-wide. No effect on GPUs without TF32 (T4) or on the CPU.
+#define DUMMYGRAD_HAS_TF32_SWITCH 1  // lets tools built against several versions (bench.cpp) check
+inline std::atomic<bool> g_allow_tf32{false};
+
+inline void set_allow_tf32(bool allow) { g_allow_tf32 = allow; }
+inline bool allow_tf32() { return g_allow_tf32.load(std::memory_order_relaxed); }

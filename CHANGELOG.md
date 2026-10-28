@@ -6,13 +6,53 @@ All notable changes to dummygrad are documented here. Versions follow [Semantic 
 
 Groundwork for keeping activations in fp16 under autocast: half-precision tensors now work with every op. Speed is unchanged; the fp16 kernels and the switch come next.
 
+### Fixed (2026-10-28 audit)
+- **Graphs leaked when backward never ran.** Tanh, sigmoid, softmax and attention kept their own output, which points back at their backward node: a reference cycle that kept the whole graph and its activations alive after an evaluation without `NoGradGuard`, a skipped step, an exception or `retain_graph=true`. They now keep `saved_output(out)`, the same memory without the back-pointer.
+- **Embedding backward wrote out of bounds on CUDA** for an out-of-range or negative token id (forward only made its row NaN), corrupting whatever sat next to the gradient. Ids are checked on the host and throw `std::out_of_range`.
+- **Multi-GPU gradients were wrong.** `all_reduce_gradients_p2p` dropped every other GPU's gradients when the GPUs lacked peer access, raced between ranks, and indexed empty arrays with one GPU; both reductions went through the host and summed instead of averaging. Replaced by `all_reduce_gradients` (GPU to GPU, fixed order, averaged); `MultiGPURunner` rethrows exceptions from its threads instead of terminating.
+- **CUDA causal, sliding-window and prefix masks assumed square scores**: with different query and key counts they masked the wrong elements and wrote past the output.
+- **`max_pool2d` routed gradients to the wrong element** on inputs over 2^24 elements (flat indices stored as floats). It now stores window offsets, and runs on the GPU.
+- **Out-of-bounds reads rejected up front:** RoPE positions past the tables (sequences longer than `max_seq_len`), tables of the wrong width, `n_kv_heads` that does not divide `n_heads`, 1-D or mismatched-batch CUDA matmul operands, a `bool_mask` mask of another shape.
+- Non-causal `alibi_bias` gave future keys a growing positive bias; it penalizes `|i - j|`.
+- `Module::to(device)` converted fp16 and int8 tensors to fp32; it now keeps each tensor's dtype. `randn`/`xavier`/`kaiming` ignored their dtype.
+- Copying a module shared its parameters with the original (moving the copy to another device moved parts of the original). Modules are now move-only.
+- `load_safetensors` loaded unsupported dtypes (I32, I64, F64, ...) as Float32 garbage; it throws. Header and shape sizes are checked for overflow; the legacy `.bin` loader detects truncation.
+- `clip_grad_norm_` counted a parameter listed twice twice. `Tensor::to` ignored CUDA copy errors; `show()` read GPU memory from the host.
+- Attention past 2048 tokens with head dims other than 16/32/64/128 used untiled kernels with atomics (slow, not reproducible). Head dims up to 128 now run the tiled kernels zero-padded; larger ones take the GEMM path.
+- The Metal backend leaked every MPS buffer (no release without ARC) and bound nil buffers for views with an offset.
+- TPU (experimental): every op recompiled its XLA program per call, the gradient all-reduce reused the first shape's program, host and TPU copies went out of sync, and `MultiTPURunner` never synchronized gradients.
+
+### Added (2026-10-28 audit)
+- **`matmul_nt(a, b)`** = a @ b^T for a 2-D `b`: on CUDA one transposed GEMM, with b's gradient in b's own layout. GPT and ModernTransformer use it for the tied LM head, which densified the [vocab, d] embedding every forward and its gradient every backward.
+- **GPU kernels for ops that round-tripped through the host on CUDA:** sum, mean, var, std_dev, mse, l1_loss, cross_entropy, bool_mask, concat, im2col (so conv1d/conv2d), max_pool2d; broadcast and scale_n_shift are now broadcast add/mul compositions.
+- **`set_allow_tf32(bool)`**: Float32 matmuls use TF32 tensor cores only when enabled; it is off by default, as in PyTorch (they used TF32 silently on Ampere and newer). `dg_bench` enables it to match `bench_torch.py`.
+- **Per-parameter weight decay:** `opt.set_weight_decay(params, wd)` on Adam and SGD, and `no_weight_decay_params(model)` (biases, norm gains and shifts). `train_lm` uses it.
+- `MultiGPURunner::for_each_replica` for per-GPU work such as optimizer steps; `DeviceMesh` initializes once.
+- Tests: graphs freed without backward, bad embedding ids, two-GPU averaging (Kaggle T4 x2) and a CPU reduction, non-square masks, max-pool past 2^24 elements, rejected shapes, dtype preservation, weight-decay overrides, attention head dims 48 and 160, `matmul_nt`.
+
+### Changed (2026-10-28 audit)
+- Branch merges in backward accumulate into an unshared gradient instead of a fresh copy (bit-identical results).
+- `clip_grad_norm_` and `GradScaler::unscale` run one launch over all parameters and scale in place.
+- Backward nodes no longer keep whole inputs just for their shapes (RoPE, slice, max-pool, im2col), and activation backward passes skip zero-fills they overwrite.
+- Embedding ids given on the host are kept for backward (no device-to-host copy); GPT and MARS positions are one `[T]` row broadcast over the batch.
+
+### Removed (2026-10-28 audit)
+- `ArenaScope` / `CUDAScratchpadArena` (memory reused while tensors still pointed into it), `CUDAGraph` (could not capture the stream every kernel runs on), `dummy_ptr`, the unused CUDA bias-epilogue kernels, and the never-called Metal matmul, attention and layernorm. `all_reduce_gradients_p2p` (see Fixed).
+
 ### Added
 - **`cast(x, dtype)`**: differentiable conversion between Float32, Float16 and BFloat16 (nearest-even rounding); the gradient is converted back to the input's dtype.
 - **Every op accepts fp16 and bf16 inputs.** An op without a native half-precision kernel converts such an input to fp32 first (differentiably) and returns fp32, so an unsupported dtype costs a conversion, never precision or an error. Before, passing an fp16 tensor to almost any op threw.
 - CUDA `matmul` and `linear` take Float32, Float16 or BFloat16 inputs: an input already in the GEMM's compute dtype is used as is, others are converted. Each input's gradient comes back in its own dtype.
 - Tests: `cast` rounding and gradients (CPU and CUDA, no host copies on CUDA); 18 ops given fp16 inputs produce bit-identical outputs to fp32 inputs, with the fp32 gradient rounded once to fp16.
 
+- **`bench/compare.py`: one table for the whole comparison.** It runs dummygrad, optionally a baseline build of dummygrad, PyTorch eager and `torch.compile`d PyTorch back to back, and prints median step times with their spread, speed ratios, peak GPU memory, and torch.compile's one-off compile time. The notebook's benchmark cells are now one `compare.py` call per precision.
+- **Same-session baselines in the notebook.** Set `BASELINE` (e.g. `v0.7.0`) and the notebook also builds that version's benchmark, from the current `bench.cpp`, and passes it to `compare.py`, so a before/after comparison is free of session-to-session noise.
+- **A `large` benchmark configuration** (100M parameters: d=768, 12 layers, GQA 12/4 heads, vocabulary 32000, batch 8 x 512 tokens), where both frameworks are bound by the GPU.
+- **GPU memory statistics:** `cuda_memory_stats()` reports bytes in use, peak in use (`reset_peak_memory_stats()` restarts it) and reserved by the caching allocator, matching `torch.cuda.memory_allocated` / `max_memory_allocated` / `memory_reserved`. `dg_bench` reports the peak per configuration.
+- `bench_torch.py --compile[=mode]` and `--json`; `dg_bench --json`.
+
 ### Changed
+- **Benchmarks report medians over a fixed time budget.** `dg_bench` and `bench_torch.py` run 10 warmup steps, then at least 50 timed steps covering at least 2 seconds (`--seconds` changes it), and report the median step with its 10th-90th percentile spread. They used to average 10 steps after 3 warmups, about 20 ms of measurement for the tiny model, which on shared cloud CPUs moved by tens of percent from run to run. `--profile` now averages 10 steps instead of 3. PyTorch now runs with its fastest settings, fused AdamW and `F.rms_norm` (the hand-written RMSNorm ran several kernels), so the comparison is against PyTorch at its best.
 - `Tensor::to(dtype)` on a CUDA tensor converts on the GPU. It used to copy to the host, convert there and copy back.
 - CUDA `fill` and `add_inplace` (gradient accumulation) work on fp16 and bf16, summing in fp32 and rounding once.
 - `SliceBackward` copies by element size, so it works in any dtype, and on CUDA builds the gradient on the device with one strided copy. It used to round-trip every GPU gradient through the host.

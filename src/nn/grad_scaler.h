@@ -150,13 +150,16 @@ private:
                 continue;
             }
 #endif
-            // MPS memory is shared with the host, as in Adam's fallback path
-            if (g->device != Device::CPU && g->device != Device::MPS) throw std::runtime_error("GradScaler: unsupported device");
+            // MPS memory is shared with the host, and host memory is a TPU tensor's authoritative copy
+            if (g->device != Device::CPU && g->device != Device::MPS && g->device != Device::TPU) {
+                throw std::runtime_error("GradScaler: unsupported device");
+            }
             float* d = g->data_ptr<float>();
             for (int64_t i = 0; i < g->size(); ++i) {
                 if (!std::isfinite(d[i])) found = true;
                 d[i] *= inv_scale;
             }
+            if (g->device == Device::TPU) g->storage->tpu_handle.reset();
         }
 #ifdef USE_CUDA
         if (cuda::unscale_and_check(device_grads, device_sizes, inv_scale)) found = true;

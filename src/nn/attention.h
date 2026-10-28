@@ -81,14 +81,14 @@ public:
             auto V_4d = make_contiguous(reshape(V, {B, 1, S, d_k}));
             // Q/K/V carry the weights' requires_grad even when the input x does not
             bool qkv_grad = grad_enabled() && (Q->requires_grad || K->requires_grad || V->requires_grad);
-            auto out_4d = std::make_shared<Tensor>(Q_4d->shape, Device::CUDA, x->dtype, qkv_grad);
-            auto lse = std::make_shared<Tensor>(std::vector<int64_t>{B, 1, S}, Device::CUDA, x->dtype, false);
+            auto out_4d = std::make_shared<Tensor>(Q_4d->shape, Device::CUDA, DType::Float32, qkv_grad);
+            auto lse = std::make_shared<Tensor>(std::vector<int64_t>{B, 1, S}, Device::CUDA, DType::Float32, false);
             DType compute = autocast_dtype();
             auto impl = cuda::attention_forward(Q_4d->data_ptr<float>(), K_4d->data_ptr<float>(), V_4d->data_ptr<float>(),
                                                 out_4d->data_ptr<float>(), lse->data_ptr<float>(), B, 1, S, d_k, causal, scale,
                                                 compute);
             if (qkv_grad) {
-                auto grad_fn = std::make_shared<FlashAttentionBackward>(Q_4d, K_4d, V_4d, out_4d, lse,
+                auto grad_fn = std::make_shared<FlashAttentionBackward>(Q_4d, K_4d, V_4d, saved_output(out_4d), lse,
                                                                         B, 1, S, d_k, causal, scale, impl, compute);
                 grad_fn->add_next_edge(get_grad_edge(Q).function);
                 grad_fn->add_next_edge(get_grad_edge(K).function);
@@ -212,9 +212,25 @@ public:
     int d_k;
     bool causal;
 
+    // Number of key/value heads (n_kv_heads, or n_heads when 0) after checking the head layout:
+    // n_heads must divide d_model and the kv heads must divide n_heads, or the attention kernels
+    // would index past K and V
+    static int checked_kv_heads(int d_model, int n_heads, int n_kv_heads) {
+        if (n_heads <= 0 || d_model <= 0 || d_model % n_heads != 0) {
+            throw std::invalid_argument("MultiHeadAttention: d_model (" + std::to_string(d_model) +
+                                        ") must be a positive multiple of n_heads (" + std::to_string(n_heads) + ")");
+        }
+        int kv = n_kv_heads > 0 ? n_kv_heads : n_heads;
+        if (n_kv_heads < 0 || kv > n_heads || n_heads % kv != 0) {
+            throw std::invalid_argument("MultiHeadAttention: n_kv_heads (" + std::to_string(n_kv_heads) +
+                                        ") must divide n_heads (" + std::to_string(n_heads) + ")");
+        }
+        return kv;
+    }
+
     MultiHeadAttention(int d_model, int n_heads, int n_kv_heads = 0, bool causal = false)
         : W_q(d_model, d_model),
-          W_k(d_model, (n_kv_heads > 0 ? n_kv_heads : n_heads) * (d_model / n_heads)),
+          W_k(d_model, checked_kv_heads(d_model, n_heads, n_kv_heads) * (d_model / n_heads)),
           W_v(d_model, (n_kv_heads > 0 ? n_kv_heads : n_heads) * (d_model / n_heads)),
           W_o(d_model, d_model),
           d_model(d_model),
@@ -277,14 +293,14 @@ public:
             auto V_c = make_contiguous(V_split);
             // Q/K/V carry the weights' requires_grad even when the input x does not
             bool qkv_grad = grad_enabled() && (Q_split->requires_grad || K_split->requires_grad || V_split->requires_grad);
-            attn_out = std::make_shared<Tensor>(Q_split->shape, Device::CUDA, x->dtype, qkv_grad);
-            auto lse = std::make_shared<Tensor>(std::vector<int64_t>{B, n_heads, S}, Device::CUDA, x->dtype, false);
+            attn_out = std::make_shared<Tensor>(Q_split->shape, Device::CUDA, DType::Float32, qkv_grad);
+            auto lse = std::make_shared<Tensor>(std::vector<int64_t>{B, n_heads, S}, Device::CUDA, DType::Float32, false);
             DType compute = autocast_dtype();
             auto impl = cuda::attention_forward(Q_c->data_ptr<float>(), K_c->data_ptr<float>(), V_c->data_ptr<float>(),
                                                 attn_out->data_ptr<float>(), lse->data_ptr<float>(), B, n_heads, S, d_k,
                                                 causal, scale, compute);
             if (qkv_grad) {
-                auto grad_fn = std::make_shared<FlashAttentionBackward>(Q_c, K_c, V_c, attn_out, lse,
+                auto grad_fn = std::make_shared<FlashAttentionBackward>(Q_c, K_c, V_c, saved_output(attn_out), lse,
                                                                         B, n_heads, S, d_k, causal, scale, impl, compute);
                 grad_fn->add_next_edge(get_grad_edge(Q_split).function);
                 grad_fn->add_next_edge(get_grad_edge(K_split).function);

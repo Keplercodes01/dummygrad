@@ -19,7 +19,7 @@ inline std::shared_ptr<Tensor> randn(std::vector<int64_t> shape, Device device =
         ptr[i] = dis(g_gen);
     }
     if (device != Device::CPU || dtype != DType::Float32) {
-        auto out = t->to(device);
+        auto out = t->to(device, dtype);
         out->requires_grad = requires_grad;
         return out;
     }
@@ -40,7 +40,7 @@ inline std::shared_ptr<Tensor> xavier(std::vector<int64_t> shape, Device device 
         ptr[i] = dis(g_gen);
     }
     if (device != Device::CPU || dtype != DType::Float32) {
-        auto out = t->to(device);
+        auto out = t->to(device, dtype);
         out->requires_grad = requires_grad;
         return out;
     }
@@ -61,7 +61,7 @@ inline std::shared_ptr<Tensor> kaiming(std::vector<int64_t> shape, Device device
         ptr[i] = dis(g_gen);
     }
     if (device != Device::CPU || dtype != DType::Float32) {
-        auto out = t->to(device);
+        auto out = t->to(device, dtype);
         out->requires_grad = requires_grad;
         return out;
     }

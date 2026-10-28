@@ -25,6 +25,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 using TensorPtr = std::shared_ptr<Tensor>;
@@ -308,6 +309,13 @@ static std::vector<GradTest> build_grad_tests() {
         auto h = matmul(L[1], L[0]);                     // [5, 4]
         return matmul(h, transpose(L[0], 0, 1));         // [5, 6]
     });
+    // a @ b^T without a transposed copy (the tied LM head), alone and tied like an embedding
+    add_test("matmul_nt", {leaf({2, 3, 4}), leaf({5, 4})},
+             [](const Leaves& L, Device) { return matmul_nt(L[0], L[1]); });
+    add_test("tied_weight_nt", {leaf({6, 4}), leaf({5, 6})}, [](const Leaves& L, Device) {
+        auto h = matmul(L[1], L[0]);  // [5, 4]
+        return matmul_nt(h, L[0]);    // [5, 6]
+    });
     // Residual fan-out: AddBackward hands the same gradient tensor to several edges
     add_test("residual_fanout", {leaf({3, 4}, -1, 1, 0.1f)}, [](const Leaves& L, Device) {
         auto a = add(L[0], L[0]);
@@ -383,8 +391,9 @@ static std::vector<GradTest> build_grad_tests() {
 
     // Multi-head attention. Leaves: x, then (W, b) for q, k, v, o. Weights scale with 1/sqrt(d_model)
     // so the softmax stays smooth. On CUDA these short sequences take the GEMM path; main() runs them
-    // again on the tiled kernels (head dims 16/32/64/128, with sequence lengths that cross their tile
-    // and block boundaries) and the untiled ones (other head dims).
+    // again past the GEMM limit: the tiled kernels (head dims 16/32/64/128, with sequence lengths that
+    // cross their tile and block boundaries; other head dims up to 128 zero-padded) and, above 128,
+    // the GEMM path a chunk of heads at a time.
     auto attention_test = [&](const std::string& name, int d_model, int n_heads, int n_kv_heads, bool use_rope,
                               int batch, int seq) {
         auto mha = std::make_shared<MultiHeadAttention>(d_model, n_heads, n_kv_heads, true);
@@ -418,6 +427,8 @@ static std::vector<GradTest> build_grad_tests() {
     attention_test("attention_d32_gqa_rope", 128, 4, 2, true, 2, 37);
     attention_test("attention_d64", 128, 2, 0, false, 2, 20);
     attention_test("attention_d128_two_blocks", 256, 2, 0, false, 1, 40);
+    attention_test("attention_d48_padded", 96, 2, 0, true, 1, 9);
+    attention_test("attention_d160", 320, 2, 0, false, 1, 9);
 
     // --- Shape ops ---
     add_test("concat_rows", {leaf({2, 3, 4}), leaf({2, 2, 4})},
@@ -449,6 +460,13 @@ static std::vector<GradTest> build_grad_tests() {
     add_test("sliding_window_mask", {leaf({2, 5, 5})},
              [](const Leaves& L, Device) { return softmax(masking::sliding_window_mask(L[0], 2)); });
     add_test("prefix_causal_mask", {leaf({2, 5, 5})},
+             [](const Leaves& L, Device) { return softmax(masking::prefix_causal_mask(L[0], 2)); });
+    // Fewer queries than keys and the reverse (the CUDA kernels used to assume square scores)
+    add_test("causal_mask_wide", {leaf({2, 3, 5})}, [](const Leaves& L, Device) { return softmax(causal_mask(L[0])); });
+    add_test("causal_mask_tall", {leaf({2, 5, 3})}, [](const Leaves& L, Device) { return softmax(causal_mask(L[0])); });
+    add_test("sliding_window_mask_wide", {leaf({2, 3, 6})},
+             [](const Leaves& L, Device) { return softmax(masking::sliding_window_mask(L[0], 1)); });
+    add_test("prefix_causal_mask_tall", {leaf({2, 5, 3})},
              [](const Leaves& L, Device) { return softmax(masking::prefix_causal_mask(L[0], 2)); });
 
     // --- More losses & affine ---
@@ -814,6 +832,69 @@ static std::string engine_deep_chain() {
     return expect_all(x, 1.0f, "3000-op chain");
 }
 
+// Every node reachable from t's grad_fn, except the leaves' AccumulateGrad nodes (the leaves own those)
+static std::vector<std::weak_ptr<Node>> graph_nodes(const TensorPtr& t) {
+    std::vector<std::weak_ptr<Node>> out;
+    std::vector<std::shared_ptr<Node>> stack;
+    std::unordered_set<Node*> seen;
+    if (t->grad_fn) stack.push_back(t->grad_fn);
+    while (!stack.empty()) {
+        auto node = stack.back();
+        stack.pop_back();
+        if (!seen.insert(node.get()).second) continue;
+        if (!dynamic_cast<AccumulateGrad*>(node.get())) out.push_back(node);
+        for (const auto& edge : node->next_edges) {
+            if (edge.function) stack.push_back(edge.function);
+        }
+    }
+    return out;
+}
+
+// A graph whose backward never runs (evaluation without NoGradGuard, a skipped step) must be freed
+// with its output. A backward node that keeps its own op's output forms a reference cycle instead,
+// which leaks the node, its saved tensors and every node upstream of it.
+static std::string expect_graph_freed(const std::string& what, const std::function<TensorPtr()>& build) {
+    std::weak_ptr<Tensor> out_ref;
+    std::vector<std::weak_ptr<Node>> nodes;
+    {
+        auto out = build();
+        out_ref = out;
+        nodes = graph_nodes(out);
+    }
+    if (nodes.empty()) return what + ": built no graph";
+    if (!out_ref.expired()) return what + ": the output outlived its last reference";
+    for (const auto& n : nodes) {
+        if (auto alive = n.lock()) return what + ": " + alive->name() + " outlived its graph";
+    }
+    return "";
+}
+
+static std::string engine_graph_freed_without_backward(Device dev) {
+    auto input = [dev](std::vector<int64_t> shape) { return upload(random_values(numel(shape), -1, 1), shape, dev, true); };
+    MultiHeadAttention mha(8, 2, 0, true);
+    manual_seed(4);
+    ModernTransformer model(16, 8, 16, 2, 1, 1);
+    if (dev == Device::CUDA) {
+        mha.cuda();
+        model.cuda();
+    }
+    const std::vector<std::pair<std::string, std::function<TensorPtr()>>> cases = {
+        {"tanh", [&] { return tanh(input({3, 4})); }},
+        {"sigmoid", [&] { return sigmoid(input({3, 4})); }},
+        {"softmax", [&] { return softmax(input({3, 4})); }},
+        {"attention", [&] { return mha.forward(input({2, 3, 8})); }},
+        {"transformer + loss", [&] {
+             return fused_cross_entropy(model.forward(upload({1, 2, 3, 4}, {1, 4}, dev, false)),
+                                        upload({2, 3, 4, 5}, {1, 4}, dev, false));
+         }},
+    };
+    for (const auto& [name, build] : cases) {
+        auto err = expect_graph_freed(name, build);
+        if (!err.empty()) return err;
+    }
+    return "";
+}
+
 // ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
@@ -974,6 +1055,122 @@ static std::string module_modes_and_zero_grad() {
         if (p->grad) return "zero_grad() left a gradient";
     }
     return "";
+}
+
+// A copy would share the original's parameters (they are shared_ptrs); moving is how models travel
+static_assert(!std::is_copy_constructible_v<ModernTransformer>, "modules must not be copyable");
+static_assert(std::is_move_constructible_v<ModernTransformer>, "modules must stay movable");
+
+// to(device) keeps each tensor's dtype, init functions honor theirs, and a safetensors dtype
+// dummygrad has no type for fails loudly instead of loading as Float32
+static std::string module_dtypes_preserved() {
+    Linear layer(3, 2);
+    layer.to(Device::CPU, DType::Float16);
+    layer.to(Device::CPU);
+    if (layer.W->dtype != DType::Float16) return "to(device) converted an fp16 parameter back to fp32";
+    for (auto t : {randn({2, 2}, Device::CPU, DType::Float16), xavier({2, 2}, Device::CPU, DType::BFloat16)}) {
+        if (t->dtype == DType::Float32) return "an init function ignored its dtype";
+    }
+    const std::string path = "test_i32.safetensors";
+    {
+        std::string header = "{\"ids\":{\"dtype\":\"I32\",\"shape\":[2],\"data_offsets\":[0,8]}}";
+        std::ofstream out(path, std::ios::binary);
+        uint64_t len = header.size();
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out << header;
+        int32_t ids[2] = {1, 2};
+        out.write(reinterpret_cast<const char*>(ids), sizeof(ids));
+    }
+    std::string msg;
+    try {
+        io::load_safetensors(path);
+    } catch (const std::runtime_error& e) {
+        msg = e.what();
+    }
+    std::remove(path.c_str());
+    return msg.find("unsupported dtype") != std::string::npos ? "" : "an I32 tensor loaded without an error";
+}
+
+// Inputs that kernels would read out of bounds with must be rejected up front
+static std::string invalid_shapes_rejected(Device dev) {
+    auto throws = [](const std::function<void()>& f) {
+        try {
+            f();
+        } catch (const std::exception&) {
+            return true;
+        }
+        return false;
+    };
+    if (!throws([] { MultiHeadAttention bad(12, 4, 3); })) return "n_kv_heads that does not divide n_heads was accepted";
+    if (!throws([] { MultiHeadAttention bad(10, 4); })) return "d_model that n_heads does not divide was accepted";
+    if (!throws([] { MultiHeadAttention bad(8, 2, 4); })) return "more kv heads than query heads was accepted";
+
+    auto freqs = precompute_freqs_cis(4, 8);
+    auto cos_t = freqs.first->to(dev), sin_t = freqs.second->to(dev);
+    auto x = upload(random_values(2 * 8 * 4, -1, 1), {2, 8, 1, 4}, dev, false);
+    if (throws([&] { apply_rotary_emb(x, cos_t, sin_t, 0); })) return "RoPE rejected positions inside its tables";
+    if (!throws([&] { apply_rotary_emb(x, cos_t, sin_t, 1); })) return "RoPE read past the end of its tables";
+    auto x6 = upload(random_values(2 * 8 * 6, -1, 1), {2, 8, 1, 6}, dev, false);
+    if (!throws([&] { apply_rotary_emb(x6, cos_t, sin_t, 0); })) return "RoPE accepted tables of the wrong head dimension";
+
+    // Non-causal ALiBi penalizes distance in both directions
+    auto bias = download(masking::alibi_bias(1, 3, /*causal=*/false));
+    if (bias[0 * 3 + 2] != bias[2 * 3 + 0] || !(bias[0 * 3 + 2] < 0.0f)) return "non-causal ALiBi is not a symmetric penalty";
+
+    if (dev == Device::CUDA &&
+        !throws([] { matmul(upload({1, 2}, {2}, Device::CUDA, false), upload({1, 2, 3, 4}, {2, 2}, Device::CUDA, false)); })) {
+        return "a 1-D CUDA matmul operand was accepted";
+    }
+    return "";
+}
+
+// max_pool2d on an input of more than 2^24 elements: the winner of the last window sits at an odd
+// flat index above 2^24, which a float flat index (the old representation) cannot hold
+static std::string max_pool2d_large_input() {
+    const int64_t n = 4097;
+    auto x = std::make_shared<Tensor>(std::vector<int64_t>{1, 1, n, n}, Device::CPU, DType::Float32, true);
+    x->fill_(0.0f);
+    const int64_t winner = 4095 * n + 4094;  // 16781309
+    x->data_ptr<float>()[winner] = 1.0f;
+    auto out = max_pool2d(x, 2, 2, 2, 2);
+    if (out->data_ptr<float>()[out->size() - 1] != 1.0f) return "the last window's maximum is wrong";
+    scalar_sum(out)->backward();
+    float g = x->grad->data_ptr<float>()[winner];
+    float neighbour = x->grad->data_ptr<float>()[winner - 1];
+    if (g != 1.0f || neighbour != 0.0f) {
+        return "the gradient went to the wrong element (" + std::to_string(g) + " at the winner, " +
+               std::to_string(neighbour) + " next to it)";
+    }
+    return "";
+}
+
+// Out-of-range token ids must throw, never index memory: ids given on the host in forward, ids
+// already on the GPU in backward (before the gradient kernel writes their rows)
+static std::string embedding_rejects_bad_ids(Device dev) {
+    Embedding emb(10, 4);
+    if (dev == Device::CUDA) emb.cuda();
+    auto throws_out_of_range = [](const std::function<void()>& f) {
+        try {
+            f();
+        } catch (const std::out_of_range&) {
+            return true;
+        }
+        return false;
+    };
+    for (float bad : {10.0f, -1.0f, -100.0f}) {
+        auto ids = upload({3, bad}, {2}, Device::CPU, false);
+        if (!throws_out_of_range([&] { emb.forward(ids); })) return "host id " + std::to_string(bad) + " was accepted";
+    }
+    if (dev == Device::CUDA) {
+        auto ids = upload({3, 12}, {2}, Device::CUDA, false);
+        TensorPtr out;
+        if (throws_out_of_range([&] { out = emb.forward(ids); })) return "a GPU id was checked in forward (that costs a sync)";
+        if (!throws_out_of_range([&] { scalar_sum(out)->backward(); })) return "backward accepted an out-of-range GPU id";
+    }
+    // Valid ids give the same rows whether they come from the host or the device
+    auto from_host = emb.forward(upload({3, 0, 9}, {3}, Device::CPU, false));
+    auto from_dev = emb.forward(upload({3, 0, 9}, {3}, dev, false));
+    return download(from_host) == download(from_dev) ? "" : "host and device ids gave different rows";
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,8 +1345,114 @@ static std::string workflow_clip_grad_norm() {
     float ga = download(a->grad)[0], gb = download(b->grad)[1];
     if (std::fabs(ga - 0.6f) > 1e-5f || std::fabs(gb - 0.8f) > 1e-5f) return "gradients not rescaled to norm 1";
     float unclipped = clip_grad_norm_({a, b}, 10.0f);
-    return std::fabs(unclipped - 1.0f) < 1e-4f ? "" : "a norm under the limit was changed";
+    if (std::fabs(unclipped - 1.0f) > 1e-4f) return "a norm under the limit was changed";
+    // A parameter listed twice (a tied weight in a hand-built list) counts once
+    float tied = clip_grad_norm_({a, a, b}, 10.0f);
+    return std::fabs(tied - 1.0f) < 1e-4f ? "" : "a parameter listed twice was counted twice: norm " + std::to_string(tied);
 }
+
+// Weight decay overrides: no_weight_decay_params picks biases and norm parameters, and an
+// override of 0 leaves them undecayed while the rest decays
+static std::string workflow_weight_decay_overrides() {
+    Linear layer(2, 2);
+    auto excluded = no_weight_decay_params(layer);
+    if (excluded.size() != 1 || excluded[0] != layer.b) return "no_weight_decay_params should pick only the bias";
+    RMSNorm norm(4);
+    if (no_weight_decay_params(norm).size() != 1) return "no_weight_decay_params missed a norm gain";
+    Adam opt(1.0f, 0.9f, 0.999f, 1e-8f, /*weight_decay=*/0.5f);
+    opt.set_weight_decay(excluded, 0.0f);
+    auto w0 = download(layer.W), b0 = download(layer.b);
+    for (auto& p : layer.parameters()) p->grad = zeros(p->shape);
+    opt.step(layer.parameters());
+    if (download(layer.b) != b0) return "an excluded parameter was decayed";
+    auto w1 = download(layer.W);
+    for (size_t k = 0; k < w0.size(); ++k) {
+        if (std::fabs(w1[k] - 0.5f * w0[k]) > 1e-6f) return "the weight was not decayed by lr * weight_decay";
+    }
+    return "";
+}
+
+// Data-parallel reduction: every replica ends with the average (or sum) of all replicas' gradients,
+// and a replica that had no gradient counts as zero and still receives the result
+static std::string workflow_all_reduce_gradients() {
+    auto param = [](std::vector<float> grad) {
+        auto p = upload({0, 0, 0}, {3}, Device::CPU, true);
+        if (!grad.empty()) p->grad = upload(grad, {3}, Device::CPU, false);
+        return p;
+    };
+    std::vector<std::vector<TensorPtr>> four = {{param({1, 2, 3})}, {param({3, 4, 5})}, {param({})}, {param({4, 6, 8})}};
+    all_reduce_gradients(four);
+    for (size_t r = 0; r < four.size(); ++r) {
+        if (!four[r][0]->grad || download(four[r][0]->grad) != std::vector<float>{2, 3, 4}) {
+            return "replica " + std::to_string(r) + " did not receive the average";
+        }
+    }
+    std::vector<std::vector<TensorPtr>> two = {{param({1, 2, 3})}, {param({3, 4, 5})}};
+    all_reduce_gradients(two, /*average=*/false);
+    if (download(two[1][0]->grad) != std::vector<float>{4, 6, 8}) return "average=false did not sum";
+    std::vector<std::vector<TensorPtr>> mismatched = {{param({1, 2, 3})}, {upload({0, 0}, {2}, Device::CPU, true)}};
+    try {
+        all_reduce_gradients(mismatched);
+    } catch (const std::runtime_error&) {
+        return "";
+    }
+    return "replicas with different parameter shapes were accepted";
+}
+
+#ifdef USE_CUDA
+static int cuda_device_count() {
+    int n = 0;
+    return cudaGetDeviceCount(&n) == cudaSuccess ? n : 0;
+}
+
+// Two GPUs (Kaggle's T4 x2): after parallel_step both replicas hold the average of the gradients each
+// would have computed alone, and identical optimizer steps keep their weights identical
+static std::string multi_gpu_parallel_step() {
+    MultiGPURunner<ModernTransformer> runner(2, [](int) {
+        ModernTransformer model(16, 8, 16, 2, 1, 1);
+        model.cuda();
+        return model;
+    });
+    const std::vector<std::vector<float>> in = {{1, 2, 3, 4}, {5, 6, 7, 8}}, tg = {{2, 3, 4, 5}, {6, 7, 8, 9}};
+    auto step = [&](int rank, ModernTransformer& model) {
+        model.zero_grad();
+        fused_cross_entropy(model.forward(upload(in[rank], {1, 4}, Device::CUDA, false)),
+                            upload(tg[rank], {1, 4}, Device::CUDA, false))->backward();
+    };
+    // Reference: each rank's batch alone through replica 0, on GPU 0
+    std::vector<std::vector<std::vector<float>>> alone;
+    CUDA_CHECK(cudaSetDevice(0));
+    for (int rank = 0; rank < 2; ++rank) {
+        step(rank, *runner.replicas[0]);
+        alone.push_back(all_grads(*runner.replicas[0]));
+    }
+    runner.parallel_step(step);
+    for (int rank = 0; rank < 2; ++rank) {
+        auto got = all_grads(*runner.replicas[rank]);
+        for (size_t k = 0; k < got.size(); ++k) {
+            std::vector<float> expected(alone[0][k].size());
+            for (size_t e = 0; e < expected.size(); ++e) expected[e] = (alone[0][k][e] + alone[1][k][e]) / 2.0f;
+            auto err = compare(expected, got[k], 1e-5f);
+            if (!err.empty()) return "replica " + std::to_string(rank) + ", parameter " + std::to_string(k) + ": " + err;
+        }
+    }
+    std::vector<Adam> opts(2, Adam(1e-2f));
+    runner.for_each_replica([&](int rank, ModernTransformer& model) { opts[rank].step(model.parameters()); });
+    auto p0 = runner.replicas[0]->parameters(), p1 = runner.replicas[1]->parameters();
+    for (size_t k = 0; k < p0.size(); ++k) {
+        if (download(p0[k]) != download(p1[k])) return "replica weights diverged after one step (parameter " + std::to_string(k) + ")";
+    }
+    // An exception on one GPU reaches the caller instead of terminating the process
+    try {
+        runner.for_each_replica([](int rank, ModernTransformer&) {
+            if (rank == 1) throw std::runtime_error("boom");
+        });
+    } catch (const std::runtime_error& e) {
+        return std::string(e.what()) == "boom" ? "" : std::string("unexpected exception: ") + e.what();
+    }
+    return "an exception thrown on GPU 1 was not rethrown";
+}
+#endif
 
 static std::string workflow_dataloader() {
     const int64_t n = 10;
@@ -1840,6 +2143,11 @@ int main() {
     run_case(r, "engine/concurrent_fanin", engine_concurrent_fanin);
     run_case(r, "engine/adopted_grads_do_not_alias", engine_adopted_grads_do_not_alias);
     run_case(r, "engine/deep_chain", engine_deep_chain);
+    run_case(r, "engine/graph_freed_without_backward", [] { return engine_graph_freed_without_backward(Device::CPU); });
+    if (has_cuda) {
+        run_case(r, "engine/graph_freed_without_backward_cuda",
+                 [] { return engine_graph_freed_without_backward(Device::CUDA); });
+    }
     run_case(r, "engine/calling_thread", [] { return engine_calling_thread(Device::CPU); });
     if (has_cuda) run_case(r, "engine/calling_thread_cuda", [] { return engine_calling_thread(Device::CUDA); });
 
@@ -1850,6 +2158,12 @@ int main() {
     run_case(r, "module/strict_loading", module_strict_loading);
     run_case(r, "module/to_tied_and_frozen", module_to_tied_and_frozen);
     run_case(r, "module/modes_and_zero_grad", module_modes_and_zero_grad);
+    run_case(r, "module/max_pool2d_large_input", max_pool2d_large_input);
+    run_case(r, "module/dtypes_preserved", module_dtypes_preserved);
+    run_case(r, "module/invalid_shapes_rejected", [] { return invalid_shapes_rejected(Device::CPU); });
+    if (has_cuda) run_case(r, "module/invalid_shapes_rejected_cuda", [] { return invalid_shapes_rejected(Device::CUDA); });
+    run_case(r, "module/embedding_rejects_bad_ids", [] { return embedding_rejects_bad_ids(Device::CPU); });
+    if (has_cuda) run_case(r, "module/embedding_rejects_bad_ids_cuda", [] { return embedding_rejects_bad_ids(Device::CUDA); });
 
     std::cout << "\n-- workflow\n";
     run_case(r, "workflow/deterministic_backward", workflow_deterministic_backward);
@@ -1861,6 +2175,15 @@ int main() {
     run_case(r, "workflow/resume_sgd_momentum", workflow_resume_sgd_momentum);
     run_case(r, "workflow/checkpoint_scalars", workflow_checkpoint_scalars);
     run_case(r, "workflow/clip_grad_norm", workflow_clip_grad_norm);
+    run_case(r, "workflow/weight_decay_overrides", workflow_weight_decay_overrides);
+    run_case(r, "workflow/all_reduce_gradients", workflow_all_reduce_gradients);
+#ifdef USE_CUDA
+    if (cuda_device_count() >= 2) {
+        run_case(r, "workflow/multi_gpu_parallel_step", multi_gpu_parallel_step);
+    } else if (has_cuda) {
+        std::cout << "[SKIP] workflow/multi_gpu_parallel_step (needs 2 GPUs, e.g. Kaggle's T4 x2)\n";
+    }
+#endif
     run_case(r, "workflow/dataloader", workflow_dataloader);
     run_case(r, "workflow/token_dataset", workflow_token_dataset);
     run_case(r, "workflow/metrics_logger", workflow_metrics_logger);

@@ -110,7 +110,6 @@ public:
             x_in = reshape(actions, {1, actions->shape[0], actions->shape[1]});
         }
 
-        int B = x_in->shape[0];
         int T = x_in->shape[1];
         int act_dim = x_in->shape[2];
 
@@ -126,18 +125,13 @@ public:
         // 1. Encode continuous action tokens into latent space: [B, T, d_model]
         auto h = action_encoder.forward(x_in);
 
-        // 2. Generate frame position indices [0, 1, ..., T-1] safely on CPU
-        auto pos_ids_cpu = std::make_shared<Tensor>(std::vector<int64_t>{B, T}, Device::CPU, DType::Float32, false);
-        float* p_ptr = pos_ids_cpu->data_ptr<float>();
-        for (int b = 0; b < B; b++) {
-            for (int t = 0; t < T; t++) {
-                p_ptr[b * T + t] = static_cast<float>(t);
-            }
-        }
-        auto pos_ids = (actions->device != Device::CPU) ? pos_ids_cpu->to(actions->device) : pos_ids_cpu;
+        // 2. Frame positions 0..T-1 as one row on the host; the embedding keeps them for its backward
+        auto positions = std::make_shared<Tensor>(std::vector<int64_t>{T}, Device::CPU, DType::Float32, false);
+        float* p_ptr = positions->data_ptr<float>();
+        for (int t = 0; t < T; t++) p_ptr[t] = static_cast<float>(t);
 
-        // 3. Positional Embedding lookup [B, T, d_model] and residual addition
-        auto pos_h = pos_emb.forward(pos_ids);
+        // 3. Positional embedding [T, d_model], broadcast over the batch in the residual addition
+        auto pos_h = pos_emb.forward(positions);
         h = add(h, pos_h);
 
         // 4. Pass through Causal Transformer Blocks

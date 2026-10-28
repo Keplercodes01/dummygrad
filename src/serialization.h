@@ -68,12 +68,25 @@ inline std::string dtype_to_safetensors_str(DType dt) {
     }
 }
 
-inline DType safetensors_str_to_dtype(const std::string& str) {
+// Throws for dtypes dummygrad has no type for (F64, I32, I64, U8, BOOL, ...): reading their bytes
+// as Float32 would load garbage without an error
+inline DType safetensors_str_to_dtype(const std::string& str, const std::string& tensor_name = "") {
     if (str == "F32" || str == "float32") return DType::Float32;
     if (str == "F16" || str == "float16") return DType::Float16;
     if (str == "BF16" || str == "bfloat16") return DType::BFloat16;
     if (str == "I8" || str == "int8") return DType::Int8;
-    return DType::Float32;
+    throw std::runtime_error("load_safetensors: unsupported dtype \"" + str + "\"" +
+                             (tensor_name.empty() ? std::string() : " for tensor " + tensor_name));
+}
+
+// Element count of a shape, or -1 if it is negative or overflows
+inline int64_t checked_numel(const std::vector<int64_t>& shape) {
+    int64_t n = 1;
+    for (int64_t d : shape) {
+        if (d < 0 || (d > 0 && n > INT64_MAX / d)) return -1;
+        n *= d;
+    }
+    return n;
 }
 
 // Save named tensors to a Hugging Face compatible .safetensors file
@@ -147,7 +160,7 @@ inline void save_safetensors(
 // Minimal, zero-dependency parser for SafeTensors JSON header
 struct SafeTensorEntry {
     std::string name;
-    DType dtype = DType::Float32;
+    std::string dtype;
     std::vector<int64_t> shape;
     uint64_t offset_start = 0;
     uint64_t offset_end = 0;
@@ -204,7 +217,7 @@ inline std::vector<SafeTensorEntry> parse_safetensors_header(const std::string& 
                 if (v_start != std::string::npos) {
                     size_t v_end = entry_str.find('"', v_start + 1);
                     if (v_end != std::string::npos) {
-                        entry.dtype = safetensors_str_to_dtype(entry_str.substr(v_start + 1, v_end - v_start - 1));
+                        entry.dtype = entry_str.substr(v_start + 1, v_end - v_start - 1);
                     }
                 }
             }
@@ -297,7 +310,7 @@ inline std::unordered_map<std::string, std::shared_ptr<Tensor>> load_safetensors
     const uint8_t* ptr = static_cast<const uint8_t*>(mmapped_data);
     uint64_t header_len = *reinterpret_cast<const uint64_t*>(ptr);
 
-    if (8 + header_len > file_size) {
+    if (header_len > file_size - 8) {
         munmap(mmapped_data, file_size);
         close(fd);
         throw std::runtime_error("load_safetensors: Corrupt file header size");
@@ -314,14 +327,22 @@ inline std::unordered_map<std::string, std::shared_ptr<Tensor>> load_safetensors
             close(fd);
             throw std::runtime_error("load_safetensors: Offset out of bounds for tensor: " + entry.name);
         }
-        auto tensor = std::make_shared<Tensor>(entry.shape, Device::CPU, entry.dtype, false);
-        size_t expected_bytes = static_cast<size_t>(tensor->size()) * dtype_size(entry.dtype);
+        DType dtype;
+        int64_t numel = checked_numel(entry.shape);
         size_t bytes = entry.offset_end - entry.offset_start;
-        if (bytes != expected_bytes) {
+        try {
+            dtype = safetensors_str_to_dtype(entry.dtype, entry.name);
+        } catch (...) {
+            munmap(mmapped_data, file_size);
+            close(fd);
+            throw;
+        }
+        if (numel < 0 || (uint64_t)numel != bytes / dtype_size(dtype) || bytes % dtype_size(dtype) != 0) {
             munmap(mmapped_data, file_size);
             close(fd);
             throw std::runtime_error("load_safetensors: Byte size mismatch for tensor: " + entry.name);
         }
+        auto tensor = std::make_shared<Tensor>(entry.shape, Device::CPU, dtype, false);
         const uint8_t* src = payload_base + entry.offset_start;
         std::memcpy(tensor->data_ptr<char>(), src, bytes);
 
@@ -349,7 +370,7 @@ inline std::unordered_map<std::string, std::shared_ptr<Tensor>> load_safetensors
 
     uint64_t header_len = 0;
     in.read(reinterpret_cast<char*>(&header_len), sizeof(header_len));
-    if (8 + header_len > file_size) {
+    if (header_len > file_size - 8) {
         throw std::runtime_error("load_safetensors: Corrupt file header size");
     }
 
@@ -364,12 +385,13 @@ inline std::unordered_map<std::string, std::shared_ptr<Tensor>> load_safetensors
         if (entry.offset_start > entry.offset_end || entry.offset_end > max_payload) {
             throw std::runtime_error("load_safetensors: Offset out of bounds for tensor: " + entry.name);
         }
-        auto tensor = std::make_shared<Tensor>(entry.shape, Device::CPU, entry.dtype, false);
-        size_t expected_bytes = static_cast<size_t>(tensor->size()) * dtype_size(entry.dtype);
+        DType dtype = safetensors_str_to_dtype(entry.dtype, entry.name);
+        int64_t numel = checked_numel(entry.shape);
         size_t bytes = entry.offset_end - entry.offset_start;
-        if (bytes != expected_bytes) {
+        if (numel < 0 || (uint64_t)numel != bytes / dtype_size(dtype) || bytes % dtype_size(dtype) != 0) {
             throw std::runtime_error("load_safetensors: Byte size mismatch for tensor: " + entry.name);
         }
+        auto tensor = std::make_shared<Tensor>(entry.shape, Device::CPU, dtype, false);
         in.seekg(payload_base + entry.offset_start);
         in.read(tensor->data_ptr<char>(), bytes);
 
@@ -454,18 +476,24 @@ inline std::unordered_map<std::string, std::shared_ptr<Tensor>> load_checkpoint(
 
         int32_t dt_raw = 0;
         in.read(reinterpret_cast<char*>(&dt_raw), sizeof(dt_raw));
+        if (!in || dt_raw < 0 || dt_raw > static_cast<int32_t>(DType::Int8)) {
+            throw std::runtime_error("load_checkpoint: corrupt tensor header in " + filepath);
+        }
         DType dt = static_cast<DType>(dt_raw);
 
         uint32_t ndim = 0;
         in.read(reinterpret_cast<char*>(&ndim), sizeof(ndim));
+        if (!in || ndim > 64) throw std::runtime_error("load_checkpoint: corrupt tensor header in " + filepath);
         std::vector<int64_t> shape(ndim);
         for (uint32_t d = 0; d < ndim; ++d) {
             in.read(reinterpret_cast<char*>(&shape[d]), sizeof(shape[d]));
         }
+        if (!in || checked_numel(shape) < 0) throw std::runtime_error("load_checkpoint: corrupt tensor shape in " + filepath);
 
         auto tensor = std::make_shared<Tensor>(shape, Device::CPU, dt, false);
         uint64_t bytes = static_cast<uint64_t>(tensor->size()) * dtype_size(dt);
         in.read(tensor->data_ptr<char>(), bytes);
+        if (!in) throw std::runtime_error("load_checkpoint: " + filepath + " is truncated");
 
         if (device != Device::CPU) {
             state_dict[name] = tensor->to(device);

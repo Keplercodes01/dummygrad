@@ -12,6 +12,12 @@
 #include <functional>
 #include <stdexcept>
 
+#ifdef USE_CUDA
+static void check_copy(cudaError_t err, const char* direction) {
+    if (err != cudaSuccess) throw std::runtime_error(std::string("Tensor::to: ") + direction + " copy failed: " + cudaGetErrorString(err));
+}
+#endif
+
 static std::atomic<uint64_t> g_to_device_count{0}, g_to_device_bytes{0};
 static std::atomic<uint64_t> g_to_host_count{0}, g_to_host_bytes{0};
 
@@ -50,7 +56,16 @@ int64_t Tensor::flat_idx(const std::vector<int64_t>& idx) const {
     return pos;
 }
 
-bool Tensor::is_contiguous() const { return strides == make_strides(shape); }
+// Row-major strides, checked in place: this runs several times per op, so it must not allocate
+bool Tensor::is_contiguous() const {
+    if (strides.size() != shape.size()) return false;
+    int64_t expected = 1;
+    for (int64_t d = (int64_t)shape.size() - 1; d >= 0; --d) {
+        if (strides[d] != expected) return false;
+        expected *= shape[d];
+    }
+    return true;
+}
 int64_t Tensor::ndim() const { return (int64_t)shape.size(); }
 int64_t Tensor::size() const {
     int64_t total = 1;
@@ -150,6 +165,11 @@ void Tensor::_show_shape() const {
     std::cout << ")\n";
 }
 void Tensor::show() const {
+    // Printing reads host floats: show a CPU Float32 copy of anything else
+    if (device != Device::CPU || dtype != DType::Float32) {
+        const_cast<Tensor*>(this)->to(Device::CPU, DType::Float32)->show();
+        return;
+    }
     if (ndim() == 0) {
         std::cout << data_ptr<float>()[0];
         _show_shape();
@@ -160,6 +180,11 @@ void Tensor::show() const {
 }
 
 void Tensor::show_grad() const {
+    // The gradient may be on another device, in another dtype, or laid out differently from this view
+    if (grad) {
+        grad->show();
+        return;
+    }
     if (ndim() == 0) {
         float g_val = (grad) ? grad->data_ptr<float>()[0] : 0.0f;
         std::cout << g_val;
@@ -193,6 +218,11 @@ void tensor_add_inplace(std::shared_ptr<Tensor>& dst, const std::shared_ptr<Tens
         return;
     }
     ops::add_inplace(*dst, *src);
+}
+
+bool grad_is_exclusive(const std::shared_ptr<Tensor>& g) {
+    return g && g.use_count() == 1 && g->storage && g->storage.use_count() == 1 && g->is_contiguous() &&
+           g->global_offset == 0 && g->storage->total_bytes == (size_t)g->size() * dtype_size(g->dtype);
 }
 
 Edge get_grad_edge(const std::shared_ptr<Tensor>& t) {
@@ -335,13 +365,13 @@ std::shared_ptr<Tensor> Tensor::to(Device target_device, DType target_dtype, int
 
     if (this->device == Device::CPU && target_device == Device::CUDA) {
 #ifdef USE_CUDA
-        cudaMemcpy(out->data_ptr<void>(), this->data_ptr<void>(), copy_bytes, cudaMemcpyHostToDevice);
+        check_copy(cudaMemcpy(out->data_ptr<void>(), this->data_ptr<void>(), copy_bytes, cudaMemcpyHostToDevice), "host-to-device");
 #else
         throw std::runtime_error("Tensor::to: CUDA requested but dummygrad was built without CUDA support");
 #endif
     } else if (this->device == Device::CUDA && target_device == Device::CPU) {
 #ifdef USE_CUDA
-        cudaMemcpy(out->data_ptr<void>(), this->data_ptr<void>(), copy_bytes, cudaMemcpyDeviceToHost);
+        check_copy(cudaMemcpy(out->data_ptr<void>(), this->data_ptr<void>(), copy_bytes, cudaMemcpyDeviceToHost), "device-to-host");
 #else
         throw std::runtime_error("Tensor::to: CUDA requested but dummygrad was built without CUDA support");
 #endif

@@ -2,7 +2,11 @@
 #include <vector>
 #include <memory>
 #include <iostream>
+#include <exception>
 #include <functional>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <thread>
 #include <stdexcept>
 #include "pjrt_client.h"
@@ -15,7 +19,19 @@ class TPUEngine {
 private:
     size_t num_devices = 0;
     bool available = false;
-    PJRT_LoadedExecutable* ici_all_reduce_exec = nullptr;
+    // Compiled executables by HLO text: compiling is expensive and each program is shape-specific,
+    // so every distinct program compiles once and is reused
+    std::unordered_map<std::string, PJRT_LoadedExecutable*> executables;
+    std::mutex executables_mutex;
+
+    PJRT_LoadedExecutable* executable(const std::string& hlo_src) {
+        std::lock_guard<std::mutex> lock(executables_mutex);
+        auto it = executables.find(hlo_src);
+        if (it != executables.end()) return it->second;
+        PJRT_LoadedExecutable* exec = PJRTTPUManager::get().compile_hlo(hlo_src);
+        executables[hlo_src] = exec;
+        return exec;
+    }
 
 public:
     static TPUEngine& get() {
@@ -52,14 +68,12 @@ public:
         if (!available || num_devices <= 1) return;
 
         auto& mgr = PJRTTPUManager::get();
-        if (!ici_all_reduce_exec) {
-            std::string hlo_src = hlo::build_ici_all_reduce_hlo(shape, num_devices, dtype);
-            ici_all_reduce_exec = mgr.compile_hlo(hlo_src);
-        }
+        // One program per gradient shape (it used to compile once, for the first shape seen)
+        PJRT_LoadedExecutable* all_reduce = executable(hlo::build_ici_all_reduce_hlo(shape, num_devices, dtype));
 
         // Run ICI all-reduce on each device asynchronously
         for (size_t d = 0; d < num_devices; ++d) {
-            auto reduced = mgr.execute(ici_all_reduce_exec, { per_device_gradients[d] }, { shape }, { dtype }, d);
+            auto reduced = mgr.execute(all_reduce, { per_device_gradients[d] }, { shape }, { dtype }, d);
             if (!reduced.empty()) {
                 per_device_gradients[d] = reduced[0];
             }
@@ -78,9 +92,8 @@ public:
 
         auto& mgr = PJRTTPUManager::get();
         std::string hlo_src = hlo::build_gemm_hlo(M, K, N, dtype);
-        PJRT_LoadedExecutable* exec = mgr.compile_hlo(hlo_src);
+        PJRT_LoadedExecutable* exec = executable(hlo_src);
         auto out = mgr.execute(exec, { a, b }, { {M, N} }, { dtype }, device_id);
-        mgr.destroy_executable(exec);
 
         if (out.empty()) throw std::runtime_error("TPUEngine::matmul execution failed");
         return out[0];
@@ -99,9 +112,8 @@ public:
 
         auto& mgr = PJRTTPUManager::get();
         std::string hlo_src = hlo::build_fused_linear_gelu_hlo(M, K, N, dtype);
-        PJRT_LoadedExecutable* exec = mgr.compile_hlo(hlo_src);
+        PJRT_LoadedExecutable* exec = executable(hlo_src);
         auto out = mgr.execute(exec, { x, w, bias }, { {M, N} }, { dtype }, device_id);
-        mgr.destroy_executable(exec);
 
         if (out.empty()) throw std::runtime_error("TPUEngine::fused_linear_gelu execution failed");
         return out[0];
@@ -120,9 +132,8 @@ public:
 
         auto& mgr = PJRTTPUManager::get();
         std::string hlo_src = hlo::build_tpu_attention_hlo(B, H, S, D, dtype);
-        PJRT_LoadedExecutable* exec = mgr.compile_hlo(hlo_src);
+        PJRT_LoadedExecutable* exec = executable(hlo_src);
         auto out = mgr.execute(exec, { q, k, v }, { {B, H, S, D} }, { dtype }, device_id);
-        mgr.destroy_executable(exec);
 
         if (out.empty()) throw std::runtime_error("TPUEngine::attention execution failed");
         return out[0];
@@ -138,9 +149,8 @@ public:
         if (!available) throw std::runtime_error("TPUEngine: TPU runtime not available");
         auto& mgr = PJRTTPUManager::get();
         std::string hlo_src = hlo::build_sigmoid_hlo(shape, dtype);
-        PJRT_LoadedExecutable* exec = mgr.compile_hlo(hlo_src);
+        PJRT_LoadedExecutable* exec = executable(hlo_src);
         auto out = mgr.execute(exec, { x }, { shape }, { dtype }, device_id);
-        mgr.destroy_executable(exec);
         if (out.empty()) throw std::runtime_error("TPUEngine::sigmoid execution failed");
         return out[0];
     }
@@ -155,9 +165,8 @@ public:
         if (!available) throw std::runtime_error("TPUEngine: TPU runtime not available");
         auto& mgr = PJRTTPUManager::get();
         std::string hlo_src = hlo::build_silu_hlo(shape, dtype);
-        PJRT_LoadedExecutable* exec = mgr.compile_hlo(hlo_src);
+        PJRT_LoadedExecutable* exec = executable(hlo_src);
         auto out = mgr.execute(exec, { x }, { shape }, { dtype }, device_id);
-        mgr.destroy_executable(exec);
         if (out.empty()) throw std::runtime_error("TPUEngine::silu execution failed");
         return out[0];
     }
@@ -173,9 +182,8 @@ public:
         if (!available) throw std::runtime_error("TPUEngine: TPU runtime not available");
         auto& mgr = PJRTTPUManager::get();
         std::string hlo_src = hlo::build_leaky_relu_hlo(shape, negative_slope, dtype);
-        PJRT_LoadedExecutable* exec = mgr.compile_hlo(hlo_src);
+        PJRT_LoadedExecutable* exec = executable(hlo_src);
         auto out = mgr.execute(exec, { x }, { shape }, { dtype }, device_id);
-        mgr.destroy_executable(exec);
         if (out.empty()) throw std::runtime_error("TPUEngine::leaky_relu execution failed");
         return out[0];
     }
@@ -191,9 +199,8 @@ public:
         if (!available) throw std::runtime_error("TPUEngine: TPU runtime not available");
         auto& mgr = PJRTTPUManager::get();
         std::string hlo_src = hlo::build_mse_hlo(shape, dtype);
-        PJRT_LoadedExecutable* exec = mgr.compile_hlo(hlo_src);
+        PJRT_LoadedExecutable* exec = executable(hlo_src);
         auto out = mgr.execute(exec, { pred, target }, { {1} }, { dtype }, device_id);
-        mgr.destroy_executable(exec);
         if (out.empty()) throw std::runtime_error("TPUEngine::mse execution failed");
         return out[0];
     }
@@ -209,18 +216,15 @@ public:
         if (!available) throw std::runtime_error("TPUEngine: TPU runtime not available");
         auto& mgr = PJRTTPUManager::get();
         std::string hlo_src = hlo::build_l1_loss_hlo(shape, dtype);
-        PJRT_LoadedExecutable* exec = mgr.compile_hlo(hlo_src);
+        PJRT_LoadedExecutable* exec = executable(hlo_src);
         auto out = mgr.execute(exec, { pred, target }, { {1} }, { dtype }, device_id);
-        mgr.destroy_executable(exec);
         if (out.empty()) throw std::runtime_error("TPUEngine::l1_loss execution failed");
         return out[0];
     }
 
     ~TPUEngine() {
-        if (ici_all_reduce_exec) {
-            PJRTTPUManager::get().destroy_executable(ici_all_reduce_exec);
-            ici_all_reduce_exec = nullptr;
-        }
+        for (auto& entry : executables) PJRTTPUManager::get().destroy_executable(entry.second);
+        executables.clear();
     }
 };
 
@@ -257,19 +261,49 @@ public:
     size_t world_size() const { return num_chips; }
     ModelType& get_replica(size_t rank) { return replicas[rank]; }
 
-    // Execute parallel data-parallel steps across all TPU chips with zero CPU lock contention
+    // One data-parallel step: step_fn(rank, replica) runs on every replica at once (one thread per
+    // chip; the first exception is rethrown after all finish), then each parameter's gradient is
+    // averaged across replicas. The average is computed on the host, which holds TPU tensors'
+    // authoritative copy, and written back to every replica.
     void parallel_step(std::function<void(size_t rank, ModelType& model)> step_fn) {
+        std::vector<std::exception_ptr> errors(num_chips);
         std::vector<std::thread> workers;
         workers.reserve(num_chips);
-
         for (size_t rank = 0; rank < num_chips; ++rank) {
-            workers.emplace_back([this, rank, &step_fn]() {
-                step_fn(rank, replicas[rank]);
+            workers.emplace_back([this, rank, &step_fn, &errors]() {
+                try {
+                    step_fn(rank, replicas[rank]);
+                } catch (...) {
+                    errors[rank] = std::current_exception();
+                }
             });
         }
+        for (auto& w : workers) w.join();
+        for (auto& e : errors) {
+            if (e) std::rethrow_exception(e);
+        }
+        average_gradients();
+    }
 
-        for (auto& w : workers) {
-            if (w.joinable()) w.join();
+private:
+    void average_gradients() {
+        if (num_chips <= 1) return;
+        std::vector<std::vector<std::shared_ptr<Tensor>>> params;
+        for (auto& model : replicas) params.push_back(model.parameters());
+        for (size_t i = 0; i < params[0].size(); ++i) {
+            std::shared_ptr<Tensor> total;
+            for (size_t r = 0; r < num_chips; ++r) {
+                const auto& g = params[r][i]->grad;
+                if (g) tensor_add_inplace(total, make_contiguous(g)->to(Device::CPU, DType::Float32));
+            }
+            if (!total) continue;
+            float* t = total->data_ptr<float>();
+            for (int64_t k = 0; k < total->size(); ++k) t[k] /= (float)num_chips;
+            for (size_t r = 0; r < num_chips; ++r) {
+                const auto& p = params[r][i];
+                p->grad = total->to(p->device, DType::Float32, (int)r);
+                p->grad->requires_grad = false;
+            }
         }
     }
 };
