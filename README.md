@@ -75,35 +75,27 @@ Full details for every release are in [CHANGELOG.md](CHANGELOG.md).
 ## Architecture & Performance Highlights
 
 ```
-┌────────────────────────────────────────────────────────┐
-│  High-Level Models: GPT / Transformers / Linear / CNNs  │
-├────────────────────────────────────────────────────────┤
-│  Multi-GPU Engine: Native P2P NVLink DMA & Reduction   │
-├────────────────────────────────────────────────────────┤
-│  Memory: Static Arena (0 ns) + CUDACachingAllocator    │
-├────────────────────────────────────────────────────────┤
-│  Attention: Fused FlashAttention (Fwd + Bwd, O(N) Mem) │
-├────────────────────────────────────────────────────────┤
-│  Compute: cuBLAS Tensor Cores (TF32 / FP16 / BF16)     │
-├────────────────────────────────────────────────────────┤
-│  Fused Kernels: LayerNorm, AdamW, GELU, Bias-Epilogue  │
-├────────────────────────────────────────────────────────┤
-│  Execution: Hardware CUDA Graphs (0 CPU Latency)       │
-└────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  Models: GPT / ModernTransformer (GQA, RoPE, SwiGLU) / CNNs │
+├──────────────────────────────────────────────────────────┤
+│  Autograd: deterministic gradient sums, calling-thread GPU │
+├──────────────────────────────────────────────────────────┤
+│  Attention: cuBLAS GEMMs ≤ 2048 tokens, tiled kernels past │
+├──────────────────────────────────────────────────────────┤
+│  Compute: cuBLAS / cuBLASLt (FP32, opt-in TF32, FP16, BF16)│
+├──────────────────────────────────────────────────────────┤
+│  Multi-GPU: one process, GPU-to-GPU gradient averaging     │
+├──────────────────────────────────────────────────────────┤
+│  Memory: CUDA caching allocator                            │
+└──────────────────────────────────────────────────────────┘
 ```
 
-- **Zero-Overhead Dispatch**: Pure C++ inline execution drops op launch overhead from PyTorch's $\sim 3\text{ }\mu\text{s}$ down to sub-$100\text{ ns}$.
-- **Hardware Tensor Cores (cuBLAS)**: Matrix multiplies in `Float32` (with TF32 Tensor Cores), `Float16`, and `BFloat16` using thread-safe per-device cuBLAS handles and row-major transpose identities.
-- **FlashAttention**: Custom CUDA forward and backward attention kernels using online softmax, scaling to head dimensions up to 512 in strictly $O(N)$ memory.
-- **Single-Pass Fused Kernels**:
-  - **LayerNorm**: Parallel reductions for row mean and variance; fused affine scaling and backward passes.
-  - **AdamW**: Updates parameters, gradients, momentum $m$, and variance $v$ in a single memory pass with Rule-of-5 resource safety.
-  - **Activations & Epilogues**: Fast vectorized GELU, ReLU, fused bias addition, and Rotary Position Embedding (RoPE) kernels.
-  - **Dynamic Stride Contiguity**: Parallel GPU stride unrolling (`k_make_contiguous`) preserving tensor memory layouts under arbitrary transpositions.
-- **Hardware CUDA Graphs**: Record forward, backward, and optimizer steps into an executable GPU graph (`CUDAGraph`) to eliminate CPU dispatch latency across training iterations.
-- **Scratchpad Arena Allocator**: `CUDAScratchpadArena` with `ArenaScope` RAII helper eliminates runtime memory fragmentation and allocation spikes during high-throughput steps.
-- **Native Multi-GPU Scaling**: Single-process Multi-GPU coordination (`DeviceMesh` + `MultiGPURunner`) with synchronized peer gradient aggregation and direct peer-to-peer weight broadcasting.
-- **Apple Silicon Metal & MPS**: Hardware acceleration on macOS via Metal compute shaders and `MPSMatrixMultiplication` engaging Unified Memory (UMA).
+- **Low per-op overhead**: ops are plain C++ functions with no Python or dispatcher layer, which is why small models step several times faster than in PyTorch (see [Performance](#performance)).
+- **cuBLAS matmuls**: `Float32` (TF32 tensor cores only with `set_allow_tf32(true)`, off by default as in PyTorch), and `Float16` / `BFloat16` under `AutocastGuard`. Linear adds its bias in the cuBLASLt epilogue; the tied LM head (`matmul_nt`) reads the embedding transposed in place.
+- **Attention**: cuBLAS GEMMs for sequences up to 2048 tokens (any head dimension), and FlashAttention-style tiled kernels beyond that, with memory linear in sequence length (head dimensions up to 128; larger ones use the GEMM path a chunk of heads at a time). Every path is deterministic.
+- **Fused, deterministic kernels**: RMSNorm, LayerNorm, cross entropy, embedding, RoPE, GQA head repetition and AdamW; reductions sum in a fixed order (no atomics), so identical runs give bitwise-identical gradients.
+- **Multi-GPU**: `MultiGPURunner` runs one replica per GPU in a single process and averages gradients GPU to GPU after each backward pass.
+- **Apple Silicon**: MPS tensors live in unified memory; a few elementwise ops, masks, loss gradients and AdamW run as Metal kernels, everything else on the CPU over the same memory. Not covered by tests.
 - **CPU SIMD Fallback**: Vectorized kernels for AVX2/FMA on x86_64 and NEON on ARM with optional OpenBLAS/oneMKL integration.
 
 ---
@@ -295,6 +287,7 @@ ModernTransformer model(256, seq_len, 64, 4, 2, 2);
 model.to(device);
 auto params = model.parameters();
 Adam optimizer(3e-3f, 0.9f, 0.95f, 1e-8f, /*weight_decay=*/0.1f);
+optimizer.set_weight_decay(no_weight_decay_params(model), 0.0f);  // no decay for biases and norm gains
 CosineAnnealingLR schedule(3e-3f, steps, /*warmup_steps=*/20, /*min_lr=*/3e-4f);
 MetricsLogger logger("metrics.csv");                    // step,metric,value
 std::mt19937 rng(0);
@@ -384,7 +377,7 @@ std::string err = dummygrad::gradcheck(
 if (!err.empty()) std::cerr << err << "\n";   // e.g. "input 0 element 3: analytic 0.12 vs numeric 0.48"
 ```
 
-`gradcheck` works for any function of tensors — a single op, a layer, or a whole block. Use CPU inputs (TF32 GPU matmuls are too imprecise for finite differences) and keep inputs away from kinks such as `relu` at 0.
+`gradcheck` works for any function of tensors — a single op, a layer, or a whole block. Use CPU inputs (GPU matmuls under TF32 or autocast are too imprecise for finite differences) and keep inputs away from kinks such as `relu` at 0.
 
 ### Evaluation and debugging
 
@@ -494,101 +487,55 @@ int main() {
 
 ---
 
-## Example: Multi-GPU Parallel Training (P2P Mesh)
+## Example: Multi-GPU Data-Parallel Training
 
 ```cpp
 #include "dummy_core.h"
 
 int main() {
-    int num_gpus = 4;
+    int num_gpus = 2;  // e.g. Kaggle's T4 x2
 
-    // Spin up model replicas across all GPUs in a single native C++ process
-    // The factory runs with `rank` already selected as the current CUDA device
+    // One replica per GPU in a single process. The factory runs with GPU `rank` current; replica 0's
+    // weights are then copied to the others.
     MultiGPURunner<ModernTransformer> runner(num_gpus, [](int rank) {
         ModernTransformer model(32000, 2048, 512, 8, 4, 2);
         model.cuda();
         return model;
     });
+    std::vector<Adam> opts(num_gpus, Adam(3e-4f));
 
-    // Execute parallel steps with peer gradient synchronization
-    runner.parallel_step([](int rank, ModernTransformer& model) {
-        // Each worker executes on its designated CUDA device rank.
-        // Token ids are stored as floats; load this rank's shard of the batch here.
-        auto inputs  = zeros({2, 32}, Device::CUDA);
-        auto targets = ones({2, 32}, Device::CUDA);
-
-        auto logits = model.forward(inputs);
-        auto loss = fused_cross_entropy(logits, targets);
-        loss->backward();
-        // Gradients are accumulated across all GPUs and broadcast back automatically!
-    });
-
+    for (int step = 0; step < 1000; ++step) {
+        // Forward and backward on every GPU at once, each on its own shard of the batch; then the
+        // gradients are averaged across GPUs (GPU to GPU, in a fixed order)
+        runner.parallel_step([&](int rank, ModernTransformer& model) {
+            auto inputs  = zeros({2, 32}, Device::CUDA);  // load this rank's shard here
+            auto targets = ones({2, 32}, Device::CUDA);
+            model.zero_grad();
+            fused_cross_entropy(model.forward(inputs), targets)->backward();
+        });
+        // Identical gradients and identical optimizer steps keep the replicas identical
+        runner.for_each_replica([&](int rank, ModernTransformer& model) { opts[rank].step(model.parameters()); });
+    }
     return 0;
 }
 ```
 
+Gradients are averaged, as in PyTorch DDP (`runner.average_gradients = false` sums them). An exception on any GPU is rethrown by `parallel_step`. `all_reduce_gradients(replica_parameters)` does the reduction on its own for your own training loops.
+
 ---
 
-## Google Cloud TPU Acceleration (Colab v5e-1, Kaggle v5e-8 & Multi-TPU Pod Slices)
+## TPU (experimental)
 
-`dummygrad` provides native TPU execution via **OpenXLA PJRT C-API** with zero Python dependencies and sub-microsecond host launch latency.
+An experimental TPU backend loads the OpenXLA PJRT runtime (`libtpu.so`) at run time. Sigmoid, SiLU, LeakyReLU, MSE and L1 run as compiled XLA programs on the TPU (each distinct program compiles once and is cached); every other op runs on the host, which holds TPU tensors' authoritative copy. `MultiTPURunner` runs one replica per chip and averages gradients on the host after each step. It is a prototype: nothing in CI or the notebook runs it.
 
-### Why pure C++ beats JAX on TPUs:
-- **Zero Python/GIL Overhead**: Launch latency drops from JAX's $\sim 500\text{ }\mu\text{s}$ down to $< 5\text{ }\mu\text{s}$.
-- **Hardware Inter-Chip Interconnect (ICI)**: Dynamic ICI ring all-reduce that automatically scales across any arbitrary number of TPU chips ($N = 2, 4, 8, 16, 32, 64\dots$).
-- **128x128 Systolic Array Saturation**: Direct HLO emission maps dense matrix multiplies directly to TPU Matrix Multiply Units (MXUs).
-- **Instant Cold Starts**: Execution starts in $< 50\text{ ms}$ compared to JAX's 30-second Python environment initialization.
-
-### Running on Single or Multi-TPU:
 ```cpp
-#include "dummy_core.h"
-
-// Dynamically scales across all available TPU chips (Colab v5e-1, Kaggle v5e-8, or full TPU Pod slices)
 MultiTPURunner<GPT> tpu_runner([](size_t rank) {
     return GPT(vocab_size, max_seq_len, d_model, n_heads, n_layers);
 });
-
-// Run parallel steps across all TPU chips with direct hardware ICI gradient synchronization
-tpu_runner.parallel_step([](size_t rank, GPT& model) {
-    auto logits = model.forward(batch_inputs[rank], batch_pos[rank]);
-    auto loss = cross_entropy(logits, batch_targets[rank]);
+tpu_runner.parallel_step([&](size_t rank, GPT& model) {
+    auto loss = fused_cross_entropy(model.forward(batch_inputs[rank]), batch_targets[rank]);
     loss->backward();
-    // Hardware ICI dynamically all-reduces gradients across all N TPU chips!
-});
-```
-
----
-
-## Apple Silicon Acceleration (Metal & MPS)
-
-`dummygrad` natively targets Apple Silicon GPUs and the **Apple Matrix Coprocessor (AMX)** via Metal and MetalPerformanceShaders with zero-copy Unified Memory Architecture (UMA):
-
-- **Zero-Copy Shared Memory**: CPU and GPU share physical address space via `MTLResourceStorageModeShared`. Host-to-device migration overhead is literally $0\text{ ns}$.
-- **Hardware GEMMs via MPS**: Direct invocation of `MPSMatrixMultiplication` engaging Apple's AMX coprocessor and GPU execution cores.
-- **Custom MSL Shaders**: Single-pass fused LayerNorm with SIMD-group reductions, fused AdamW, and Tiled FlashAttention.
-
-### Running on Apple Silicon Metal:
-```cpp
-#include "dummy_core.h"
-
-int main() {
-    auto& metal = MetalBackend::get();
-    if (!metal.is_available()) {
-        std::cerr << "Metal not available on this system.\n";
-        return 1;
-    }
-
-    // Allocate tensors directly in unified zero-copy shared memory
-    auto x = std::make_shared<Tensor>(std::vector<int64_t>{512, 768})->mps();
-    auto w = std::make_shared<Tensor>(std::vector<int64_t>{768, 768})->mps();
-    auto y = std::make_shared<Tensor>(std::vector<int64_t>{512, 768})->mps();
-
-    // Fast AMX matrix multiplication
-    metal.matmul(x->data_ptr<float>(), w->data_ptr<float>(), y->data_ptr<float>(), 512, 768, 768);
-
-    std::cout << "Executed on " << metal.device_name() << " with zero-copy UMA.\n";
-    return 0;
-}
+});  // gradients averaged across chips
 ```
 
 ---
@@ -723,9 +670,9 @@ At 23M parameters both are bound by the GPU: cuBLAS matrix multiplies are nearly
 dummygrad is pre-1.0: the core training path (CPU and CUDA, FP32) is covered by `test_engine`; other paths are less exercised.
 
 - **Mixed precision covers matrix products.** Under `AutocastGuard`, CUDA matmuls and attention (on its cuBLAS path, up to 2048 tokens) run on fp16/bf16 tensor cores. Normalization and elementwise kernels, the softmax, and attention beyond 2048 tokens stay fp32. Tensors are always stored in fp32; non-fp32 tensors are only for storage and conversion. bf16 needs an Ampere or newer GPU.
-- **Attention** runs as cuBLAS GEMMs for sequences up to 2048 tokens (any head dimension) and as tiled kernels beyond that for head dimensions 16, 32, 64 and 128. Other head dimensions past 2048 tokens (up to 512) fall back to slower untiled kernels, whose backward uses atomics and is not bitwise reproducible.
-- **Multi-GPU gradient aggregation** currently reduces through host memory.
-- **Metal and TPU kernels** are not covered by the test suite (macOS CI runs the CPU backend).
+- **Attention** runs as cuBLAS GEMMs for sequences up to 2048 tokens (any head dimension) and as tiled kernels beyond that for head dimensions up to 128 (other sizes zero-padded to 16, 32, 64 or 128). Larger head dimensions past 2048 tokens use the GEMM path a chunk of heads at a time, whose memory is quadratic in the sequence length.
+- **Multi-GPU** runs in one process and averages gradients GPU to GPU, one parameter at a time (no bucketing or overlap with backward yet). Its test needs two GPUs (Kaggle's T4 x2).
+- **Metal and TPU** paths are not covered by the test suite (macOS CI runs the CPU backend; there is no TPU in CI).
 
 Bug reports with a failing `test_engine` case are the fastest way to get something fixed.
 
