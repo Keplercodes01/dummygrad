@@ -12,6 +12,12 @@
 #include <functional>
 #include <stdexcept>
 
+#ifdef USE_CUDA
+static void check_copy(cudaError_t err, const char* direction) {
+    if (err != cudaSuccess) throw std::runtime_error(std::string("Tensor::to: ") + direction + " copy failed: " + cudaGetErrorString(err));
+}
+#endif
+
 static std::atomic<uint64_t> g_to_device_count{0}, g_to_device_bytes{0};
 static std::atomic<uint64_t> g_to_host_count{0}, g_to_host_bytes{0};
 
@@ -159,6 +165,11 @@ void Tensor::_show_shape() const {
     std::cout << ")\n";
 }
 void Tensor::show() const {
+    // Printing reads host floats: show a CPU Float32 copy of anything else
+    if (device != Device::CPU || dtype != DType::Float32) {
+        const_cast<Tensor*>(this)->to(Device::CPU, DType::Float32)->show();
+        return;
+    }
     if (ndim() == 0) {
         std::cout << data_ptr<float>()[0];
         _show_shape();
@@ -169,6 +180,11 @@ void Tensor::show() const {
 }
 
 void Tensor::show_grad() const {
+    // The gradient may be on another device, in another dtype, or laid out differently from this view
+    if (grad) {
+        grad->show();
+        return;
+    }
     if (ndim() == 0) {
         float g_val = (grad) ? grad->data_ptr<float>()[0] : 0.0f;
         std::cout << g_val;
@@ -349,13 +365,13 @@ std::shared_ptr<Tensor> Tensor::to(Device target_device, DType target_dtype, int
 
     if (this->device == Device::CPU && target_device == Device::CUDA) {
 #ifdef USE_CUDA
-        cudaMemcpy(out->data_ptr<void>(), this->data_ptr<void>(), copy_bytes, cudaMemcpyHostToDevice);
+        check_copy(cudaMemcpy(out->data_ptr<void>(), this->data_ptr<void>(), copy_bytes, cudaMemcpyHostToDevice), "host-to-device");
 #else
         throw std::runtime_error("Tensor::to: CUDA requested but dummygrad was built without CUDA support");
 #endif
     } else if (this->device == Device::CUDA && target_device == Device::CPU) {
 #ifdef USE_CUDA
-        cudaMemcpy(out->data_ptr<void>(), this->data_ptr<void>(), copy_bytes, cudaMemcpyDeviceToHost);
+        check_copy(cudaMemcpy(out->data_ptr<void>(), this->data_ptr<void>(), copy_bytes, cudaMemcpyDeviceToHost), "device-to-host");
 #else
         throw std::runtime_error("Tensor::to: CUDA requested but dummygrad was built without CUDA support");
 #endif

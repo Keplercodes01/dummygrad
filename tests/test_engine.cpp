@@ -1047,6 +1047,40 @@ static std::string module_modes_and_zero_grad() {
     return "";
 }
 
+// A copy would share the original's parameters (they are shared_ptrs); moving is how models travel
+static_assert(!std::is_copy_constructible_v<ModernTransformer>, "modules must not be copyable");
+static_assert(std::is_move_constructible_v<ModernTransformer>, "modules must stay movable");
+
+// to(device) keeps each tensor's dtype, init functions honor theirs, and a safetensors dtype
+// dummygrad has no type for fails loudly instead of loading as Float32
+static std::string module_dtypes_preserved() {
+    Linear layer(3, 2);
+    layer.to(Device::CPU, DType::Float16);
+    layer.to(Device::CPU);
+    if (layer.W->dtype != DType::Float16) return "to(device) converted an fp16 parameter back to fp32";
+    for (auto t : {randn({2, 2}, Device::CPU, DType::Float16), xavier({2, 2}, Device::CPU, DType::BFloat16)}) {
+        if (t->dtype == DType::Float32) return "an init function ignored its dtype";
+    }
+    const std::string path = "test_i32.safetensors";
+    {
+        std::string header = "{\"ids\":{\"dtype\":\"I32\",\"shape\":[2],\"data_offsets\":[0,8]}}";
+        std::ofstream out(path, std::ios::binary);
+        uint64_t len = header.size();
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out << header;
+        int32_t ids[2] = {1, 2};
+        out.write(reinterpret_cast<const char*>(ids), sizeof(ids));
+    }
+    std::string msg;
+    try {
+        io::load_safetensors(path);
+    } catch (const std::runtime_error& e) {
+        msg = e.what();
+    }
+    std::remove(path.c_str());
+    return msg.find("unsupported dtype") != std::string::npos ? "" : "an I32 tensor loaded without an error";
+}
+
 // Inputs that kernels would read out of bounds with must be rejected up front
 static std::string invalid_shapes_rejected(Device dev) {
     auto throws = [](const std::function<void()>& f) {
@@ -2091,6 +2125,7 @@ int main() {
     run_case(r, "module/to_tied_and_frozen", module_to_tied_and_frozen);
     run_case(r, "module/modes_and_zero_grad", module_modes_and_zero_grad);
     run_case(r, "module/max_pool2d_large_input", max_pool2d_large_input);
+    run_case(r, "module/dtypes_preserved", module_dtypes_preserved);
     run_case(r, "module/invalid_shapes_rejected", [] { return invalid_shapes_rejected(Device::CPU); });
     if (has_cuda) run_case(r, "module/invalid_shapes_rejected_cuda", [] { return invalid_shapes_rejected(Device::CUDA); });
     run_case(r, "module/embedding_rejects_bad_ids", [] { return embedding_rejects_bad_ids(Device::CPU); });
