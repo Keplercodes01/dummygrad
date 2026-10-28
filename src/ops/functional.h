@@ -121,6 +121,12 @@ inline std::shared_ptr<Tensor> float32_input(const std::shared_ptr<Tensor>& a) {
     return (a && (a->dtype == DType::Float16 || a->dtype == DType::BFloat16)) ? cast(a, DType::Float32) : a;
 }
 
+// A TPU op writes its result to a TPU buffer only; mirror it into the tensor's host memory, which is
+// the authoritative copy every other op reads (see host_written in ops.cpp)
+inline void sync_tpu_result(const std::shared_ptr<Tensor>& t) {
+    PJRTTPUManager::get().copy_to_host(*t->storage->tpu_handle, t->data_ptr<void>(), (size_t)t->size() * dtype_size(t->dtype));
+}
+
 // ========================================
 // From activations.h
 // ========================================
@@ -409,6 +415,7 @@ inline std::shared_ptr<Tensor> sigmoid(const std::shared_ptr<Tensor>& a_in) {
     }
     if (a->device == Device::TPU && a->storage->tpu_handle) {
         out->storage->tpu_handle = TPUEngine::get().sigmoid(a->storage->tpu_handle, a->shape, a->dtype);
+        sync_tpu_result(out);
         if (req_grad) {
             auto grad_fn = std::make_shared<SigmoidBackward>(saved_output(out));
             grad_fn->add_next_edge(get_grad_edge(a).function);
@@ -498,6 +505,7 @@ inline std::shared_ptr<Tensor> silu(const std::shared_ptr<Tensor>& a_in) {
     }
     if (a->device == Device::TPU && a->storage->tpu_handle) {
         out->storage->tpu_handle = TPUEngine::get().silu(a->storage->tpu_handle, a->shape, a->dtype);
+        sync_tpu_result(out);
         if (req_grad) {
             auto grad_fn = std::make_shared<SiluBackward>(a);
             grad_fn->add_next_edge(get_grad_edge(a).function);
@@ -592,6 +600,7 @@ inline std::shared_ptr<Tensor> leaky_relu(const std::shared_ptr<Tensor>& a_in, f
     }
     if (a->device == Device::TPU && a->storage->tpu_handle) {
         out->storage->tpu_handle = TPUEngine::get().leaky_relu(a->storage->tpu_handle, a->shape, negative_slope, a->dtype);
+        sync_tpu_result(out);
         if (req_grad) {
             auto grad_fn = std::make_shared<LeakyReluBackward>(a, negative_slope);
             grad_fn->add_next_edge(get_grad_edge(a).function);
@@ -1396,6 +1405,7 @@ inline std::shared_ptr<Tensor> mse(const std::shared_ptr<Tensor>& pred_in, const
         bool req_grad = grad_enabled() && (pred->requires_grad);
         auto out = std::make_shared<Tensor>(std::vector<int64_t>{1, 1}, Device::TPU, pred->dtype, req_grad);
         out->storage->tpu_handle = TPUEngine::get().mse(pred->storage->tpu_handle, target->storage->tpu_handle, pred->shape, pred->dtype);
+        sync_tpu_result(out);
         if (req_grad) {
             auto grad_fn = std::make_shared<MseBackward>(pred, target, n);
             grad_fn->add_next_edge(get_grad_edge(pred).function);
@@ -1514,6 +1524,7 @@ inline std::shared_ptr<Tensor> l1_loss(const std::shared_ptr<Tensor>& pred_in, c
         bool req_grad = grad_enabled() && (pred->requires_grad);
         auto out = std::make_shared<Tensor>(std::vector<int64_t>{1, 1}, Device::TPU, pred->dtype, req_grad);
         out->storage->tpu_handle = TPUEngine::get().l1_loss(pred->storage->tpu_handle, target->storage->tpu_handle, pred->shape, pred->dtype);
+        sync_tpu_result(out);
         if (req_grad) {
             auto grad_fn = std::make_shared<L1LossBackward>(pred, target, n);
             grad_fn->add_next_edge(get_grad_edge(pred).function);

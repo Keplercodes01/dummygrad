@@ -1,6 +1,12 @@
 #include "ops.h"
 #include <stdexcept>
 
+// TPU tensors keep their authoritative copy in host memory (Storage::data); a TPU buffer
+// (tpu_handle) is a copy that host writes make stale, so every host write drops it
+static void host_written(Tensor& t) {
+    if (t.device == Device::TPU && t.storage) t.storage->tpu_handle.reset();
+}
+
 // Forward declarations for the pure C++ CPU kernels
 namespace cpu {
     void fill(Tensor& tensor, float value);
@@ -24,7 +30,9 @@ namespace ops {
             case Device::CPU:
             case Device::MPS:
             case Device::TPU:
-                cpu::fill(tensor, value); break;
+                cpu::fill(tensor, value);
+                host_written(tensor);
+                break;
 #ifdef USE_CUDA
             case Device::CUDA: cuda::fill(tensor, value); break;
 #endif
@@ -38,7 +46,9 @@ namespace ops {
             case Device::CPU:
             case Device::MPS:
             case Device::TPU:
-                cpu::add_inplace(dst, src); break;
+                cpu::add_inplace(dst, src);
+                host_written(dst);
+                break;
 #ifdef USE_CUDA
             case Device::CUDA: cuda::add_inplace(dst, src); break;
 #endif
@@ -51,7 +61,9 @@ namespace ops {
             case Device::CPU:
             case Device::MPS:
             case Device::TPU:
-                cpu::copy_from_vector(tensor, values); break;
+                cpu::copy_from_vector(tensor, values);
+                host_written(tensor);
+                break;
 #ifdef USE_CUDA
             case Device::CUDA: cuda::copy_from_vector(tensor, values); break;
 #endif
@@ -65,7 +77,9 @@ namespace ops {
             case Device::CPU:
             case Device::MPS:
             case Device::TPU:
-                cpu::make_contiguous(dst, src); break;
+                cpu::make_contiguous(dst, src);
+                host_written(dst);
+                break;
 #ifdef USE_CUDA
             case Device::CUDA: cuda::make_contiguous(dst, src); break;
 #endif

@@ -218,7 +218,10 @@ public:
                                       (size_t)n, lr, beta1, beta2, eps, wd, (int)s.step);
             return;
         }
-        if (p->device != Device::CPU && p->device != Device::MPS) throw std::runtime_error("Adam: unsupported device");
+        // CPU, MPS (unified memory) and TPU (host memory is a TPU tensor's authoritative copy) update on the host
+        if (p->device != Device::CPU && p->device != Device::MPS && p->device != Device::TPU) {
+            throw std::runtime_error("Adam: unsupported device");
+        }
 
         float* w = p->data_ptr<float>();
         const float* grad = g->data_ptr<float>();
@@ -232,6 +235,7 @@ public:
             v[i] = beta2 * v[i] + (1.0f - beta2) * grad[i] * grad[i];
             w[i] -= lr * (m[i] / bias1) / (std::sqrt(v[i] / bias2) + eps);
         }
+        if (p->device == Device::TPU) p->storage->tpu_handle.reset();  // the TPU copy is now stale
     }
 
     void zero_grad(const std::vector<std::shared_ptr<Tensor>>& params) { ::zero_grad(params); }
