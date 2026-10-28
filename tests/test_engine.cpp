@@ -1351,6 +1351,27 @@ static std::string workflow_clip_grad_norm() {
     return std::fabs(tied - 1.0f) < 1e-4f ? "" : "a parameter listed twice was counted twice: norm " + std::to_string(tied);
 }
 
+// Weight decay overrides: no_weight_decay_params picks biases and norm parameters, and an
+// override of 0 leaves them undecayed while the rest decays
+static std::string workflow_weight_decay_overrides() {
+    Linear layer(2, 2);
+    auto excluded = no_weight_decay_params(layer);
+    if (excluded.size() != 1 || excluded[0] != layer.b) return "no_weight_decay_params should pick only the bias";
+    RMSNorm norm(4);
+    if (no_weight_decay_params(norm).size() != 1) return "no_weight_decay_params missed a norm gain";
+    Adam opt(1.0f, 0.9f, 0.999f, 1e-8f, /*weight_decay=*/0.5f);
+    opt.set_weight_decay(excluded, 0.0f);
+    auto w0 = download(layer.W), b0 = download(layer.b);
+    for (auto& p : layer.parameters()) p->grad = zeros(p->shape);
+    opt.step(layer.parameters());
+    if (download(layer.b) != b0) return "an excluded parameter was decayed";
+    auto w1 = download(layer.W);
+    for (size_t k = 0; k < w0.size(); ++k) {
+        if (std::fabs(w1[k] - 0.5f * w0[k]) > 1e-6f) return "the weight was not decayed by lr * weight_decay";
+    }
+    return "";
+}
+
 // Data-parallel reduction: every replica ends with the average (or sum) of all replicas' gradients,
 // and a replica that had no gradient counts as zero and still receives the result
 static std::string workflow_all_reduce_gradients() {
@@ -2154,6 +2175,7 @@ int main() {
     run_case(r, "workflow/resume_sgd_momentum", workflow_resume_sgd_momentum);
     run_case(r, "workflow/checkpoint_scalars", workflow_checkpoint_scalars);
     run_case(r, "workflow/clip_grad_norm", workflow_clip_grad_norm);
+    run_case(r, "workflow/weight_decay_overrides", workflow_weight_decay_overrides);
     run_case(r, "workflow/all_reduce_gradients", workflow_all_reduce_gradients);
 #ifdef USE_CUDA
     if (cuda_device_count() >= 2) {

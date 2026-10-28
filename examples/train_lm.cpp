@@ -79,6 +79,7 @@ int main(int argc, char** argv) {
     std::cout << "parameters: " << model.num_parameters() << " on " << (device == Device::CUDA ? "CUDA" : "CPU") << "\n";
 
     Adam optimizer(peak_lr, 0.9f, 0.95f, 1e-8f, /*weight_decay=*/0.1f);
+    optimizer.set_weight_decay(no_weight_decay_params(model), 0.0f);  // no decay for biases and norm gains
     CosineAnnealingLR schedule(peak_lr, (int)steps, /*warmup_steps=*/20, min_lr);
 
     TrainingState state;

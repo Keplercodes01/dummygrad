@@ -77,7 +77,45 @@ inline void load_into(const std::shared_ptr<Tensor>& dst, const std::shared_ptr<
     ops::make_contiguous(*dst, *src->to(dst->device, dst->dtype));
 }
 
+// Per-parameter weight decay overrides, bound to each tensor's identity like StateMap
+class DecayOverrides {
+public:
+    void set(const std::vector<std::shared_ptr<Tensor>>& params, float weight_decay) {
+        for (const auto& p : params) {
+            if (p) slots_[p.get()] = Slot{p, weight_decay};
+        }
+    }
+    float get(const std::shared_ptr<Tensor>& p, float fallback) const {
+        auto it = slots_.find(p.get());
+        return (it != slots_.end() && it->second.owner.lock() == p) ? it->second.weight_decay : fallback;
+    }
+
+private:
+    struct Slot {
+        std::weak_ptr<Tensor> owner;
+        float weight_decay;
+    };
+    std::unordered_map<const Tensor*, Slot> slots_;
+};
+
 }  // namespace optim_detail
+
+// Parameters that conventionally get no weight decay: biases and normalization gains and shifts
+// (names ending in "bias", "gamma" or "beta") and any other 1-D tensor. Decaying a norm's gamma
+// pulls it toward 0, which the norm exists to avoid.
+//
+//   Adam opt(3e-4f);  // weight_decay 0.01 for everything else
+//   opt.set_weight_decay(no_weight_decay_params(model), 0.0f);
+inline std::vector<std::shared_ptr<Tensor>> no_weight_decay_params(Module& model) {
+    auto ends_with = [](const std::string& s, const std::string& suffix) {
+        return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+    std::vector<std::shared_ptr<Tensor>> out;
+    for (const auto& [name, p] : model.named_parameters()) {
+        if (p->ndim() <= 1 || ends_with(name, "bias") || ends_with(name, "gamma") || ends_with(name, "beta")) out.push_back(p);
+    }
+    return out;
+}
 
 // SGD with optional momentum and (coupled, L2-style) weight decay:
 //   g = grad + weight_decay * p;  buf = momentum * buf + g;  p -= lr * buf
@@ -98,7 +136,8 @@ public:
         optim_detail::check_param(p, "SGD");
         NoGradGuard no_grad;
         auto g = make_contiguous(p->grad);
-        if (weight_decay != 0.0f) g = add(g, mul_scalar(p, weight_decay));
+        float wd = decay_.get(p, weight_decay);
+        if (wd != 0.0f) g = add(g, mul_scalar(p, wd));
         if (momentum != 0.0f) {
             auto& s = state_.get(p);
             // A fresh tensor: the buffer must not alias p->grad, which backward may accumulate into
@@ -109,6 +148,9 @@ public:
     }
 
     void zero_grad(const std::vector<std::shared_ptr<Tensor>>& params) { ::zero_grad(params); }
+
+    // Weight decay for these parameters instead of weight_decay (e.g. 0 for no_weight_decay_params)
+    void set_weight_decay(const std::vector<std::shared_ptr<Tensor>>& params, float wd) { decay_.set(params, wd); }
 
     NamedTensors state_dict(const NamedTensors& named_params) const {
         NamedTensors out;
@@ -136,10 +178,13 @@ private:
         void follow(const std::shared_ptr<Tensor>& p) { optim_detail::follow_device(buf, p); }
     };
     optim_detail::StateMap<State> state_;
+    optim_detail::DecayOverrides decay_;
 };
 
 // AdamW: Adam with decoupled weight decay (Loshchilov & Hutter, 2019). The moment estimates live
 // in tensors on each parameter's device and are updated by a fused kernel on CUDA and Metal.
+// weight_decay applies to every parameter unless set_weight_decay overrides it; exclude biases
+// and norm parameters with opt.set_weight_decay(no_weight_decay_params(model), 0.0f).
 class Adam {
 public:
     float lr, beta1, beta2, eps, weight_decay;
@@ -159,17 +204,18 @@ public:
         auto& s = state_.get(p);
         s.step++;
         int64_t n = p->size();
+        float wd = decay_.get(p, weight_decay);
 
 #ifdef USE_CUDA
         if (p->device == Device::CUDA) {
             cuda::adamw_step(p->data_ptr<float>(), g->data_ptr<float>(), s.m->data_ptr<float>(), s.v->data_ptr<float>(),
-                             lr, beta1, beta2, eps, weight_decay, (int)s.step, n);
+                             lr, beta1, beta2, eps, wd, (int)s.step, n);
             return;
         }
 #endif
         if (p->device == Device::MPS && MetalBackend::get().is_available()) {
             MetalBackend::get().adamw(p->data_ptr<float>(), g->data_ptr<float>(), s.m->data_ptr<float>(), s.v->data_ptr<float>(),
-                                      (size_t)n, lr, beta1, beta2, eps, weight_decay, (int)s.step);
+                                      (size_t)n, lr, beta1, beta2, eps, wd, (int)s.step);
             return;
         }
         if (p->device != Device::CPU && p->device != Device::MPS) throw std::runtime_error("Adam: unsupported device");
@@ -181,7 +227,7 @@ public:
         const float bias1 = 1.0f - (float)std::pow((double)beta1, (double)s.step);
         const float bias2 = 1.0f - (float)std::pow((double)beta2, (double)s.step);
         for (int64_t i = 0; i < n; ++i) {
-            w[i] -= lr * weight_decay * w[i];
+            w[i] -= lr * wd * w[i];
             m[i] = beta1 * m[i] + (1.0f - beta1) * grad[i];
             v[i] = beta2 * v[i] + (1.0f - beta2) * grad[i] * grad[i];
             w[i] -= lr * (m[i] / bias1) / (std::sqrt(v[i] / bias2) + eps);
@@ -189,6 +235,9 @@ public:
     }
 
     void zero_grad(const std::vector<std::shared_ptr<Tensor>>& params) { ::zero_grad(params); }
+
+    // Weight decay for these parameters instead of weight_decay (e.g. 0 for no_weight_decay_params)
+    void set_weight_decay(const std::vector<std::shared_ptr<Tensor>>& params, float wd) { decay_.set(params, wd); }
 
     // State of the given parameters, keyed "<name>.exp_avg", "<name>.exp_avg_sq", "<name>.step".
     // Parameters that never received a gradient have no state and are omitted.
@@ -234,6 +283,7 @@ private:
         }
     };
     optim_detail::StateMap<State> state_;
+    optim_detail::DecayOverrides decay_;
 };
 
 using AdamW = Adam;
