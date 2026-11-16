@@ -8,7 +8,6 @@ A pure C++ deep learning engine engineered for absolute speed, zero abstraction 
 
 No Python. No bindings. No GIL. No multi-layer dispatcher overhead. Just raw, frontier-grade execution directly on the metal.
 
-> *"I honestly made it for my selfish reasons. I train my neural nets in C++ with my engine. Read the source code—it's fast and it's fun."*
 
 ---
 
