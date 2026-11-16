@@ -6,7 +6,7 @@
 
 A pure C++ deep learning engine engineered for absolute speed, zero abstraction bloat, and minimal codebase maintenance.
 
-No Python. No bindings. No GIL. No multi-layer dispatcher overhead. Just raw, frontier-grade execution directly on the metal.
+Got rid of Python and its bindings, GIL, multi-layer dispatcher overhead. It's a raw, frontier-grade execution directly on the metal.
 
 
 ---
