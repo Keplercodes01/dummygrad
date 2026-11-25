@@ -94,10 +94,35 @@ void AutogradEngine::execute(const std::vector<Root>& roots, const Options& opti
     const bool retain_graph = options.retain_graph || create_graph;
     GradModeGuard record(create_graph || grad_enabled());
 
-    // Every node reachable from the roots, each after the nodes it feeds (iterative, so deep graphs
-    // can't overflow the stack)
-    std::vector<Node*> order;
-    {
+    // How many gradients each node waits for. An ordinary backward runs every reachable node; with
+    // captures, only those on the way to a captured node.
+    std::unordered_map<Node*, int64_t> in_degree;
+    std::unordered_map<Node*, size_t> capture_index;
+    for (size_t i = 0; i < options.capture.size(); ++i) capture_index.emplace(options.capture[i], i);
+    const bool capturing = options.captured != nullptr;
+    std::unordered_set<Node*> needed, leads_on;  // when capturing: nodes to visit, and those with a needed node past them
+    auto is_needed = [&](Node* n) { return !capturing || needed.count(n) > 0; };
+
+    if (!capturing) {
+        // Iterative, so deep graphs can't overflow the stack
+        std::vector<Node*> stack;
+        for (const auto& r : roots) {
+            if (r.node && in_degree.emplace(r.node.get(), 0).second) stack.push_back(r.node.get());
+        }
+        while (!stack.empty()) {
+            Node* node = stack.back();
+            stack.pop_back();
+            for (const auto& edge : node->next_edges) {
+                Node* next = edge.function.get();
+                if (!next) continue;
+                auto entry = in_degree.emplace(next, 0);
+                if (entry.second) stack.push_back(next);
+                ++entry.first->second;
+            }
+        }
+    } else {
+        // Every reachable node, each after the nodes it feeds
+        std::vector<Node*> order;
         std::unordered_set<Node*> seen;
         std::vector<std::pair<Node*, size_t>> stack;
         for (const auto& r : roots) {
@@ -116,31 +141,19 @@ void AutogradEngine::execute(const std::vector<Root>& roots, const Options& opti
                 if (next && seen.insert(next).second) stack.emplace_back(next, 0);
             }
         }
-    }
-
-    // Which nodes to run: all of them, or only those on the way to a captured node
-    std::unordered_map<Node*, size_t> capture_index;
-    for (size_t i = 0; i < options.capture.size(); ++i) capture_index.emplace(options.capture[i], i);
-    const bool capturing = options.captured != nullptr;
-    std::unordered_set<Node*> needed, leads_on;  // leads_on: some node past it is needed
-    for (Node* node : order) {
-        bool on = false;
-        if (capturing) {
+        for (Node* node : order) {
+            bool on = false;
             for (const auto& edge : node->next_edges) on = on || (edge.function && needed.count(edge.function.get()));
             if (on) leads_on.insert(node);
             if (on || capture_index.count(node)) needed.insert(node);
-        } else {
-            needed.insert(node);
         }
-    }
-
-    std::unordered_map<Node*, int64_t> in_degree;
-    for (Node* node : order) {
-        if (!needed.count(node)) continue;
-        in_degree.emplace(node, 0);
-        if (capturing && !leads_on.count(node)) continue;  // it will not run, so it feeds nothing
-        for (const auto& edge : node->next_edges) {
-            if (edge.function && needed.count(edge.function.get())) in_degree[edge.function.get()]++;
+        for (Node* node : order) {
+            if (!needed.count(node)) continue;
+            in_degree.emplace(node, 0);
+            if (!leads_on.count(node)) continue;  // it will not run, so it feeds nothing
+            for (const auto& edge : node->next_edges) {
+                if (edge.function && needed.count(edge.function.get())) in_degree[edge.function.get()]++;
+            }
         }
     }
 
@@ -158,7 +171,7 @@ void AutogradEngine::execute(const std::vector<Root>& roots, const Options& opti
     std::mutex graph_mutex;
 
     for (size_t i = 0; i < roots.size(); ++i) {
-        if (!roots[i].node || !needed.count(roots[i].node.get())) continue;
+        if (!roots[i].node || !is_needed(roots[i].node.get())) continue;
         auto& slots = node_grads[roots[i].node.get()];
         if (slots.empty()) slots.resize(1);
         auto g = roots[i].grad;
@@ -257,7 +270,7 @@ void AutogradEngine::execute(const std::vector<Root>& roots, const Options& opti
             if (!edge.function) continue;
 
             Node* next_node = edge.function.get();
-            if (capturing && !needed.count(next_node)) continue;
+            if (!is_needed(next_node)) continue;
             // Moved, not copied: the consumer may run before this loop ends, and AccumulateGrad
             // adopts a gradient only when it holds the sole reference.
             std::shared_ptr<Tensor> grad_to_pass = (i < outgoing.size()) ? std::move(outgoing[i]) : nullptr;
@@ -287,7 +300,7 @@ void AutogradEngine::execute(const std::vector<Root>& roots, const Options& opti
     {
         std::unordered_set<Node*> pushed;
         for (const auto& r : roots) {
-            if (r.node && needed.count(r.node.get()) && in_degree[r.node.get()] == 0 && pushed.insert(r.node.get()).second) {
+            if (r.node && is_needed(r.node.get()) && in_degree[r.node.get()] == 0 && pushed.insert(r.node.get()).second) {
                 start.push_back(r.node);
             }
         }

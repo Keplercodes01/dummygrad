@@ -17,7 +17,7 @@ Full details for every release are in [CHANGELOG.md](CHANGELOG.md).
 
 ### Next release: the research release (in development)
 - **Higher-order autograd:** `autograd::grad` with `create_graph`, Jacobians, Hessians, hooks, checkpointing. See [Research toolkit](#research-toolkit).
-- **The op library of a research framework:** about 250 ops, convolutions of every kind, recurrent and transformer layers, 15 optimizers, `linalg`, `fft`, `distributions`.
+- **The op library of a research framework:** about 300 ops, convolutions of every kind, recurrent and transformer layers, 15 optimizers, `linalg`, `fft`, `distributions`.
 - **2.4 to 2.7 times faster on CPU.**
 
 ### v0.8.0: the audit release
@@ -107,7 +107,7 @@ Full details for every release are in [CHANGELOG.md](CHANGELOG.md).
 - **Fused, deterministic kernels**: RMSNorm, LayerNorm, cross entropy, embedding, RoPE, GQA head repetition and AdamW; reductions sum in a fixed order (no atomics), so identical runs give bitwise-identical gradients.
 - **Multi-GPU**: `MultiGPURunner` runs one replica per GPU in a single process and averages gradients GPU to GPU after each backward pass.
 - **Apple Silicon**: MPS tensors live in unified memory; a few elementwise ops, masks, loss gradients and AdamW run as Metal kernels, everything else on the CPU over the same memory. Not covered by tests.
-- **CPU**: threaded, vectorized kernels (AVX2, AVX-512 or NEON, whatever the machine has) around OpenBLAS, Accelerate or MKL, or a built-in matrix multiply without one. Results do not depend on the thread count.
+- **CPU**: threaded, vectorized kernels (AVX2, AVX-512 or NEON, whatever the machine has) around OpenBLAS, Accelerate or MKL, or a built-in matrix multiply without one. dummygrad's own kernels give the same results at any thread count.
 
 ---
 
@@ -355,7 +355,7 @@ The scaler follows PyTorch's `GradScaler`: it starts at 65536, halves on overflo
 
 ### Research toolkit
 
-[`examples/research_tour.cpp`](examples/research_tour.cpp) is a runnable tour. Tensors are `TensorPtr` (`std::shared_ptr<Tensor>`), ops are free functions with PyTorch's names and semantics, and every one is differentiable to second order.
+[`examples/research_tour.cpp`](examples/research_tour.cpp) is a runnable tour. Tensors are `TensorPtr` (`std::shared_ptr<Tensor>`), ops are free functions with PyTorch's names and, with few exceptions, its semantics. Differentiable ops support second derivatives.
 
 ```cpp
 // Higher-order gradients: differentiate through a gradient
@@ -394,7 +394,7 @@ optim::OneCycleLR schedule(0.02f, total_steps);
 | Autograd | `grad`, `create_graph`, `jacobian`, `hessian`, `hvp`, `vjp`, `jvp`, hooks, `retain_grad`, `checkpoint`, `custom_function`, anomaly detection, in-place-modification checks |
 | Ops | elementwise, broadcasting, views, indexing and scatter, reductions, sorting, `einsum`, convolutions, pooling, resampling, losses including CTC |
 | Layers | containers, convolutions, normalizations, dropout, recurrent, attention, transformers, pooling, embeddings |
-| Optimizers | SGD, Adam(W), AMSGrad, NAdam, RAdam, Adamax, Adagrad, Adadelta, RMSprop, Rprop, LBFGS, Lion, Muon, Adafactor; 11 schedules; EMA, SWA |
+| Optimizers | SGD, Adam(W), AMSGrad, NAdam, RAdam, Adamax, Adagrad, Adadelta, RMSprop, Rprop, LBFGS, Lion, Muon, Adafactor; 12 schedules; EMA, SWA |
 | Numerics | `linalg`, `fft`, `distributions`, reproducible counter-based random numbers |
 
 On a GPU, factorizations, Fourier transforms, sorting and general `scatter` run on the host and copy their data there and back; everything else runs on the device. Run `./build/test_research` to check all of it on your machine.
