@@ -387,15 +387,15 @@ public:
             best.pop();
             if (pair_count[top.pair] != top.count) continue;  // counted again since
             if (top.count < 2) break;
-            int merged = (int)t.tokens_.size();
             std::string a = t.tokens_[(size_t)top.pair.first], b = t.tokens_[(size_t)top.pair.second];
-            if (t.vocab_.count(a + b)) {  // spelled by another merge already
-                pair_count[top.pair] = 0;
-                continue;
+            // Another merge may spell the same token
+            auto known = t.vocab_.find(a + b);
+            int merged = known != t.vocab_.end() ? (int)known->second : (int)t.tokens_.size();
+            if (known == t.vocab_.end()) {
+                t.add_token(a + b, merged, false);
+                ++m;
             }
-            t.add_token(a + b, merged, false);
             t.add_merge(a, b);
-            ++m;
             std::set<Pair> changed;
             auto users = where[top.pair];
             for (size_t w : users) {
