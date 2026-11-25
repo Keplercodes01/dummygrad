@@ -333,8 +333,16 @@ inline TensorPtr lgamma(const TensorPtr& x) {
     return op_detail::unary("lgamma", kern::Unary::Lgamma, x, 0, 0, {0},
         [](const OpContext& c, const TensorPtr& g) -> TensorList { return {mul(g, digamma(c.input(0)))}; });
 }
-// First derivative only: its vjp is not differentiable further
-inline TensorPtr trigamma(const TensorPtr& x) { return op_detail::unary_const("trigamma", kern::Unary::Trigamma, x); }
+// Derivatives of lgamma: digamma, trigamma, tetragamma. The last one cannot be differentiated further.
+inline TensorPtr tetragamma(const TensorPtr& x) {
+    return op_detail::unary("tetragamma", kern::Unary::Tetragamma, x, 0, 0, {}, [](const OpContext&, const TensorPtr&) -> TensorList {
+        throw std::runtime_error("tetragamma: derivatives of lgamma past the third are not implemented");
+    });
+}
+inline TensorPtr trigamma(const TensorPtr& x) {
+    return op_detail::unary("trigamma", kern::Unary::Trigamma, x, 0, 0, {0},
+        [](const OpContext& c, const TensorPtr& g) -> TensorList { return {mul(g, tetragamma(c.input(0)))}; });
+}
 inline TensorPtr digamma(const TensorPtr& x) {
     return op_detail::unary("digamma", kern::Unary::Digamma, x, 0, 0, {0},
         [](const OpContext& c, const TensorPtr& g) -> TensorList { return {mul(g, trigamma(c.input(0)))}; });

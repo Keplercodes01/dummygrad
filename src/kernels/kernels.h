@@ -20,7 +20,7 @@ namespace kern {
 #define DG_UNARY_LIST(X)                                                                              \
     X(Abs) X(Neg) X(Sign) X(Exp) X(Expm1) X(Log) X(Log2) X(Log10) X(Log1p) X(Sqrt) X(Rsqrt) X(Square) \
     X(Reciprocal) X(Sin) X(Cos) X(Tan) X(Asin) X(Acos) X(Atan) X(Sinh) X(Cosh) X(Tanh) X(Asinh)       \
-    X(Acosh) X(Atanh) X(Erf) X(Erfc) X(Erfinv) X(Lgamma) X(Digamma) X(Trigamma) X(Floor) X(Ceil)      \
+    X(Acosh) X(Atanh) X(Erf) X(Erfc) X(Erfinv) X(Lgamma) X(Digamma) X(Trigamma) X(Tetragamma) X(Floor) X(Ceil)      \
     X(Round) X(Trunc) X(IsNan) X(IsInf) X(IsFinite) X(LogicalNot) X(Clamp) X(PowScalar) X(ScalarPow)  \
     X(Sigmoid) X(LogSigmoid) X(Softplus) X(Relu) X(LeakyRelu) X(Elu) X(Gelu) X(GeluTanh) X(Silu)      \
     X(Mish) X(Hardswish) X(Hardsigmoid) X(Softsign) X(Softshrink) X(Hardshrink) X(Threshold)          \

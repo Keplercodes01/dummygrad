@@ -118,6 +118,21 @@ DG_HD float m_trigamma(float x) {
     return sign * r;
 }
 
+DG_HD float m_tetragamma(float x) {  // second derivative of digamma
+    float r = 0.0f;
+    if (x < 0.5f) {
+        float s = sinf(kPi * x), c = cosf(kPi * x);
+        r = -2.0f * kPi * kPi * kPi * c / (s * s * s);
+        x = 1.0f - x;
+    }
+    while (x < 6.0f) {
+        r -= 2.0f / (x * x * x);
+        x += 1.0f;
+    }
+    float f = 1.0f / (x * x);
+    return r - f * (1.0f + 1.0f / x + f * (0.5f - f * (1.0f / 6.0f - f * (1.0f / 6.0f - f * 0.3f))));
+}
+
 // Modified Bessel functions of the first kind (Abramowitz & Stegun 9.8.1 - 9.8.4)
 DG_HD float m_i0(float x) {
     float a = fabsf(x);
@@ -180,6 +195,7 @@ DG_HD float unary_eval(float x, float p, float q) {
     else if constexpr (OP == Unary::Lgamma) return lgammaf(x);
     else if constexpr (OP == Unary::Digamma) return m_digamma(x);
     else if constexpr (OP == Unary::Trigamma) return m_trigamma(x);
+    else if constexpr (OP == Unary::Tetragamma) return m_tetragamma(x);
     else if constexpr (OP == Unary::Floor) return floorf(x);
     else if constexpr (OP == Unary::Ceil) return ceilf(x);
     else if constexpr (OP == Unary::Round) return rintf(x);

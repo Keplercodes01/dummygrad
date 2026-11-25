@@ -63,11 +63,11 @@ static TensorPtr input(const std::vector<int64_t>& shape, float lo = -1.0f, floa
     return tensor(v, shape);
 }
 // Shuffled, evenly spaced values, so maxima and orderings survive a finite-difference step
-static TensorPtr distinct(const std::vector<int64_t>& shape, float gap = 0.15f) {
+static TensorPtr distinct(const std::vector<int64_t>& shape, float gap = 0.15f, float offset = 0.05f) {
     int64_t n = 1;
     for (int64_t d : shape) n *= d;
     std::vector<float> v((size_t)n);
-    for (int64_t i = 0; i < n; ++i) v[(size_t)i] = gap * (float)(i - n / 2) + 0.05f;
+    for (int64_t i = 0; i < n; ++i) v[(size_t)i] = gap * (float)(i - n / 2) + offset;
     std::shuffle(v.begin(), v.end(), g_rng);
     return tensor(v, shape);
 }
@@ -86,7 +86,9 @@ static std::string near(const std::vector<float>& a, const std::vector<float>& b
     return "";
 }
 static std::string near(const TensorPtr& a, const std::vector<float>& b, float atol = 1e-5f, float rtol = 1e-5f) { return near(a->to_vector(), b, atol, rtol); }
-static std::string near(const TensorPtr& a, const TensorPtr& b, float atol = 1e-5f, float rtol = 1e-5f) {
+// A template, so that a braced list is never taken for a tensor
+template <typename T, typename = std::enable_if_t<std::is_same_v<T, TensorPtr>>>
+static std::string near(const TensorPtr& a, const T& b, float atol = 1e-5f, float rtol = 1e-5f) {
     if (a->shape != b->shape) return "shapes " + shape_string(a->shape) + " and " + shape_string(b->shape);
     return near(a->to_vector(), b->to_vector(), atol, rtol);
 }
@@ -222,7 +224,8 @@ static void build_ops() {
     unary_op_test("erfc", erfc);
     unary_op_test("erfinv", erfinv, -0.6f, 0.6f);
     unary_op_test("lgamma", lgamma, 1.0f, 3.0f);
-    unary_op_test("digamma", digamma, 1.2f, 3.0f, 0.0f, false);
+    unary_op_test("digamma", digamma, 1.2f, 3.0f);
+    unary_op_test("trigamma", trigamma, 1.2f, 3.0f, 0.0f, false);
     unary_op_test("i0", i0);
     unary_op_test("i1", i1, 0.3f, 1.5f);
     unary_op_test("sinc", sinc, 0.3f, 1.0f);
@@ -263,15 +266,15 @@ static void build_ops() {
     op("mul_both", {input({3, 1}), input({1, 4})}, [](const TensorList& x, Device) { return mul(x[0], x[1]); });
     op("div_both", {input({4}), input({3, 1}, 0.6f, 1.5f)}, [](const TensorList& x, Device) { return div(x[0], x[1]); });
     op("pow", {input({3, 1}, 0.6f, 1.5f), input({4}, 0.5f, 2.0f)}, [](const TensorList& x, Device) { return pow(x[0], x[1]); });
-    op("maximum", {distinct({2, 4}), distinct({2, 4}, 0.31f)}, [](const TensorList& x, Device) { return maximum(x[0], x[1]); });
-    op("minimum", {distinct({2, 4}), distinct({4}, 0.37f)}, [](const TensorList& x, Device) { return minimum(x[0], x[1]); });
+    op("maximum", {distinct({2, 4}), distinct({2, 4}, 0.3f, 0.12f)}, [](const TensorList& x, Device) { return maximum(x[0], x[1]); });
+    op("minimum", {distinct({2, 4}), distinct({4}, 0.3f, 0.12f)}, [](const TensorList& x, Device) { return minimum(x[0], x[1]); });
     op("atan2", {input({4}, 0.4f, 1.0f), input({4}, 0.4f, 1.0f)}, [](const TensorList& x, Device) { return atan2(x[0], x[1]); });
     op("hypot", {input({4}, 0.4f, 1.0f), input({4}, 0.4f, 1.0f)}, [](const TensorList& x, Device) { return hypot(x[0], x[1]); });
     op("copysign", {input({4}, 0.4f, 1.0f), input({4}, -1.0f, 1.0f, 0.1f)}, [](const TensorList& x, Device) { return copysign(x[0], x[1]); });
     op("where", {input({2, 3}), input({3})}, [](const TensorList& x, Device d) { return where(tensor({1, 0, 1, 0, 0, 1}, {2, 3}, d), x[0], x[1]); });
     op("lerp", {input({4}), input({4}), input({4}, 0.1f, 0.9f)}, [](const TensorList& x, Device) { return lerp(x[0], x[1], x[2]); });
     op("xlogy", {input({4}, 0.3f, 1.0f), input({4}, 0.5f, 1.5f)}, [](const TensorList& x, Device) { return xlogy(x[0], x[1]); });
-    op("logaddexp", {distinct({4}), distinct({4}, 0.4f)}, [](const TensorList& x, Device) { return logaddexp(x[0], x[1]); });
+    op("logaddexp", {distinct({4}), distinct({4}, 0.3f, 0.12f)}, [](const TensorList& x, Device) { return logaddexp(x[0], x[1]); });
     op("addcdiv", {input({4}), input({4}), input({4}, 0.6f, 1.5f)}, [](const TensorList& x, Device) { return addcdiv(x[0], x[1], x[2], 0.5f); });
 
     // Views and joining
@@ -336,7 +339,7 @@ static void build_ops() {
     op("scatter_add", {input({3, 4}), input({3, 2})}, [](const TensorList& x, Device d) { return scatter_add(x[0], 1, tensor({0, 0, 2, 3, 1, 1}, {3, 2}, d), x[1]); });
     op("scatter", {input({3, 4}), input({3, 2})}, [](const TensorList& x, Device d) { return scatter(x[0], 1, tensor({0, 1, 2, 3, 1, 0}, {3, 2}, d), x[1]); });
     op("scatter_mean", {input({3}), input({4})}, [](const TensorList& x, Device d) { return scatter_reduce(x[0], 0, tensor({0, 0, 2, 1}, {4}, d), x[1], ScatterReduce::Mean); });
-    op("scatter_amax", {distinct({3}), distinct({4}, 0.4f)}, [](const TensorList& x, Device d) { return scatter_reduce(x[0], 0, tensor({0, 0, 2, 1}, {4}, d), x[1], ScatterReduce::Amax); });
+    op("scatter_amax", {distinct({3}), distinct({4}, 0.3f, 0.12f)}, [](const TensorList& x, Device d) { return scatter_reduce(x[0], 0, tensor({0, 0, 2, 1}, {4}, d), x[1], ScatterReduce::Amax); });
     op("index_select", {input({4, 3})}, [](const TensorList& x, Device d) { return index_select(x[0], 0, tensor({3, 1, 1}, {3}, d)); });
     op("index_select_dim1", {input({2, 4, 2})}, [](const TensorList& x, Device d) { return index_select(x[0], 1, tensor({0, 0, 3}, {3}, d)); });
     op("index_add", {input({4, 2}), input({3, 2})}, [](const TensorList& x, Device d) { return index_add(x[0], 0, tensor({1, 1, 3}, {3}, d), x[1], 0.5f); });
@@ -672,7 +675,7 @@ static std::string values_reductions() {
     CHECK(near(cumsum(arange(1, 5), 0), {1, 3, 6, 10}));
     CHECK(near(cumprod(arange(1, 5), 0), {1, 2, 6, 24}));
     CHECK(near(cummax(tensor({1, 3, 2, 5, 4}, {5}), 0).second, {0, 1, 1, 3, 3}));
-    CHECK(near(prod(x, 2, false), {0, 840, 7920, 32760, 73440, 143640}, 1e-2f));
+    CHECK(near(prod(x, 2, false), {0, 840, 7920, 32760, 93024, 255024}, 1e-2f));
     CHECK(scalar(var(arange(0, 5), 0, false, 1), 2.5f));
     CHECK(scalar(norm(tensor({3, 4}, {2})), 5.0f));
     CHECK(scalar(logsumexp(tensor({1000, 1000}, {2}), 0), 1000.6931f, 1e-3f));
