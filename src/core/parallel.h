@@ -26,7 +26,18 @@ namespace parallel_detail {
 // Runs body(begin, end) over [begin, end) cut into pieces of at least grain
 void run(int64_t begin, int64_t end, int64_t grain, const std::function<void(int64_t, int64_t)>& body);
 bool in_parallel_region();
+void set_in_parallel_region(bool inside);
 }  // namespace parallel_detail
+
+// While one of these lives, parallel_for runs serially on this thread: for threads that work beside the one that
+// trains (data loading), which should not take its cores away
+struct SerialGuard {
+    bool previous = parallel_detail::in_parallel_region();
+    SerialGuard() { parallel_detail::set_in_parallel_region(true); }
+    ~SerialGuard() { parallel_detail::set_in_parallel_region(previous); }
+    SerialGuard(const SerialGuard&) = delete;
+    SerialGuard& operator=(const SerialGuard&) = delete;
+};
 
 template <typename F>
 inline void parallel_for(int64_t begin, int64_t end, int64_t grain, const F& body) {

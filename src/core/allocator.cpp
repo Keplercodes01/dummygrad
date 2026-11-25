@@ -46,43 +46,65 @@ void CPUCachingAllocator::empty_cache() {
     free_blocks.clear();
 }
 
+BlockPool& CUDACachingAllocator::pool(int device) {
+    auto& p = pools[device];
+    if (!p) {
+#ifdef USE_CUDA
+        p = std::make_unique<BlockPool>(
+            [](size_t bytes) -> void* {
+                void* ptr = nullptr;
+                return cudaMalloc(&ptr, bytes) == cudaSuccess ? ptr : nullptr;
+            },
+            [](void* ptr) { cudaFree(ptr); });
+#else
+        p = std::make_unique<BlockPool>([](size_t) -> void* { return nullptr; }, [](void*) {});
+#endif
+    }
+    return *p;
+}
+
+MemoryStats CUDACachingAllocator::stats_locked() const {
+    MemoryStats s;
+    for (const auto& p : pools) {
+        s.in_use += p.second->in_use();
+        s.reserved += p.second->reserved();
+    }
+    s.peak_in_use = std::max(peak_in_use, s.in_use);
+    return s;
+}
+
+MemoryStats CUDACachingAllocator::memory_stats() {
+    std::lock_guard<std::mutex> lock(mtx);
+    return stats_locked();
+}
+
+void CUDACachingAllocator::reset_peak() {
+    std::lock_guard<std::mutex> lock(mtx);
+    peak_in_use = 0;
+    peak_in_use = stats_locked().in_use;
+}
+
 void* CUDACachingAllocator::allocate(size_t bytes) {
 #ifdef USE_CUDA
-    size_t alloc_size = round_up(std::max<size_t>(bytes, 1));
     int dev = 0;
-    cudaGetDevice(&dev);
+    if (cudaGetDevice(&dev) != cudaSuccess) throw std::runtime_error("CUDACachingAllocator: no usable GPU");
     std::lock_guard<std::mutex> lock(mtx);
-
-    auto& blocks = free_blocks[dev][alloc_size];
-    void* ptr = nullptr;
-    if (!blocks.empty()) {
-        ptr = blocks.back();
-        blocks.pop_back();
-    } else {
-        cudaError_t err = cudaMalloc(&ptr, alloc_size);
-        if (err != cudaSuccess || !ptr) {
-            // Blocks cached for other sizes may hold the memory: give this device's back and try again
-            cudaDeviceSynchronize();
-            for (auto& pair : free_blocks[dev]) {
-                for (void* cached : pair.second) {
-                    cudaFree(cached);
-                    ptr_device.erase(cached);
-                    stats.reserved -= std::min(stats.reserved, pair.first);
-                }
-                pair.second.clear();
-            }
-            ptr = nullptr;
-            err = cudaMalloc(&ptr, alloc_size);
-        }
-        if (err != cudaSuccess || !ptr) {
-            throw std::runtime_error("out of GPU memory: " + std::to_string(alloc_size >> 20) + " MB requested, " +
-                                     std::to_string(stats.in_use >> 20) + " MB in use by tensors");
-        }
-        ptr_device[ptr] = dev;
-        stats.reserved += alloc_size;
+    auto& p = pool(dev);
+    void* ptr = p.allocate(bytes);
+    if (!ptr) {
+        // Free blocks may be in segments too small for this request: give those back and try again
+        cudaDeviceSynchronize();
+        p.release_unused();
+        ptr = p.allocate(bytes);
     }
-    stats.in_use += alloc_size;
-    stats.peak_in_use = std::max(stats.peak_in_use, stats.in_use);
+    if (!ptr) {
+        throw std::runtime_error("out of GPU memory: " + std::to_string(bytes >> 20) + " MB requested, " +
+                                 std::to_string(p.in_use() >> 20) + " MB in use by tensors, " +
+                                 std::to_string((p.reserved() - p.in_use()) >> 20) + " MB free in pieces");
+    }
+    size_t in_use = 0;
+    for (const auto& each : pools) in_use += each.second->in_use();
+    peak_in_use = std::max(peak_in_use, in_use);
     return ptr;
 #else
     (void)bytes;
@@ -91,39 +113,25 @@ void* CUDACachingAllocator::allocate(size_t bytes) {
 }
 
 void CUDACachingAllocator::free(void* ptr, size_t bytes) {
-    if (!ptr) return;
-#ifdef USE_CUDA
-    size_t alloc_size = round_up(std::max<size_t>(bytes, 1));
-    std::lock_guard<std::mutex> lock(mtx);
-    // Return the block to the pool of the GPU it was allocated on, not the caller's current device
-    auto it = ptr_device.find(ptr);
-    int dev = 0;
-    if (it != ptr_device.end()) {
-        dev = it->second;
-    } else {
-        cudaGetDevice(&dev);
-        ptr_device[ptr] = dev;
-    }
-    free_blocks[dev][alloc_size].push_back(ptr);
-    stats.in_use -= std::min(stats.in_use, alloc_size);
-#else
     (void)bytes;
-#endif
+    if (!ptr) return;
+    std::lock_guard<std::mutex> lock(mtx);
+    // Back to the GPU it was allocated on, whichever is current now
+    for (auto& p : pools) if (p.second->free(ptr)) return;
 }
 
 void CUDACachingAllocator::empty_cache() {
-#ifdef USE_CUDA
     std::lock_guard<std::mutex> lock(mtx);
-    for (auto& dev_pool : free_blocks) {
-        for (auto& pair : dev_pool.second) {
-            for (void* ptr : pair.second) {
-                cudaFree(ptr);
-                ptr_device.erase(ptr);
-                stats.reserved -= std::min(stats.reserved, pair.first);
-            }
-        }
+#ifdef USE_CUDA
+    // Kernels still queued may be reading blocks whose tensors are gone
+    int current = 0;
+    cudaGetDevice(&current);
+    for (auto& p : pools) {
+        cudaSetDevice(p.first);
+        cudaDeviceSynchronize();
+        p.second->release_unused();
     }
-    free_blocks.clear();
+    cudaSetDevice(current);
 #endif
 }
 

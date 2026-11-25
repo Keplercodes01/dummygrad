@@ -5,11 +5,13 @@
 
 #include "test_util.h"
 
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <numeric>
 #include <set>
+#include <thread>
 
 using Ids = std::vector<int64_t>;
 
@@ -849,6 +851,245 @@ static std::string experts() {
     return expect_throw([] { MixtureOfExperts(4, 4, 2, 3); }, "top_k above the number of experts");
 }
 
+// ---------------------------------------------------------------------------------------------
+// Data loading and memory
+// ---------------------------------------------------------------------------------------------
+
+static std::string prefetching() {
+    // In order, whichever worker is faster
+    for (int workers : {1, 3}) {
+        Prefetcher<int64_t> p([](int64_t i) {
+            std::this_thread::sleep_for(std::chrono::microseconds((i * 37) % 5 * 50));
+            return i * i;
+        }, 20, workers, 3);
+        int64_t v = -1;
+        for (int64_t i = 0; i < 20; ++i) if (!p.next(v) || v != i * i) return "item " + std::to_string(i);
+        if (p.next(v)) return "an item past the end";
+    }
+    // Never more than `ahead` items before they are taken
+    {
+        std::atomic<int64_t> made{0};
+        Prefetcher<int64_t> p([&](int64_t i) { return ++made, i; }, -1, 2, 3);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        if (made > 3) return "made " + std::to_string(made) + " items ahead";
+    }
+    // An exception comes in place of its item; later items still come
+    Prefetcher<int> bad([](int64_t i) -> int {
+        if (i == 2) throw std::runtime_error("bad item");
+        return (int)i;
+    }, 5, 2, 2);
+    std::vector<int> got;
+    int errors = 0, v = 0;
+    for (int i = 0; i < 5; ++i) {
+        try {
+            bad.next(v);
+            got.push_back(v);
+        } catch (const std::runtime_error&) {
+            ++errors;
+        }
+    }
+    if (errors != 1 || got != std::vector<int>{0, 1, 3, 4}) return "exceptions";
+    // Destroyed with work left
+    Prefetcher<int> endless([](int64_t i) { return (int)i; }, -1, 2);
+    endless.next(v);
+    // Workers record no graphs and leave the cores to the main thread
+    Prefetcher<int> modes([](int64_t) { return (grad_enabled() ? 1 : 0) + (parallel_detail::in_parallel_region() ? 0 : 2); }, 1);
+    modes.next(v);
+    return v == 0 ? "" : "worker modes " + std::to_string(v);
+}
+
+struct Squares : Dataset {
+    int64_t size() const override { return 10; }
+    Batch get(int64_t i) const override {
+        if (i == 7 && fail) throw std::runtime_error("cannot read sample 7");
+        return {tensor({(float)i, (float)(i * i)}, {2}), scalar_tensor((float)-i)};
+    }
+    bool fail = false;
+};
+
+static std::string data_workers() {
+    auto X = reshape(arange(0, 30), {10, 3}), Y = arange(0, 10);
+    auto run_epochs = [&](DataLoader& loader) {
+        std::vector<float> seen;
+        for (int64_t epoch = 0; epoch < 2; ++epoch) {
+            loader.set_epoch(epoch);
+            for (auto [x, y] : loader) {
+                for (float f : x->to_vector()) seen.push_back(f);
+                for (float f : y->to_vector()) seen.push_back(f);
+            }
+        }
+        return seen;
+    };
+    for (Device d : devices()) {
+        DataLoader plain(X, Y, 4, true, 3, false, d);
+        auto want = run_epochs(plain);
+        if (want.size() != 2 * 40) return "an epoch is incomplete";
+        for (int workers : {1, 3}) {
+            DataLoader loader(X, Y, 4, true, 3, false, d);
+            loader.prefetch(workers, 2);
+            CHECK(near(run_epochs(loader), want, 0.0f));
+        }
+    }
+    // A dataset's samples, stacked
+    auto squares = std::make_shared<Squares>();
+    DataLoader samples(squares, 4, /*shuffle=*/false);
+    Batch b = samples.batch(1);
+    CHECK(shape_is(b.inputs, {4, 2}));
+    CHECK(near(b.inputs, {4, 16, 5, 25, 6, 36, 7, 49}));
+    CHECK(near(b.targets, {-4, -5, -6, -7}));
+    if (samples.batch(2).inputs->shape[0] != 2) return "the last batch";
+    samples.prefetch(2);
+    squares->fail = true;
+    int batches = 0;
+    CHECK(expect_throw([&] { for (auto [x, y] : samples) { (void)x; (void)y; ++batches; } }, "a sample that cannot be read"));
+    if (batches != 1) return "an error came at the wrong batch";
+    // Leaving a loop early
+    squares->fail = false;
+    for (auto [x, y] : samples) {
+        if (x && y) break;
+    }
+    return "";
+}
+
+static std::string token_files() {
+    TempDir dir("tokens");
+    std::vector<uint16_t> ids(1000);
+    for (size_t i = 0; i < ids.size(); ++i) ids[i] = (uint16_t)(i * 7 % 600);
+    const std::string path = dir.path + "/t.bin";
+    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(ids.data()), 2000);
+    auto data = TokenDataset::from_file(path);
+    if (data.size() != 1000 || data.token(999) != (int32_t)ids[999] || data.vocab_size() != 600) return "mapped tokens";
+    auto halves = data.split(0.5);
+    if (halves.second.size() != 500 || halves.second.token(0) != (int32_t)ids[500]) return "split";
+    // Batches depend on the seed and their number, not on the workers
+    auto draw = [&](int workers, int64_t first) {
+        TokenLoader loader(halves.first, 3, 5, 42, Device::CPU, workers, 2, first);
+        std::vector<float> out;
+        for (int i = 0; i < 4; ++i) {
+            Batch b = loader.next();
+            auto x = b.inputs->to_vector(), y = b.targets->to_vector();
+            for (size_t k = 0; k + 1 < x.size(); ++k) if ((k + 1) % 5 != 0 && y[k] != x[k + 1]) return std::vector<float>();
+            out.insert(out.end(), x.begin(), x.end());
+        }
+        return out;
+    };
+    auto one = draw(1, 0), three = draw(3, 0), later = draw(2, 2);
+    if (one.empty()) return "targets are not the inputs shifted by one";
+    CHECK(near(three, one, 0.0f));
+    CHECK(near(std::vector<float>(later.begin(), later.begin() + 30), std::vector<float>(one.begin() + 30, one.end()), 0.0f));
+    CHECK(expect_throw([&] { TokenDataset::from_file(dir.path + "/missing.bin"); }, "a missing file"));
+    return expect_throw([&] { data.token(1000); }, "a token past the end");
+}
+
+// A driver with a limit, handing out addresses nobody touches
+struct FakeMemory {
+    size_t limit, held = 0;
+    uintptr_t next = (uintptr_t)1 << 30;
+    std::map<uintptr_t, size_t> segments;
+    void* allocate(size_t bytes) {
+        if (held + bytes > limit) return nullptr;
+        uintptr_t p = next;
+        next += bytes + 4096;
+        segments[p] = bytes;
+        held += bytes;
+        return reinterpret_cast<void*>(p);
+    }
+    void release(void* p) {
+        held -= segments.at(reinterpret_cast<uintptr_t>(p));
+        segments.erase(reinterpret_cast<uintptr_t>(p));
+    }
+};
+
+static std::string block_pool() {
+    const size_t MB = (size_t)1 << 20;
+    {
+        FakeMemory m{400 * MB};
+        BlockPool pool([&](size_t b) { return m.allocate(b); }, [&](void* p) { m.release(p); });
+        std::map<uintptr_t, size_t> live;
+        std::mt19937 rng(3);
+        for (int step = 0; step < 20000; ++step) {
+            if (live.empty() || rng() % 100 < 52) {
+                // Sizes from bytes to tens of MB
+                size_t bytes = (size_t)(rng() % 1000) << (rng() % 16);
+                void* p = pool.allocate(bytes);
+                if (!p) continue;
+                auto at = reinterpret_cast<uintptr_t>(p);
+                if (at % 512) return "unaligned block";
+                auto seg = m.segments.upper_bound(at);
+                if (seg == m.segments.begin()) return "a block outside every segment";
+                --seg;
+                if (at + bytes > seg->first + seg->second) return "a block past the end of its segment";
+                auto after = live.lower_bound(at);
+                if (after != live.end() && at + bytes > after->first) return "a block overlaps the next one";
+                if (after != live.begin() && std::prev(after)->first + std::max<size_t>(1, std::prev(after)->second) > at) return "a block overlaps the one before";
+                live[at] = bytes;
+            } else {
+                auto it = live.begin();
+                std::advance(it, (long)(rng() % live.size()));
+                if (!pool.free(reinterpret_cast<void*>(it->first))) return "a live block was unknown";
+                live.erase(it);
+            }
+            if (step % 1000 == 999) pool.release_unused();
+            size_t wanted = 0;
+            if (step % 500 == 0) {
+                for (auto& b : live) wanted += b.second;
+                if (pool.in_use() < wanted || pool.in_use() > pool.reserved() || pool.reserved() != m.held) return "the books do not balance";
+            }
+        }
+        if (pool.free(reinterpret_cast<void*>((uintptr_t)12345))) return "an unknown pointer was freed";
+        for (auto& b : live) pool.free(reinterpret_cast<void*>(b.first));
+        if (pool.in_use() != 0) return "memory in use after everything was freed";
+        pool.release_unused();
+        if (m.held != 0 || pool.reserved() != 0) return "neighbours were not joined back into whole segments";
+    }
+    FakeMemory m{200 * MB};
+    BlockPool pool([&](size_t b) { return m.allocate(b); }, [&](void* p) { m.release(p); });
+    // Memory freed at one size serves others, and joins up again
+    void* a = pool.allocate(60 * MB);
+    pool.free(a);
+    void *b = pool.allocate(25 * MB), *c = pool.allocate(25 * MB);
+    if (pool.reserved() != 60 * MB) return "a free block was not split";
+    pool.free(b);
+    pool.free(c);
+    if (pool.allocate(60 * MB) != a || pool.reserved() != 60 * MB) return "free neighbours were not joined";
+    // A repeated pattern stops growing after its first round
+    size_t reserved = 0;
+    for (int round = 0; round < 50; ++round) {
+        std::vector<void*> blocks;
+        for (size_t s : {3000, 70000, 3000, 2000000, 512, 9000000, 70000}) blocks.push_back(pool.allocate(s));
+        for (void* p : blocks) pool.free(p);
+        if (round == 0) reserved = pool.reserved();
+        if (pool.reserved() != reserved) return "a repeated pattern kept growing";
+    }
+    // Small and large blocks live in separate segments, and running out returns null
+    if (pool.allocate(500 * MB)) return "more memory than there is";
+    void* small = pool.allocate(100);
+    size_t before = pool.reserved();
+    pool.release_unused();
+    if (pool.reserved() >= before || !pool.free(small)) return "unused segments were kept";
+    return "";
+}
+
+// Steps with changing sizes reuse memory instead of reserving more
+static std::string cuda_memory() {
+    if (!has_cuda()) return "";
+    CUDACachingAllocator::get().empty_cache();
+    auto base = cuda_memory_stats();
+    size_t peak = 0;
+    for (int64_t n : {1000, 900, 1100, 500, 1050, 700}) {
+        auto a = ones({n, 1024}, Device::CUDA), b = a + a;
+        peak = std::max(peak, cuda_memory_stats().in_use - base.in_use);
+    }
+    auto s = cuda_memory_stats();
+    if (s.in_use != base.in_use) return "memory in use after the tensors are gone";
+    if (s.reserved > base.reserved + 2 * peak + ((size_t)40 << 20)) return "reserved " + std::to_string(s.reserved >> 20) + " MB";
+    // Copies to the GPU that do not wait still arrive whole and in order
+    TensorList sent;
+    for (int i = 0; i < 20; ++i) sent.push_back(tensor(std::vector<float>(5000, (float)i), {5000})->to(Device::CUDA));
+    for (int i = 0; i < 20; ++i) if (amin(sent[(size_t)i])->item() != (float)i || amax(sent[(size_t)i])->item() != (float)i) return "copy " + std::to_string(i);
+    return "";
+}
+
 int main(int argc, char** argv) {
     if (argc > 1) g_filter = argv[1];
     manual_seed(0);
@@ -867,5 +1108,10 @@ int main(int argc, char** argv) {
     run("no_bias_linear", no_bias_linear);
     run("lora", lora);
     run("experts", experts);
+    run("prefetching", prefetching);
+    run("data_workers", data_workers);
+    run("token_files", token_files);
+    run("block_pool", block_pool);
+    run("cuda_memory", cuda_memory);
     return report();
 }

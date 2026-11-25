@@ -127,6 +127,7 @@ void set_num_threads(int n) { thread_count().store(std::max(1, n), std::memory_o
 namespace parallel_detail {
 
 bool in_parallel_region() { return t_in_region; }
+void set_in_parallel_region(bool inside) { t_in_region = inside; }
 
 void run(int64_t begin, int64_t end, int64_t grain, const std::function<void(int64_t, int64_t)>& body) {
     // One region at a time: a second thread's kernel runs serially instead of oversubscribing the cores
