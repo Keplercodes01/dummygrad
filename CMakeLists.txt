@@ -142,6 +142,10 @@ if(DUMMYGRAD_BUILD_EXAMPLES)
     target_link_libraries(custom_op PRIVATE dummygrad_engine)
     add_test(NAME example_custom_op COMMAND custom_op)
 
+    add_executable(research_tour examples/research_tour.cpp)
+    target_link_libraries(research_tour PRIVATE dummygrad_engine)
+    add_test(NAME example_research_tour COMMAND research_tour)
+
     add_executable(train_lm examples/train_lm.cpp)
     target_link_libraries(train_lm PRIVATE dummygrad_engine)
     add_test(NAME example_train_lm COMMAND train_lm)

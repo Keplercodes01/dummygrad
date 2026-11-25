@@ -396,7 +396,7 @@ static void build_ops() {
     op("interpolate_bicubic", {input({1, 1, 4, 4})}, [](const TensorList& x, Device) { return interpolate(x[0], {6, 7}, InterpolateMode::Cubic, true); });
     op("pixel_shuffle", {input({1, 4, 2, 2})}, [](const TensorList& x, Device) { return pixel_shuffle(x[0], 2); });
     op("pixel_unshuffle", {input({1, 1, 4, 4})}, [](const TensorList& x, Device) { return pixel_unshuffle(x[0], 2); });
-    op("grid_sample", {input({1, 2, 4, 4}), input({1, 2, 2, 2}, -0.6f, 0.6f)}, [](const TensorList& x, Device) { return grid_sample(x[0], x[1]); }).second_order = false;
+    op("grid_sample", {input({1, 2, 4, 4}), tensor({-0.55f, 0.05f, 0.4f, -0.1f, -0.4f, 0.55f, 0.05f, -0.4f}, {1, 2, 2, 2})}, [](const TensorList& x, Device) { return grid_sample(x[0], x[1]); }).second_order = false;
     op("affine_grid", {input({1, 2, 3})}, [](const TensorList& x, Device) { return affine_grid(x[0], 2, 3); });
 
     // Masks, normalization, attention and embedding layers
@@ -675,7 +675,7 @@ static std::string values_reductions() {
     CHECK(near(cumsum(arange(1, 5), 0), {1, 3, 6, 10}));
     CHECK(near(cumprod(arange(1, 5), 0), {1, 2, 6, 24}));
     CHECK(near(cummax(tensor({1, 3, 2, 5, 4}, {5}), 0).second, {0, 1, 1, 3, 3}));
-    CHECK(near(prod(x, 2, false), {0, 840, 7920, 32760, 93024, 255024}, 1e-2f));
+    CHECK(near(prod(x, 2, false), {0, 840, 7920, 32760, 93024, 212520}, 1e-2f));
     CHECK(scalar(var(arange(0, 5), 0, false, 1), 2.5f));
     CHECK(scalar(norm(tensor({3, 4}, {2})), 5.0f));
     CHECK(scalar(logsumexp(tensor({1000, 1000}, {2}), 0), 1000.6931f, 1e-3f));

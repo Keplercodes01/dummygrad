@@ -672,6 +672,7 @@ public:
         NoGradGuard no_grad;
         for (size_t i = 0; i < params_.size(); ++i) {
             DG_KERNEL(params_[i]->device, ema_step(averages_[i]->data_ptr<float>(), params_[i]->data_ptr<float>(), params_[i]->size(), decay));
+            averages_[i]->storage->bump_version();
         }
     }
     void swap() {

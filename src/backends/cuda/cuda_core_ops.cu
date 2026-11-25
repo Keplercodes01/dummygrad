@@ -109,7 +109,18 @@ struct BroadcastDims {
     int64_t y_shape[kMaxDims];
 
     __device__ int64_t y_offset(int64_t x_idx) const {
+        if (ndim == 1) return y_strides[0] ? x_idx : 0;  // equal shapes, or a scalar: no division
         int64_t off = 0;
+        if (x_strides[0] * x_shape[0] <= 0x7fffffffLL) {
+            // 32-bit division is several times cheaper than 64-bit
+            uint32_t rest = (uint32_t)x_idx;
+            for (int d = ndim - 1; d > 0; --d) {
+                uint32_t size = (uint32_t)x_shape[d], quot = rest / size;
+                off += (int64_t)(rest - quot * size) * y_strides[d];
+                rest = quot;
+            }
+            return off + (int64_t)rest * y_strides[0];
+        }
         for (int d = ndim - 1; d >= 0; --d) {
             int64_t i = x_idx % x_shape[d];
             x_idx /= x_shape[d];

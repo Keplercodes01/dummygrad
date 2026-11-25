@@ -434,6 +434,7 @@ inline float clip_grad_norm_(const std::vector<std::shared_ptr<Tensor>>& paramet
 
     if (total_norm > max_norm) {
         float scale = max_norm / (total_norm + 1e-6f);
+        for (const auto& g : grads) g->storage->bump_version();  // scaled in place below
 #ifdef USE_CUDA
         cuda::scale_buffers(device_targets, device_sizes, scale);
 #endif
