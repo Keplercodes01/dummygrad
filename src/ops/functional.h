@@ -120,6 +120,14 @@ inline std::shared_ptr<Tensor> float32_input(const std::shared_ptr<Tensor>& a) {
     return (a && (a->dtype == DType::Float16 || a->dtype == DType::BFloat16)) ? cast(a, DType::Float32) : a;
 }
 
+// Under autocast, the ops with half-precision GPU kernels (relu, gelu, silu, the product of two equal
+// shapes, RoPE, GQA repetition, attention) keep a tensor that is already in the autocast dtype in it.
+// Outside autocast, or on any other device, a half-precision input computes in fp32 as before.
+inline bool native_half(const std::shared_ptr<Tensor>& a) {
+    return a && a->device == Device::CUDA && a->dtype != DType::Float32 && a->dtype == autocast_dtype();
+}
+inline std::shared_ptr<Tensor> native_input(const std::shared_ptr<Tensor>& a) { return native_half(a) ? a : float32_input(a); }
+
 // A TPU op writes its result to a TPU buffer only; mirror it into the tensor's host memory, which is
 // the authoritative copy every other op reads (see host_written in ops.cpp)
 inline void sync_tpu_result(const std::shared_ptr<Tensor>& t) {
@@ -145,7 +153,7 @@ struct ReluBackward : public Node {
         auto da = std::make_shared<Tensor>(a->shape, a->device, a->dtype, false);
 #ifdef USE_CUDA
         if (a->device == Device::CUDA) {
-            cuda::relu_backward(a->data_ptr<float>(), grad->data_ptr<float>(), da->data_ptr<float>(), a->size());
+            cuda::relu_backward(a->data_ptr<void>(), grad->to(a->dtype)->data_ptr<void>(), da->data_ptr<void>(), a->size(), a->dtype);
             return {da};
         }
 #endif
@@ -164,12 +172,12 @@ struct ReluBackward : public Node {
 // relu
 inline std::shared_ptr<Tensor> relu(const std::shared_ptr<Tensor>& a_in) {
     DG_PROFILE_OP("relu");
-    auto a = contiguous(float32_input(a_in));
+    auto a = contiguous(native_input(a_in));
     bool req_grad = grad_enabled() && (a->requires_grad);
     auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
 #ifdef USE_CUDA
     if (a->device == Device::CUDA) {
-        cuda::relu_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size());
+        cuda::relu_forward(a->data_ptr<void>(), out->data_ptr<void>(), a->size(), a->dtype);
         if (req_grad) {
             auto grad_fn = std::make_shared<ReluBackward>(a);
             grad_fn->add_next_edge(get_grad_edge(a).function);
@@ -291,7 +299,7 @@ struct GeluBackward : public Node {
         auto da = std::make_shared<Tensor>(a->shape, a->device, a->dtype, false);
 #ifdef USE_CUDA
         if (a->device == Device::CUDA) {
-            cuda::gelu_backward(a->data_ptr<float>(), grad->data_ptr<float>(), da->data_ptr<float>(), a->size());
+            cuda::gelu_backward(a->data_ptr<void>(), grad->to(a->dtype)->data_ptr<void>(), da->data_ptr<void>(), a->size(), a->dtype);
             return {da};
         }
 #endif
@@ -317,7 +325,7 @@ struct GeluBackward : public Node {
 // gelu
 inline std::shared_ptr<Tensor> gelu(const std::shared_ptr<Tensor>& a_in) {
     DG_PROFILE_OP("gelu");
-    auto a = contiguous(float32_input(a_in));
+    auto a = contiguous(native_input(a_in));
     const float sqrt_2_over_pi = 0.7978845608f;
     const float coeff = 0.044715f;
 
@@ -325,7 +333,7 @@ inline std::shared_ptr<Tensor> gelu(const std::shared_ptr<Tensor>& a_in) {
     auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
 #ifdef USE_CUDA
     if (a->device == Device::CUDA) {
-        cuda::gelu_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size());
+        cuda::gelu_forward(a->data_ptr<void>(), out->data_ptr<void>(), a->size(), a->dtype);
         if (req_grad) {
             auto grad_fn = std::make_shared<GeluBackward>(a, sqrt_2_over_pi, coeff);
             grad_fn->add_next_edge(get_grad_edge(a).function);
@@ -460,7 +468,7 @@ struct SiluBackward : public Node {
         auto da = std::make_shared<Tensor>(a->shape, a->device, a->dtype, false);
 #ifdef USE_CUDA
         if (a->device == Device::CUDA) {
-            cuda::silu_backward(a->data_ptr<float>(), grad->data_ptr<float>(), da->data_ptr<float>(), a->size());
+            cuda::silu_backward(a->data_ptr<void>(), grad->to(a->dtype)->data_ptr<void>(), da->data_ptr<void>(), a->size(), a->dtype);
             return {da};
         }
 #endif
@@ -485,12 +493,12 @@ struct SiluBackward : public Node {
 // silu (Swish)
 inline std::shared_ptr<Tensor> silu(const std::shared_ptr<Tensor>& a_in) {
     DG_PROFILE_OP("silu");
-    auto a = contiguous(float32_input(a_in));
+    auto a = contiguous(native_input(a_in));
     bool req_grad = grad_enabled() && (a->requires_grad);
     auto out = std::make_shared<Tensor>(a->shape, a->device, a->dtype, req_grad);
 #ifdef USE_CUDA
     if (a->device == Device::CUDA) {
-        cuda::silu_forward(a->data_ptr<float>(), out->data_ptr<float>(), a->size());
+        cuda::silu_forward(a->data_ptr<void>(), out->data_ptr<void>(), a->size(), a->dtype);
         if (req_grad) {
             auto grad_fn = std::make_shared<SiluBackward>(a);
             grad_fn->add_next_edge(get_grad_edge(a).function);
@@ -814,6 +822,7 @@ struct BroadcastBinaryBackward : public Node {
     std::vector<int64_t> x_shape, y_shape;  // as given by the caller
     BroadcastLayout layout;
     std::shared_ptr<Tensor> x, y;           // saved only for mul and div
+    bool same_shape = false;                // a CUDA product of equal shapes: both gradients in one kernel
 
     BroadcastBinaryBackward(BinaryOp op, std::vector<int64_t> x_shape, std::vector<int64_t> y_shape, BroadcastLayout layout,
                             std::shared_ptr<Tensor> x, std::shared_ptr<Tensor> y)
@@ -836,6 +845,16 @@ struct BroadcastBinaryBackward : public Node {
         auto g = grads[0];
         Device dev = g->device;
         std::shared_ptr<Tensor> gx, gy;
+#ifdef USE_CUDA
+        if (same_shape) {
+            g = g->to(x->dtype);
+            if (need_x) gx = std::make_shared<Tensor>(x_shape, dev, x->dtype, false);
+            if (need_y) gy = std::make_shared<Tensor>(y_shape, dev, x->dtype, false);
+            cuda::mul_backward(g->data_ptr<void>(), x->data_ptr<void>(), y->data_ptr<void>(), gx ? gx->data_ptr<void>() : nullptr,
+                               gy ? gy->data_ptr<void>() : nullptr, g->size(), x->dtype);
+            return {gx, gy};
+        }
+#endif
 
         // add/sub: dL/dx is the incoming gradient itself (the output has x's shape)
         if (need_x && !uses_values) gx = g;
@@ -887,6 +906,24 @@ inline std::shared_ptr<Tensor> broadcast_binary(BinaryOp op, const std::shared_p
     DG_PROFILE_OP(binary_op_name(op));
     if (!x_in || !y_in) throw std::invalid_argument(std::string(binary_op_name(op)) + ": null tensor");
     if (x_in->device != y_in->device) throw std::invalid_argument(std::string(binary_op_name(op)) + ": tensors are on different devices");
+#ifdef USE_CUDA
+    // The product of two tensors of one shape, in fp32 or (under autocast) kept in half precision
+    if (op == BinaryOp::Mul && x_in->device == Device::CUDA && x_in->shape == y_in->shape && x_in->dtype == y_in->dtype &&
+        (x_in->dtype == DType::Float32 || native_half(x_in))) {
+        auto x = contiguous(x_in), y = contiguous(y_in);
+        auto out = std::make_shared<Tensor>(x->shape, Device::CUDA, x->dtype, false);
+        cuda::mul(x->data_ptr<void>(), y->data_ptr<void>(), out->data_ptr<void>(), x->size(), x->dtype);
+        out->requires_grad = needs_grad(x) || needs_grad(y);
+        if (out->requires_grad) {
+            auto grad_fn = std::make_shared<BroadcastBinaryBackward>(op, x->shape, y->shape, BroadcastLayout{}, x, y);
+            grad_fn->same_shape = true;
+            grad_fn->add_next_edge(get_grad_edge(x).function);
+            grad_fn->add_next_edge(get_grad_edge(y).function);
+            out->grad_fn = grad_fn;
+        }
+        return out;
+    }
+#endif
     auto x = contiguous(float32_input(x_in));
     auto y = contiguous(float32_input(y_in));
     if (x->dtype != DType::Float32 || y->dtype != DType::Float32) {
@@ -2642,8 +2679,8 @@ struct CudaMatmulBackward : public Node {
         }
         std::shared_ptr<Tensor> da, db;
         cuda::matmul_backward(a_shape, b_shape, a, b, grads[0], grad_a ? &da : nullptr, grad_b ? &db : nullptr,
-                              compute, trans_b);
-        // The GEMMs write fp32; a half-precision input gets its gradient in its own dtype
+                              compute, trans_b, a_dtype);
+        // Each input gets its gradient in its own dtype (no-ops where the GEMM already wrote it)
         if (da) da = da->to(Device::CUDA, a_dtype);
         if (db) db = db->to(Device::CUDA, b_dtype);
         if (bias_shape.empty()) return {da, db};
@@ -2651,8 +2688,8 @@ struct CudaMatmulBackward : public Node {
         if (grad_bias) {
             int64_t cols = b_shape.back();
             dbias = std::make_shared<Tensor>(bias_shape, Device::CUDA, DType::Float32, false);
-            auto g = grads[0]->to(Device::CUDA, DType::Float32);
-            cuda::bias_grad(g->data_ptr<float>(), dbias->data_ptr<float>(), g->size() / cols, cols);
+            const auto& g = grads[0];
+            cuda::bias_grad(g->data_ptr<void>(), dbias->data_ptr<float>(), g->size() / cols, cols, g->dtype);
         }
         return {da, db, dbias};
     }
@@ -2739,8 +2776,11 @@ inline std::shared_ptr<Tensor> matmul_nt(const std::shared_ptr<Tensor>& a, const
 // y = x @ w + b: x [..., in], w [in, out], b [out] or [1, out], or null for no bias. On CUDA the
 // bias is added inside the GEMM (cuBLASLt epilogue) instead of by a separate pass over the output,
 // and one LinearBackward node returns dx, dw and db. On the host it is added after the GEMM, in place.
+// The output is fp32. Under autocast, out_dtype = autocast_dtype() keeps it in that dtype instead, for
+// ops with half-precision kernels to read (see native_half).
 inline std::shared_ptr<Tensor> linear(const std::shared_ptr<Tensor>& x, const std::shared_ptr<Tensor>& w,
-                                      const std::shared_ptr<Tensor>& b = nullptr) {
+                                      const std::shared_ptr<Tensor>& b = nullptr, DType out_dtype = DType::Float32) {
+    (void)out_dtype;  // CUDA only
     DG_PROFILE_OP("linear");
     if (!x || !w) throw std::invalid_argument("linear: null input or weight");
     if (!b) return matmul(x, w);
@@ -2760,7 +2800,8 @@ inline std::shared_ptr<Tensor> linear(const std::shared_ptr<Tensor>& x, const st
         bool grad_x = needs_grad(x), grad_w = needs_grad(w), grad_b = needs_grad(bias);
         // As in matmul: dx needs only w and dw only x
         std::shared_ptr<Tensor> saved_x, saved_w;
-        auto out = cuda::linear(x, w, bias, compute, grad_w ? &saved_x : nullptr, grad_x ? &saved_w : nullptr);
+        auto out = cuda::linear(x, w, bias, compute, grad_w ? &saved_x : nullptr, grad_x ? &saved_w : nullptr,
+                                out_dtype == compute ? compute : DType::Float32);
         out->requires_grad = grad_x || grad_w || grad_b;
         if (out->requires_grad) {
             auto grad_fn = std::make_shared<CudaMatmulBackward>(x->shape, w->shape, x->dtype, w->dtype, std::move(saved_x),

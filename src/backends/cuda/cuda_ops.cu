@@ -38,31 +38,56 @@ __global__ void k_convert(const In* in, Out* out, int64_t n) {
     if (idx < n) out[idx] = from_float<Out>(to_float(in[idx]));
 }
 
-__global__ void k_relu_forward(const float* in, float* out, int64_t size) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) out[idx] = in[idx] > 0.0f ? in[idx] : 0.0f;
-}
-
-__global__ void k_relu_backward(const float* in, const float* grad_out, float* grad_in, int64_t size) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) grad_in[idx] = in[idx] > 0.0f ? grad_out[idx] : 0.0f;
-}
-
-__global__ void k_gelu_forward(const float* in, float* out, int64_t size) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+// Activations and the product of two tensors run on fp32, fp16 or bf16 elements, computing in fp32
+template <typename T>
+__global__ void k_relu_forward(const T* in, T* out, int64_t size) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
-        float x = in[idx];
-        const float sqrt_2_over_pi = 0.7978845608f;
-        const float coeff = 0.044715f;
-        float inner = sqrt_2_over_pi * (x + coeff * x * x * x);
-        out[idx] = 0.5f * x * (1.0f + tanhf(inner));
+        float x = to_float(in[idx]);
+        out[idx] = from_float<T>(x > 0.0f ? x : 0.0f);
     }
 }
 
-__global__ void k_gelu_backward(const float* in, const float* grad_out, float* grad_in, int64_t size) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+template <typename T>
+__global__ void k_relu_backward(const T* in, const T* grad_out, T* grad_in, int64_t size) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) grad_in[idx] = to_float(in[idx]) > 0.0f ? grad_out[idx] : from_float<T>(0.0f);
+}
+
+template <typename T>
+__global__ void k_mul(const T* x, const T* y, T* out, int64_t n) {
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        out[i] = from_float<T>(to_float(x[i]) * to_float(y[i]));
+    }
+}
+
+// Both gradients of x * y in one pass; a null output is skipped
+template <typename T>
+__global__ void k_mul_backward(const T* g, const T* x, const T* y, T* gx, T* gy, int64_t n) {
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        float d = to_float(g[i]);
+        if (gx) gx[i] = from_float<T>(d * to_float(y[i]));
+        if (gy) gy[i] = from_float<T>(d * to_float(x[i]));
+    }
+}
+
+template <typename T>
+__global__ void k_gelu_forward(const T* in, T* out, int64_t size) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
-        float x = in[idx];
+        float x = to_float(in[idx]);
+        const float sqrt_2_over_pi = 0.7978845608f;
+        const float coeff = 0.044715f;
+        float inner = sqrt_2_over_pi * (x + coeff * x * x * x);
+        out[idx] = from_float<T>(0.5f * x * (1.0f + tanhf(inner)));
+    }
+}
+
+template <typename T>
+__global__ void k_gelu_backward(const T* in, const T* grad_out, T* grad_in, int64_t size) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = to_float(in[idx]);
         const float sqrt_2_over_pi = 0.7978845608f;
         const float coeff = 0.044715f;
         float inner = sqrt_2_over_pi * (x + coeff * x * x * x);
@@ -70,7 +95,7 @@ __global__ void k_gelu_backward(const float* in, const float* grad_out, float* g
         float sech2 = 1.0f - tanh_val * tanh_val;
         float d_inner = sqrt_2_over_pi * (1.0f + 3.0f * coeff * x * x);
         float g = 0.5f * (1.0f + tanh_val) + 0.5f * x * sech2 * d_inner;
-        grad_in[idx] = g * grad_out[idx];
+        grad_in[idx] = from_float<T>(g * to_float(grad_out[idx]));
     }
 }
 
@@ -87,20 +112,22 @@ __global__ void k_sigmoid_backward(const float* out, const float* grad_out, floa
     }
 }
 
-__global__ void k_silu_forward(const float* in, float* out, int64_t size) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+template <typename T>
+__global__ void k_silu_forward(const T* in, T* out, int64_t size) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
-        float x = in[idx];
-        out[idx] = x / (1.0f + expf(-x));
+        float x = to_float(in[idx]);
+        out[idx] = from_float<T>(x / (1.0f + expf(-x)));
     }
 }
 
-__global__ void k_silu_backward(const float* in, const float* grad_out, float* grad_in, int64_t size) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+template <typename T>
+__global__ void k_silu_backward(const T* in, const T* grad_out, T* grad_in, int64_t size) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
-        float x = in[idx];
+        float x = to_float(in[idx]);
         float s = 1.0f / (1.0f + expf(-x));
-        grad_in[idx] = (s * (1.0f + x * (1.0f - s))) * grad_out[idx];
+        grad_in[idx] = from_float<T>((s * (1.0f + x * (1.0f - s))) * to_float(grad_out[idx]));
     }
 }
 
@@ -378,8 +405,9 @@ __device__ __forceinline__ void rope_position(int64_t idx, int64_t total, int ha
     }
 }
 
-__global__ void k_rope_forward(const float* in, const float* cos_freqs, const float* sin_freqs,
-                               float* out, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos) {
+template <typename T>
+__global__ void k_rope_forward(const T* in, const float* cos_freqs, const float* sin_freqs,
+                               T* out, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos) {
     int64_t total = (int64_t)batch_size * seq_len * n_heads * (head_dim / 2);
     int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
@@ -393,15 +421,16 @@ __global__ void k_rope_forward(const float* in, const float* cos_freqs, const fl
     float s_val = sin_freqs[pos * half_dim + j];
 
     int64_t base = ((int64_t)(b * seq_len + s) * n_heads + h) * head_dim;
-    float x0 = in[base + 2 * j];
-    float x1 = in[base + 2 * j + 1];
+    float x0 = to_float(in[base + 2 * j]);
+    float x1 = to_float(in[base + 2 * j + 1]);
 
-    out[base + 2 * j]     = x0 * c - x1 * s_val;
-    out[base + 2 * j + 1] = x0 * s_val + x1 * c;
+    out[base + 2 * j]     = from_float<T>(x0 * c - x1 * s_val);
+    out[base + 2 * j + 1] = from_float<T>(x0 * s_val + x1 * c);
 }
 
-__global__ void k_rope_backward(const float* grad_out, const float* cos_freqs, const float* sin_freqs,
-                                float* grad_in, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos) {
+template <typename T>
+__global__ void k_rope_backward(const T* grad_out, const float* cos_freqs, const float* sin_freqs,
+                                T* grad_in, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos) {
     int64_t total = (int64_t)batch_size * seq_len * n_heads * (head_dim / 2);
     int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
@@ -415,11 +444,11 @@ __global__ void k_rope_backward(const float* grad_out, const float* cos_freqs, c
     float s_val = sin_freqs[pos * half_dim + j];
 
     int64_t base = ((int64_t)(b * seq_len + s) * n_heads + h) * head_dim;
-    float d0 = grad_out[base + 2 * j];
-    float d1 = grad_out[base + 2 * j + 1];
+    float d0 = to_float(grad_out[base + 2 * j]);
+    float d1 = to_float(grad_out[base + 2 * j + 1]);
 
-    grad_in[base + 2 * j]     = d0 * c + d1 * s_val;
-    grad_in[base + 2 * j + 1] = -d0 * s_val + d1 * c;
+    grad_in[base + 2 * j]     = from_float<T>(d0 * c + d1 * s_val);
+    grad_in[base + 2 * j + 1] = from_float<T>(-d0 * s_val + d1 * c);
 }
 
 template <typename T>
@@ -495,49 +524,65 @@ void make_contiguous(Tensor& dst, const Tensor& src) {
     }
 }
 
-void rope_forward(const float* in, const float* cos_freqs, const float* sin_freqs,
-                  float* out, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos) {
+void rope_forward(const void* in, const float* cos_freqs, const float* sin_freqs,
+                  void* out, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos, DType dtype) {
     int64_t total = (int64_t)batch_size * seq_len * n_heads * (head_dim / 2);
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    k_rope_forward<<<blocks, threads>>>(in, cos_freqs, sin_freqs, out, batch_size, seq_len, n_heads, head_dim, start_pos);
+    DG_CUDA_DISPATCH_FLOAT(dtype, "cuda::rope_forward", {
+        k_rope_forward<scalar_t><<<blocks, threads>>>(static_cast<const scalar_t*>(in), cos_freqs, sin_freqs, static_cast<scalar_t*>(out),
+                                                      batch_size, seq_len, n_heads, head_dim, start_pos);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 
-void rope_backward(const float* grad_out, const float* cos_freqs, const float* sin_freqs,
-                   float* grad_in, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos) {
+void rope_backward(const void* grad_out, const float* cos_freqs, const float* sin_freqs,
+                   void* grad_in, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos, DType dtype) {
     int64_t total = (int64_t)batch_size * seq_len * n_heads * (head_dim / 2);
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    k_rope_backward<<<blocks, threads>>>(grad_out, cos_freqs, sin_freqs, grad_in, batch_size, seq_len, n_heads, head_dim, start_pos);
+    DG_CUDA_DISPATCH_FLOAT(dtype, "cuda::rope_backward", {
+        k_rope_backward<scalar_t><<<blocks, threads>>>(static_cast<const scalar_t*>(grad_out), cos_freqs, sin_freqs, static_cast<scalar_t*>(grad_in),
+                                                       batch_size, seq_len, n_heads, head_dim, start_pos);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 
-void relu_forward(const float* in, float* out, int64_t size) {
-    int threads = 256;
-    int blocks = (size + threads - 1) / threads;
-    k_relu_forward<<<blocks, threads>>>(in, out, size);
+void relu_forward(const void* in, void* out, int64_t size, DType dtype) {
+    if (size == 0) return;
+    int blocks = (int)((size + 255) / 256);
+    DG_CUDA_DISPATCH_FLOAT(dtype, "cuda::relu_forward", {
+        k_relu_forward<scalar_t><<<blocks, 256>>>(static_cast<const scalar_t*>(in), static_cast<scalar_t*>(out), size);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 
-void relu_backward(const float* in, const float* grad_out, float* grad_in, int64_t size) {
-    int threads = 256;
-    int blocks = (size + threads - 1) / threads;
-    k_relu_backward<<<blocks, threads>>>(in, grad_out, grad_in, size);
+void relu_backward(const void* in, const void* grad_out, void* grad_in, int64_t size, DType dtype) {
+    if (size == 0) return;
+    int blocks = (int)((size + 255) / 256);
+    DG_CUDA_DISPATCH_FLOAT(dtype, "cuda::relu_backward", {
+        k_relu_backward<scalar_t><<<blocks, 256>>>(static_cast<const scalar_t*>(in), static_cast<const scalar_t*>(grad_out),
+                                                 static_cast<scalar_t*>(grad_in), size);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 
-void gelu_forward(const float* in, float* out, int64_t size) {
-    int threads = 256;
-    int blocks = (size + threads - 1) / threads;
-    k_gelu_forward<<<blocks, threads>>>(in, out, size);
+void gelu_forward(const void* in, void* out, int64_t size, DType dtype) {
+    if (size == 0) return;
+    int blocks = (int)((size + 255) / 256);
+    DG_CUDA_DISPATCH_FLOAT(dtype, "cuda::gelu_forward", {
+        k_gelu_forward<scalar_t><<<blocks, 256>>>(static_cast<const scalar_t*>(in), static_cast<scalar_t*>(out), size);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 
-void gelu_backward(const float* in, const float* grad_out, float* grad_in, int64_t size) {
-    int threads = 256;
-    int blocks = (size + threads - 1) / threads;
-    k_gelu_backward<<<blocks, threads>>>(in, grad_out, grad_in, size);
+void gelu_backward(const void* in, const void* grad_out, void* grad_in, int64_t size, DType dtype) {
+    if (size == 0) return;
+    int blocks = (int)((size + 255) / 256);
+    DG_CUDA_DISPATCH_FLOAT(dtype, "cuda::gelu_backward", {
+        k_gelu_backward<scalar_t><<<blocks, 256>>>(static_cast<const scalar_t*>(in), static_cast<const scalar_t*>(grad_out),
+                                                 static_cast<scalar_t*>(grad_in), size);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -555,17 +600,22 @@ void sigmoid_backward(const float* out, const float* grad_out, float* grad_in, i
     CUDA_CHECK(cudaGetLastError());
 }
 
-void silu_forward(const float* in, float* out, int64_t size) {
-    int threads = 256;
-    int blocks = (size + threads - 1) / threads;
-    k_silu_forward<<<blocks, threads>>>(in, out, size);
+void silu_forward(const void* in, void* out, int64_t size, DType dtype) {
+    if (size == 0) return;
+    int blocks = (int)((size + 255) / 256);
+    DG_CUDA_DISPATCH_FLOAT(dtype, "cuda::silu_forward", {
+        k_silu_forward<scalar_t><<<blocks, 256>>>(static_cast<const scalar_t*>(in), static_cast<scalar_t*>(out), size);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 
-void silu_backward(const float* in, const float* grad_out, float* grad_in, int64_t size) {
-    int threads = 256;
-    int blocks = (size + threads - 1) / threads;
-    k_silu_backward<<<blocks, threads>>>(in, grad_out, grad_in, size);
+void silu_backward(const void* in, const void* grad_out, void* grad_in, int64_t size, DType dtype) {
+    if (size == 0) return;
+    int blocks = (int)((size + 255) / 256);
+    DG_CUDA_DISPATCH_FLOAT(dtype, "cuda::silu_backward", {
+        k_silu_backward<scalar_t><<<blocks, 256>>>(static_cast<const scalar_t*>(in), static_cast<const scalar_t*>(grad_out),
+                                                 static_cast<scalar_t*>(grad_in), size);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -594,6 +644,25 @@ void tanh_backward(const float* out, const float* grad_out, float* grad_in, int6
     int threads = 256;
     int blocks = (size + threads - 1) / threads;
     k_tanh_backward<<<blocks, threads>>>(out, grad_out, grad_in, size);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static int mul_grid(int64_t n) { return (int)std::min<int64_t>((n + 255) / 256, 1 << 20); }  // grid-stride loops
+
+void mul(const void* x, const void* y, void* out, int64_t n, DType dtype) {
+    if (n == 0) return;
+    DG_CUDA_DISPATCH_FLOAT(dtype, "cuda::mul", {
+        k_mul<scalar_t><<<mul_grid(n), 256>>>(static_cast<const scalar_t*>(x), static_cast<const scalar_t*>(y), static_cast<scalar_t*>(out), n);
+    });
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void mul_backward(const void* g, const void* x, const void* y, void* gx, void* gy, int64_t n, DType dtype) {
+    if (n == 0) return;
+    DG_CUDA_DISPATCH_FLOAT(dtype, "cuda::mul_backward", {
+        k_mul_backward<scalar_t><<<mul_grid(n), 256>>>(static_cast<const scalar_t*>(g), static_cast<const scalar_t*>(x), static_cast<const scalar_t*>(y),
+                                                       static_cast<scalar_t*>(gx), static_cast<scalar_t*>(gy), n);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -728,9 +797,10 @@ static std::shared_ptr<Tensor> gemm_operand(const std::shared_ptr<Tensor>& t, DT
 // Column-major C = op_a(A) op_b(B) + beta * C with alpha = 1 (see gemm_strided_batched)
 static void gemm(cublasOperation_t op_a, cublasOperation_t op_b, int m, int n, int k,
                  const void* A, int lda, long long stride_a, const void* B, int ldb, long long stride_b,
-                 float beta, float* C, int ldc, long long stride_c, int batch, DType compute) {
+                 float beta, void* C, int ldc, long long stride_c, int batch, DType compute,
+                 DType c_dtype = DType::Float32) {
     gemm_strided_batched(op_a, op_b, m, n, k, 1.0f, A, lda, stride_a, B, ldb, stride_b, beta, C, ldc, stride_c,
-                         batch, compute);
+                         batch, compute, c_dtype);
 }
 
 // ---- cuBLASLt GEMM with the bias fused into its epilogue (Linear) ----
@@ -740,14 +810,16 @@ static void gemm(cublasOperation_t op_a, cublasOperation_t op_b, int m, int n, i
 // heuristic's algorithm) are cached per shape and dtype, so a call only sets the bias pointer.
 
 struct LtKey {
-    int m, n, k, dtype;
+    int m, n, k, dtype, out_dtype;
     bool tf32;
-    bool operator==(const LtKey& o) const { return m == o.m && n == o.n && k == o.k && dtype == o.dtype && tf32 == o.tf32; }
+    bool operator==(const LtKey& o) const {
+        return m == o.m && n == o.n && k == o.k && dtype == o.dtype && out_dtype == o.out_dtype && tf32 == o.tf32;
+    }
 };
 struct LtKeyHash {
     size_t operator()(const LtKey& key) const {
         size_t h = (size_t)key.m;
-        for (int v : {key.n, key.k, key.dtype, (int)key.tf32}) h = h * 1000003u ^ (size_t)v;
+        for (int v : {key.n, key.k, key.dtype, key.out_dtype, (int)key.tf32}) h = h * 1000003u ^ (size_t)v;
         return h;
     }
 };
@@ -777,14 +849,15 @@ static LtContext& lt_context() {
     return ctx;
 }
 
-static LtPlan& lt_bias_plan(LtContext& ctx, int m, int n, int k, DType compute) {
+static LtPlan& lt_bias_plan(LtContext& ctx, int m, int n, int k, DType compute, DType out_dtype) {
     bool tf32 = compute == DType::Float32 && allow_tf32();
-    LtKey key{m, n, k, (int)compute, tf32};
+    LtKey key{m, n, k, (int)compute, (int)out_dtype, tf32};
     auto it = ctx.plans.find(key);
     if (it != ctx.plans.end()) return it->second;
     LtPlan& p = ctx.plans[key];
 
     cudaDataType_t in_type = compute == DType::Float16 ? CUDA_R_16F : compute == DType::BFloat16 ? CUDA_R_16BF : CUDA_R_32F;
+    cudaDataType_t d_type = out_dtype == DType::Float32 ? CUDA_R_32F : in_type;  // and the bias's type
     // fp32 inputs use TF32 tensor cores only when allowed, like the SGEMM path's math mode
     cublasComputeType_t compute_type = tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     CUBLAS_CHECK(cublasLtMatmulDescCreate(&p.op, compute_type, CUDA_R_32F));
@@ -795,7 +868,7 @@ static LtPlan& lt_bias_plan(LtContext& ctx, int m, int n, int k, DType compute) 
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
     CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&p.a, in_type, m, k, m));
     CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&p.b, in_type, k, n, k));
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&p.d, CUDA_R_32F, m, n, m));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&p.d, d_type, m, n, m));
 
     cublasLtMatmulPreference_t pref = nullptr;
     CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
@@ -820,10 +893,10 @@ static bool aligned16(const void* ptr) { return (reinterpret_cast<uintptr_t>(ptr
 
 // D = A B + bias as described above. Returns false (and does nothing) when cuBLASLt cannot run the
 // case: no algorithm for the shape, or a pointer that is not 16-byte aligned (an offset view).
-static bool gemm_bias(int m, int n, int k, const void* A, const void* B, const float* bias, float* D, DType compute) {
+static bool gemm_bias(int m, int n, int k, const void* A, const void* B, const void* bias, void* D, DType compute, DType out_dtype) {
     if (!aligned16(A) || !aligned16(B) || !aligned16(bias) || !aligned16(D)) return false;
     LtContext& ctx = lt_context();
-    LtPlan& p = lt_bias_plan(ctx, m, n, k, compute);
+    LtPlan& p = lt_bias_plan(ctx, m, n, k, compute, out_dtype);
     if (!p.ok) return false;
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
     const float alpha = 1.0f, beta = 0.0f;
@@ -843,7 +916,10 @@ static void check_matmul_inputs(const Tensor& a, const Tensor& b, const char* wh
 static std::shared_ptr<Tensor> matmul_impl(const std::shared_ptr<Tensor>& _a, const std::shared_ptr<Tensor>& _b,
                                            const std::shared_ptr<Tensor>& bias, DType compute,
                                            std::shared_ptr<Tensor>* saved_a, std::shared_ptr<Tensor>* saved_b,
-                                           bool trans_b = false) {
+                                           bool trans_b = false, DType out_dtype = DType::Float32) {
+    if (out_dtype != DType::Float32 && out_dtype != compute) {
+        throw std::runtime_error("cuda::matmul: the output must be Float32 or the compute dtype");
+    }
     check_matmul_inputs(*_a, *_b, "cuda::matmul");
     check_compute_dtype(compute, "cuda::matmul");
     if (_a->ndim() < 2 || _b->ndim() < 2) throw std::runtime_error("cuda::matmul: tensors must be at least 2-D");
@@ -884,7 +960,7 @@ static std::shared_ptr<Tensor> matmul_impl(const std::shared_ptr<Tensor>& _a, co
     out_shape[out_shape.size() - 2] = r1;
     out_shape[out_shape.size() - 1] = c2;
 
-    auto out = std::make_shared<Tensor>(out_shape, Device::CUDA, DType::Float32, a->requires_grad || b->requires_grad);
+    auto out = std::make_shared<Tensor>(out_shape, Device::CUDA, out_dtype, a->requires_grad || b->requires_grad);
 
     // A shared weight (b has batch 1) multiplies every row of a: run one GEMM over a viewed as
     // [batch * r1, c1] instead of a batched GEMM. The memory layout is identical.
@@ -902,23 +978,28 @@ static std::shared_ptr<Tensor> matmul_impl(const std::shared_ptr<Tensor>& _a, co
     auto bh = gemm_operand(b, compute);
     // Row-major C = A * B -> Col-major C^T = B^T * A^T. With a bias, b is one shared matrix, so
     // the product is a single folded GEMM (batch_size 1) and the bias rides in its epilogue.
+    auto bias_operand = bias && out_dtype != DType::Float32 ? gemm_operand(bias, out_dtype) : bias;
     bool fused = bias && batch_size == 1 &&
-                 gemm_bias(c2, r1, c1, bh->data_ptr<void>(), ah->data_ptr<void>(), bias->data_ptr<float>(),
-                           out->data_ptr<float>(), compute);
+                 gemm_bias(c2, r1, c1, bh->data_ptr<void>(), ah->data_ptr<void>(), bias_operand->data_ptr<void>(),
+                           out->data_ptr<void>(), compute, out_dtype);
     if (trans_b) {
         // Col-major C^T = W A^T: the row-major [N, K] buffer is col-major W^T, so op T gives W
         gemm(CUBLAS_OP_T, CUBLAS_OP_N, c2, r1, c1,
              bh->data_ptr<void>(), c1, 0, ah->data_ptr<void>(), c1, stride_a,
-             0.0f, out->data_ptr<float>(), c2, stride_c, batch_size, compute);
+             0.0f, out->data_ptr<void>(), c2, stride_c, batch_size, compute, out_dtype);
     } else if (!fused) {
+        // A separate bias is added in fp32, and the sum rounded if the output is half precision
+        auto full = bias && out_dtype != DType::Float32
+                        ? std::make_shared<Tensor>(out_shape, Device::CUDA, DType::Float32, false) : out;
         gemm(CUBLAS_OP_N, CUBLAS_OP_N, c2, r1, c1,
              bh->data_ptr<void>(), c2, stride_b, ah->data_ptr<void>(), c1, stride_a,
-             0.0f, out->data_ptr<float>(), c2, stride_c, batch_size, compute);
+             0.0f, full->data_ptr<void>(), c2, stride_c, batch_size, compute, full->dtype);
         if (bias) {
             ++g_linear_unfused;
             int64_t rows = out->size() / c2;
-            broadcast_binary_forward(0, out->data_ptr<float>(), bias->data_ptr<float>(), out->data_ptr<float>(),
+            broadcast_binary_forward(0, full->data_ptr<float>(), bias->data_ptr<float>(), full->data_ptr<float>(),
                                      {rows, (int64_t)c2}, {1, (int64_t)c2});
+            if (full != out) convert(full->data_ptr<void>(), DType::Float32, out->data_ptr<void>(), out_dtype, out->size());
         }
     }
     if (saved_a) *saved_a = std::move(ah);
@@ -938,12 +1019,12 @@ std::shared_ptr<Tensor> matmul_nt(const std::shared_ptr<Tensor>& a, const std::s
 
 std::shared_ptr<Tensor> linear(const std::shared_ptr<Tensor>& x, const std::shared_ptr<Tensor>& w,
                                const std::shared_ptr<Tensor>& bias, DType compute,
-                               std::shared_ptr<Tensor>* saved_x, std::shared_ptr<Tensor>* saved_w) {
+                               std::shared_ptr<Tensor>* saved_x, std::shared_ptr<Tensor>* saved_w, DType out_dtype) {
     if (w->ndim() != 2) throw std::runtime_error("cuda::linear: weight must be 2-D [in, out]");
     if (bias->dtype != DType::Float32 || bias->device != Device::CUDA || bias->size() != w->shape[1]) {
         throw std::runtime_error("cuda::linear: bias must be a Float32 CUDA tensor with one value per output feature");
     }
-    return matmul_impl(x, w, make_contiguous(bias), compute, saved_x, saved_w);
+    return matmul_impl(x, w, make_contiguous(bias), compute, saved_x, saved_w, /*trans_b=*/false, out_dtype);
 }
 
 // A backward GEMM operand: contiguous and of the compute dtype. matmul's saved operands already
@@ -965,7 +1046,8 @@ static int64_t shape_numel(const std::vector<int64_t>& shape) {
 void matmul_backward(const std::vector<int64_t>& a_shape, const std::vector<int64_t>& b_shape,
                      const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b,
                      const std::shared_ptr<Tensor>& grad_out,
-                     std::shared_ptr<Tensor>* grad_a, std::shared_ptr<Tensor>* grad_b, DType compute, bool trans_b) {
+                     std::shared_ptr<Tensor>* grad_a, std::shared_ptr<Tensor>* grad_b, DType compute, bool trans_b,
+                     DType grad_a_dtype) {
     if (!grad_out || (!grad_a && !grad_b)) return;
     check_compute_dtype(compute, "cuda::matmul_backward");
     if (!is_float_dtype(grad_out->dtype)) {
@@ -994,7 +1076,10 @@ void matmul_backward(const std::vector<int64_t>& a_shape, const std::vector<int6
     }
 
     // No zero fill: every GEMM below writes its output with beta = 0 before anything accumulates
-    if (grad_a) *grad_a = std::make_shared<Tensor>(a_shape, Device::CUDA, DType::Float32, false);
+    // dA can be written straight in half precision when one GEMM produces it; sums over batches stay fp32
+    bool one_gemm = trans_b || batch_size_b == 1 || batch_size_a == batch_size_b;
+    DType a_out = (grad_a_dtype == compute && one_gemm) ? grad_a_dtype : DType::Float32;
+    if (grad_a) *grad_a = std::make_shared<Tensor>(a_shape, Device::CUDA, a_out, false);
     if (grad_b) *grad_b = std::make_shared<Tensor>(b_shape, Device::CUDA, DType::Float32, false);
 
     // Shared weight: dA = dC @ B^T is one GEMM over [batch * r1] rows, and dB = A^T @ dC sums over
@@ -1016,19 +1101,19 @@ void matmul_backward(const std::vector<int64_t>& a_shape, const std::vector<int6
     const char* A = ah ? ah->data_ptr<char>() : nullptr;
     const char* B = bh ? bh->data_ptr<char>() : nullptr;
     const char* G = gh->data_ptr<char>();
-    float* dA = grad_a ? (*grad_a)->data_ptr<float>() : nullptr;
+    char* dA = grad_a ? (*grad_a)->data_ptr<char>() : nullptr;
     float* dB = grad_b ? (*grad_b)->data_ptr<float>() : nullptr;
 
     if (trans_b) {
         // b is the shared [N, K] matrix W (folded above): dA = dC W, and dW = dC^T A in W's layout
-        if (dA) gemm(CUBLAS_OP_N, CUBLAS_OP_N, c1, r1, c2, B, c1, 0, G, c2, 0, 0.0f, dA, c1, 0, 1, compute);
+        if (dA) gemm(CUBLAS_OP_N, CUBLAS_OP_N, c1, r1, c2, B, c1, 0, G, c2, 0, 0.0f, dA, c1, 0, 1, compute, a_out);
         if (dB) gemm(CUBLAS_OP_N, CUBLAS_OP_T, c1, c2, r1, A, c1, 0, G, c2, 0, 0.0f, dB, c1, 0, 1, compute);
         return;
     }
     if (batch_size_a == batch_size_b) {
         // dA = dC B^T, dB = A^T dC
         if (dA) gemm(CUBLAS_OP_T, CUBLAS_OP_N, c1, r1, c2, B, c2, stride_b, G, c2, stride_g,
-                     0.0f, dA, c1, stride_a, batch_size, compute);
+                     0.0f, dA, c1, stride_a, batch_size, compute, a_out);
         if (dB) gemm(CUBLAS_OP_N, CUBLAS_OP_T, c2, c1, r1, G, c2, stride_g, A, c1, stride_a,
                      0.0f, dB, c2, stride_b, batch_size, compute);
         return;
@@ -1044,7 +1129,7 @@ void matmul_backward(const std::vector<int64_t>& a_shape, const std::vector<int6
         int64_t off_b = batch_size_b > 1 ? (int64_t)batch * r2 * c2 : 0;
         int64_t off_g = (int64_t)batch * r1 * c2;
         if (dA) gemm(CUBLAS_OP_T, CUBLAS_OP_N, c1, r1, c2, B + off_b * elem, c2, 0, G + off_g * elem, c2, 0,
-                     beta_a, dA + off_a, c1, 0, 1, compute);
+                     beta_a, dA + off_a * (int64_t)sizeof(float), c1, 0, 1, compute);
         if (dB) gemm(CUBLAS_OP_N, CUBLAS_OP_T, c2, c1, r1, G + off_g * elem, c2, 0, A + off_a * elem, c1, 0,
                      beta_b, dB + off_b, c2, 0, 1, compute);
     }

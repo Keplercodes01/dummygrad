@@ -20,7 +20,7 @@ public:
           fc2((d_ff > 0 ? d_ff : 4 * d_model), d_model) {}
 
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x) {
-        auto h = gelu(fc1.forward(x));
+        auto h = gelu(fc1.forward_autocast(x));
         return fc2.forward(h);
     }
 

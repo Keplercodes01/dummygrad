@@ -261,9 +261,9 @@ struct RoPEBackward : public Node {
 
 #ifdef USE_CUDA
         if (dev == Device::CUDA && cos_freqs->device == Device::CUDA && sin_freqs->device == Device::CUDA) {
-            auto dx = std::make_shared<Tensor>(x_shape, Device::CUDA, DType::Float32, false);
-            cuda::rope_backward(dout->data_ptr<float>(), cos_freqs->data_ptr<float>(), sin_freqs->data_ptr<float>(),
-                                dx->data_ptr<float>(), batch_size, seq_len, n_heads, head_dim, start_pos);
+            auto dx = std::make_shared<Tensor>(x_shape, Device::CUDA, dout->dtype, false);
+            cuda::rope_backward(dout->data_ptr<void>(), cos_freqs->data_ptr<float>(), sin_freqs->data_ptr<float>(),
+                                dx->data_ptr<void>(), batch_size, seq_len, n_heads, head_dim, start_pos, dout->dtype);
             return {dx};
         }
 #endif
@@ -288,7 +288,7 @@ inline std::shared_ptr<Tensor> apply_rotary_emb(
 ) {
     DG_PROFILE_OP("rope");
     if (!x_in || !cos_freqs_in || !sin_freqs_in) throw std::runtime_error("apply_rotary_emb: null tensor passed");
-    auto x = contiguous(float32_input(x_in));
+    auto x = contiguous(native_input(x_in));
     auto cos_freqs = make_contiguous(float32_input(cos_freqs_in));
     auto sin_freqs = make_contiguous(float32_input(sin_freqs_in));
     int ndim = x->ndim();
@@ -316,11 +316,11 @@ inline std::shared_ptr<Tensor> apply_rotary_emb(
     }
 
     Device dev = x->device;
-    auto out = std::make_shared<Tensor>(x->shape, dev, DType::Float32, false);
+    auto out = std::make_shared<Tensor>(x->shape, dev, x->dtype, false);
 #ifdef USE_CUDA
     if (dev == Device::CUDA) {
-        cuda::rope_forward(x->data_ptr<float>(), cos_freqs->data_ptr<float>(), sin_freqs->data_ptr<float>(),
-                           out->data_ptr<float>(), batch_size, seq_len, n_heads, head_dim, start_pos);
+        cuda::rope_forward(x->data_ptr<void>(), cos_freqs->data_ptr<float>(), sin_freqs->data_ptr<float>(),
+                           out->data_ptr<void>(), batch_size, seq_len, n_heads, head_dim, start_pos, x->dtype);
     } else
 #endif
     {
@@ -367,9 +367,9 @@ public:
 
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x) {
         // 1. Gate projection with SiLU activation
-        auto gate = silu(w_gate.forward(x));
+        auto gate = silu(w_gate.forward_autocast(x));
         // 2. Up projection
-        auto up = w_up.forward(x);
+        auto up = w_up.forward_autocast(x);
         // 3. Element-wise gated modulation
         auto h = cast_n_mul(gate, up);
         // 4. Down projection back to in_features

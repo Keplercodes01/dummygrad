@@ -32,11 +32,11 @@ namespace cuda {
     // out = x @ w + bias for a 2-D weight w [in, out] and a bias with one value per output feature.
     // The bias is added inside the GEMM (cuBLASLt epilogue) when cuBLASLt supports the case, else
     // by a separate kernel. saved_x / saved_w as for matmul; the gradients are matmul_backward's
-    // plus bias_grad.
+    // plus bias_grad. out_dtype may be compute instead of Float32: the output is rounded once, by the GEMM.
     std::shared_ptr<Tensor> linear(const std::shared_ptr<Tensor>& x, const std::shared_ptr<Tensor>& w,
                                    const std::shared_ptr<Tensor>& bias, DType compute = DType::Float32,
                                    std::shared_ptr<Tensor>* saved_x = nullptr,
-                                   std::shared_ptr<Tensor>* saved_w = nullptr);
+                                   std::shared_ptr<Tensor>* saved_w = nullptr, DType out_dtype = DType::Float32);
     // How many linear calls so far added the bias with a separate kernel because cuBLASLt could
     // not fuse it (no algorithm for the shape, or an unaligned pointer). Should stay 0 for
     // ordinary layers; a rising count means Linear is running slower than it should.
@@ -44,30 +44,35 @@ namespace cuda {
     // Gradients of out = a @ b for inputs of shapes a_shape and b_shape (trans_b: out = a @ b^T, with
     // b_shape and grad_b in b's stored [N, K] layout). a and b are Float32 or
     // compute-dtype operands (normally matmul's saved ones). grad_a needs only b and grad_b only a:
-    // a null grad_a / grad_b skips that GEMM, and the operand only it uses may then be null.
+    // a null grad_a / grad_b skips that GEMM, and the operand only it uses may then be null. grad_a comes
+    // in grad_a_dtype when that is the compute dtype and one GEMM writes it, else in Float32.
     void matmul_backward(const std::vector<int64_t>& a_shape, const std::vector<int64_t>& b_shape,
                          const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b,
                          const std::shared_ptr<Tensor>& grad_out,
                          std::shared_ptr<Tensor>* grad_a, std::shared_ptr<Tensor>* grad_b,
-                         DType compute = DType::Float32, bool trans_b = false);
+                         DType compute = DType::Float32, bool trans_b = false, DType grad_a_dtype = DType::Float32);
 
     // Rounds n device floats to Float16 or BFloat16 (nearest even) into out
     void cast_from_float(const float* in, void* out, int64_t n, DType dtype);
     // Converts n device elements between Float32, Float16 and BFloat16 (nearest even when narrowing)
     void convert(const void* in, DType in_dtype, void* out, DType out_dtype, int64_t n);
 
-    // Fused elementwise activations
-    void relu_forward(const float* in, float* out, int64_t size);
-    void relu_backward(const float* in, const float* grad_out, float* grad_in, int64_t size);
+    // Fused elementwise activations. relu, gelu and silu take fp32, fp16 or bf16 elements.
+    void relu_forward(const void* in, void* out, int64_t size, DType dtype = DType::Float32);
+    void relu_backward(const void* in, const void* grad_out, void* grad_in, int64_t size, DType dtype = DType::Float32);
 
-    void gelu_forward(const float* in, float* out, int64_t size);
-    void gelu_backward(const float* in, const float* grad_out, float* grad_in, int64_t size);
+    void gelu_forward(const void* in, void* out, int64_t size, DType dtype = DType::Float32);
+    void gelu_backward(const void* in, const void* grad_out, void* grad_in, int64_t size, DType dtype = DType::Float32);
+
+    // Product of two tensors of one shape, and both its gradients in one pass (a null one is skipped)
+    void mul(const void* x, const void* y, void* out, int64_t n, DType dtype);
+    void mul_backward(const void* g, const void* x, const void* y, void* gx, void* gy, int64_t n, DType dtype);
 
     void sigmoid_forward(const float* in, float* out, int64_t size);
     void sigmoid_backward(const float* out, const float* grad_out, float* grad_in, int64_t size);
 
-    void silu_forward(const float* in, float* out, int64_t size);
-    void silu_backward(const float* in, const float* grad_out, float* grad_in, int64_t size);
+    void silu_forward(const void* in, void* out, int64_t size, DType dtype = DType::Float32);
+    void silu_backward(const void* in, const void* grad_out, void* grad_in, int64_t size, DType dtype = DType::Float32);
 
     void leaky_relu_forward(const float* in, float* out, int64_t size, float negative_slope);
     void leaky_relu_backward(const float* in, const float* grad_out, float* grad_in, int64_t size, float negative_slope);
@@ -126,8 +131,10 @@ namespace cuda {
                             const std::vector<int>& starts, float* grad_weight, int64_t vocab, int64_t dim);
 
     // GQA: [B, kv_heads, S, D] -> [B, kv_heads * group, S, D], and its gradient
-    void repeat_kv_forward(const float* in, float* out, int64_t batch, int64_t kv_heads, int64_t group, int64_t head_elems);
-    void repeat_kv_backward(const float* grad, float* gin, int64_t batch, int64_t kv_heads, int64_t group, int64_t head_elems);
+    void repeat_kv_forward(const void* in, void* out, int64_t batch, int64_t kv_heads, int64_t group, int64_t head_elems,
+                           DType dtype = DType::Float32);
+    void repeat_kv_backward(const void* grad, void* gin, int64_t batch, int64_t kv_heads, int64_t group, int64_t head_elems,
+                            DType dtype = DType::Float32);
 
     // 2-D max pooling (no padding) over planes = B * C of [H, W]. argmax receives each window's
     // winning offset kh * kW + kw as a float (-1 if all NaN); backward gathers deterministically.
@@ -138,7 +145,7 @@ namespace cuda {
 
     // Column sums of a row-major [rows, cols] gradient: a Linear's bias gradient. Deterministic, and
     // bit-identical to the broadcast-add backward it replaces.
-    void bias_grad(const float* grad, float* db, int64_t rows, int64_t cols);
+    void bias_grad(const void* grad, float* db, int64_t rows, int64_t cols, DType dtype = DType::Float32);
 
     // Elementwise losses summed over n elements and divided by divisor into one device float.
     // kind: 0 squared error, 1 absolute error, 2 cross entropy on probabilities (-t log(p + 1e-8))
@@ -174,25 +181,29 @@ namespace cuda {
     // implementation it used; pass it to backward.
     // compute (see AutocastGuard) is the precision of the GEMM path's products: Float16/BFloat16 round
     // Q, K, V, dO and the probabilities P / score gradients dS for tensor cores, while scores, softmax,
-    // lse and every output stay fp32. The tiled kernels always compute in fp32.
+    // lse stay fp32. q, k, v, out, dout, dq, dk and dv are io elements: Float32, or on the GEMM path the
+    // compute dtype, which saves the conversions. The tiled kernels always compute in fp32.
     enum class AttentionImpl { Gemm, Tiled };
     // Longest sequence that takes the GEMM path (default 2048). The GEMM path materializes [seq, seq]
     // scores for a chunk of heads (at most 256 MB); 0 forces the tiled kernels, whose memory is linear in seq.
     void set_attention_gemm_max_seq(int seq_len);
     int attention_gemm_max_seq();
-    AttentionImpl attention_forward(const float* q, const float* k, const float* v, float* out, float* lse,
+    AttentionImpl attention_impl(int seq_len, int head_dim);  // what attention_forward will use
+    AttentionImpl attention_forward(const void* q, const void* k, const void* v, void* out, float* lse,
                                     int batch, int heads, int seq_len, int head_dim, bool causal, float scale,
-                                    DType compute = DType::Float32);
-    void attention_backward(const float* q, const float* k, const float* v, const float* out, const float* dout,
-                            const float* lse, float* dq, float* dk, float* dv,
+                                    DType compute = DType::Float32, DType io = DType::Float32);
+    void attention_backward(const void* q, const void* k, const void* v, const void* out, const void* dout,
+                            const float* lse, void* dq, void* dk, void* dv,
                             int batch, int heads, int seq_len, int head_dim, bool causal, float scale, AttentionImpl impl,
-                            DType compute = DType::Float32);
+                            DType compute = DType::Float32, DType io = DType::Float32);
 
     // Rotary Position Embeddings (RoPE)
-    void rope_forward(const float* in, const float* cos_freqs, const float* sin_freqs,
-                      float* out, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos);
-    void rope_backward(const float* grad_out, const float* cos_freqs, const float* sin_freqs,
-                       float* grad_in, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos);
+    void rope_forward(const void* in, const float* cos_freqs, const float* sin_freqs,
+                      void* out, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos,
+                      DType dtype = DType::Float32);
+    void rope_backward(const void* grad_out, const float* cos_freqs, const float* sin_freqs,
+                       void* grad_in, int batch_size, int seq_len, int n_heads, int head_dim, int start_pos,
+                       DType dtype = DType::Float32);
 
     // Fused AdamW optimizer update
     void adamw_step(float* param, const float* grad, float* m, float* v,
