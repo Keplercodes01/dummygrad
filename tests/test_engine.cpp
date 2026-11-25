@@ -2028,6 +2028,8 @@ static std::string amp_half_activations(DType compute) {
         auto full = run(false), amp = run(true);
         if (amp.empty() || amp.size() != full.size()) return label + ": a parameter has no fp32 gradient";
         bool differs = false;
+        float largest = 0.0f;  // over every parameter's gradient
+        for (size_t k = 2; k < full.size(); ++k) for (float v : full[k]) largest = std::max(largest, std::fabs(v));
         for (size_t k = 0; k < full.size(); ++k) {
             float scale = 0.0f, worst = 0.0f;
             for (size_t i = 0; i < full[k].size(); ++i) {
@@ -2035,7 +2037,10 @@ static std::string amp_half_activations(DType compute) {
                 worst = std::max(worst, std::fabs(full[k][i] - amp[k][i]));
             }
             differs = differs || worst > 0.0f;
-            if (!(worst <= 2e-2f * scale + 1e-4f)) return label + ": result " + std::to_string(k) + " differs from fp32 by " + std::to_string(worst) + " (scale " + std::to_string(scale) + ")";
+            // Without RoPE, a key bias adds the same amount to every score of a row, which softmax ignores:
+            // its true gradient is 0 and what is computed is rounding, so it is held to the other gradients
+            float tolerance = scale < 1e-4f * largest ? 5e-3f * largest : 2e-2f * scale + 1e-4f;
+            if (!(worst <= tolerance)) return label + ": result " + std::to_string(k) + " differs from fp32 by " + std::to_string(worst) + " (scale " + std::to_string(scale) + ", largest gradient " + std::to_string(largest) + ")";
         }
         return differs ? "" : label + ": autocast had no effect";
     };
