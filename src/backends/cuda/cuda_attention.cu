@@ -30,6 +30,7 @@
 #include "cuda_ops.cuh"
 #include "cuda_common.h"
 #include "cuda_reduce.cuh"
+#include "cuda_dtype.cuh"
 #include "allocator.h"
 
 #include <algorithm>
@@ -161,14 +162,15 @@ __global__ void k_attention_forward(const float* q, const float* k, const float*
 }
 
 // delta_i = dO_i . O_i, one warp per row
-__global__ void k_attention_delta(const float* out, const float* dout, float* delta, int64_t rows, int D) {
+template <typename T>
+__global__ void k_attention_delta(const T* out, const T* dout, float* delta, int64_t rows, int D) {
     int64_t row = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane = threadIdx.x % 32;
     if (row >= rows) return;  // whole warps exit together
-    const float* o = out + row * D;
-    const float* g = dout + row * D;
+    const T* o = out + row * D;
+    const T* g = dout + row * D;
     float s = 0.0f;
-    for (int d = lane; d < D; d += 32) s += o[d] * g[d];
+    for (int d = lane; d < D; d += 32) s += to_float(o[d]) * to_float(g[d]);
     for (int offset = 16; offset > 0; offset /= 2) s += __shfl_down_sync(0xffffffff, s, offset);
     if (lane == 0) delta[row] = s;
 }
@@ -384,9 +386,10 @@ int heads_per_chunk(int bh, int S, size_t bytes_per_score) {
 // and C [m, n] fp32. A is stored [m, k] ([k, m] if trans_a) and B [k, n] ([n, k] if trans_b), both
 // of the compute dtype. cuBLAS is column-major, so this computes C^T = op(B)^T op(A)^T.
 void gemm_batched(bool trans_a, bool trans_b, int m, int n, int k, float alpha, const void* A, int64_t stride_a,
-                  const void* B, int64_t stride_b, float* C, int64_t stride_c, int batch, DType compute) {
+                  const void* B, int64_t stride_b, void* C, int64_t stride_c, int batch, DType compute,
+                  DType c_dtype = DType::Float32) {
     gemm_strided_batched(trans_b ? CUBLAS_OP_T : CUBLAS_OP_N, trans_a ? CUBLAS_OP_T : CUBLAS_OP_N, n, m, k, alpha,
-                         B, trans_b ? k : n, stride_b, A, trans_a ? m : k, stride_a, 0.0f, C, n, stride_c, batch, compute);
+                         B, trans_b ? k : n, stride_b, A, trans_a ? m : k, stride_a, 0.0f, C, n, stride_c, batch, compute, c_dtype);
 }
 
 // GEMM element type for each compute dtype
@@ -399,18 +402,18 @@ __device__ __forceinline__ void store_as(float* p, float v) { *p = v; }
 __device__ __forceinline__ void store_as(__half* p, float v) { *p = __float2half_rn(v); }
 __device__ __forceinline__ void store_as(__nv_bfloat16* p, float v) { *p = __float2bfloat16_rn(v); }
 
-// An fp32 device array as a GEMM operand of type T: the array itself for float, else a rounded
-// copy that lives as long as the operand
+// A device array of io elements as a GEMM operand of type T: the array itself when it already has that
+// type, else a rounded copy that lives as long as the operand
 template <typename T>
 struct Operand {
     std::unique_ptr<DeviceBuffer> copy;
     const T* ptr;
-    Operand(const float* x, int64_t n) {
-        if constexpr (std::is_same_v<T, float>) {
-            ptr = x;
-        } else {
+    Operand(const void* x, DType io, int64_t n) {
+        if (io == gemm_dtype<T>()) {
+            ptr = static_cast<const T*>(x);
+        } else if constexpr (!std::is_same_v<T, float>) {
             copy = std::make_unique<DeviceBuffer>((size_t)n * sizeof(T));
-            cast_from_float(x, copy->ptr, n, gemm_dtype<T>());
+            cast_from_float(static_cast<const float*>(x), copy->ptr, n, gemm_dtype<T>());
             ptr = static_cast<const T*>(copy->ptr);
         }
     }
@@ -493,11 +496,13 @@ __global__ void k_attention_grad_scores(const float* scores, const float* dp, T*
 // T is the GEMM element type: float, or __half / __nv_bfloat16 under autocast. Scores, softmax and
 // lse are fp32 either way; only the GEMM operands are rounded to T.
 template <typename T>
-void forward_gemm(const float* q, const float* k, const float* v, float* out, float* lse,
-                  int bh, int S, int D, bool causal, float scale) {
+void forward_gemm(const void* q, const void* k, const void* v, void* out_io, float* lse,
+                  int bh, int S, int D, bool causal, float scale, DType io) {
     constexpr DType dt = gemm_dtype<T>();
     int64_t hs = (int64_t)S * D, ss = (int64_t)S * S, total = (int64_t)bh * hs;
-    Operand<T> qh(q, total), kh(k, total), vh(v, total);
+    Operand<T> qh(q, io, total), kh(k, io, total), vh(v, io, total);
+    char* out = static_cast<char*>(out_io);
+    int64_t elem = (int64_t)dtype_size(io);
     int chunk = heads_per_chunk(bh, S, sizeof(float) + half_bytes<T>());
     DeviceBuffer scores((size_t)(chunk * ss) * sizeof(float));
     ScoresAs<T> probs(scores.f(), (size_t)(chunk * ss));
@@ -508,16 +513,19 @@ void forward_gemm(const float* q, const float* k, const float* v, float* out, fl
         k_attention_softmax<T><<<(unsigned)(hc * S), row_threads(S)>>>(scores.f(), probs.ptr, lse + (int64_t)h0 * S,
                                                                       S, causal);
         CUDA_CHECK(cudaGetLastError());
-        gemm_batched(false, false, S, D, S, 1.0f, probs.ptr, ss, vh.ptr + o, hs, out + o, hs, hc, dt);
+        gemm_batched(false, false, S, D, S, 1.0f, probs.ptr, ss, vh.ptr + o, hs, out + o * elem, hs, hc, dt, io);
     }
 }
 
 template <typename T>
-void backward_gemm(const float* q, const float* k, const float* v, const float* dout, const float* lse,
-                   const float* delta, float* dq, float* dk, float* dv, int bh, int S, int D, bool causal, float scale) {
+void backward_gemm(const void* q, const void* k, const void* v, const void* dout, const float* lse,
+                   const float* delta, void* dq_io, void* dk_io, void* dv_io, int bh, int S, int D, bool causal, float scale,
+                   DType io) {
     constexpr DType dt = gemm_dtype<T>();
     int64_t hs = (int64_t)S * D, ss = (int64_t)S * S, total = (int64_t)bh * hs;
-    Operand<T> qh(q, total), kh(k, total), vh(v, total), doh(dout, total);
+    Operand<T> qh(q, io, total), kh(k, io, total), vh(v, io, total), doh(dout, io, total);
+    char *dq = static_cast<char*>(dq_io), *dk = static_cast<char*>(dk_io), *dv = static_cast<char*>(dv_io);
+    int64_t elem = (int64_t)dtype_size(io);
     int chunk = heads_per_chunk(bh, S, 2 * (sizeof(float) + half_bytes<T>()));
     DeviceBuffer scores((size_t)(chunk * ss) * sizeof(float)), dp((size_t)(chunk * ss) * sizeof(float));
     ScoresAs<T> probs(scores.f(), (size_t)(chunk * ss)), ds(dp.f(), (size_t)(chunk * ss));
@@ -531,9 +539,9 @@ void backward_gemm(const float* q, const float* k, const float* v, const float* 
                                                              lse + (int64_t)h0 * S, delta + (int64_t)h0 * S,
                                                              n, S, causal, scale);
         CUDA_CHECK(cudaGetLastError());
-        gemm_batched(true, false, S, D, S, 1.0f, probs.ptr, ss, doh.ptr + o, hs, dv + o, hs, hc, dt);  // P^T dO
-        gemm_batched(true, false, S, D, S, 1.0f, ds.ptr, ss, qh.ptr + o, hs, dk + o, hs, hc, dt);      // dS^T Q
-        gemm_batched(false, false, S, D, S, 1.0f, ds.ptr, ss, kh.ptr + o, hs, dq + o, hs, hc, dt);     // dS K
+        gemm_batched(true, false, S, D, S, 1.0f, probs.ptr, ss, doh.ptr + o, hs, dv + o * elem, hs, hc, dt, io);  // P^T dO
+        gemm_batched(true, false, S, D, S, 1.0f, ds.ptr, ss, qh.ptr + o, hs, dk + o * elem, hs, hc, dt, io);      // dS^T Q
+        gemm_batched(false, false, S, D, S, 1.0f, ds.ptr, ss, kh.ptr + o, hs, dq + o * elem, hs, hc, dt, io);     // dS K
     }
 }
 
@@ -542,59 +550,72 @@ void backward_gemm(const float* q, const float* k, const float* v, const float* 
 void set_attention_gemm_max_seq(int seq_len) { g_gemm_max_seq = seq_len; }
 int attention_gemm_max_seq() { return g_gemm_max_seq; }
 
-AttentionImpl attention_forward(const float* q, const float* k, const float* v, float* out, float* lse,
+// Past the GEMM limit the tiled kernels keep memory linear in seq; head dims above their 128 take the
+// GEMM path anyway, a chunk of heads (at least one) at a time
+AttentionImpl attention_impl(int seq_len, int head_dim) {
+    return (seq_len <= g_gemm_max_seq || head_dim > 128) ? AttentionImpl::Gemm : AttentionImpl::Tiled;
+}
+
+static void check_attention_dtypes(DType compute, DType io, AttentionImpl impl) {
+    if (compute != DType::Float32 && compute != DType::Float16 && compute != DType::BFloat16) {
+        throw std::runtime_error("cuda attention: compute dtype must be Float32, Float16 or BFloat16");
+    }
+    if (io != DType::Float32 && (io != compute || impl != AttentionImpl::Gemm)) {
+        throw std::runtime_error("cuda attention: tensors must be Float32, or of the compute dtype on the GEMM path");
+    }
+}
+
+AttentionImpl attention_forward(const void* q, const void* k, const void* v, void* out, float* lse,
                                 int batch, int heads, int seq_len, int head_dim, bool causal, float scale,
-                                DType compute) {
+                                DType compute, DType io) {
     int bh = batch * heads;
-    // Past the GEMM limit the tiled kernels keep memory linear in seq; head dims above their 128
-    // take the GEMM path anyway, a chunk of heads (at least one) at a time
-    AttentionImpl impl = (seq_len <= g_gemm_max_seq || head_dim > 128) ? AttentionImpl::Gemm : AttentionImpl::Tiled;
+    AttentionImpl impl = attention_impl(seq_len, head_dim);
+    check_attention_dtypes(compute, io, impl);
     if (bh == 0 || seq_len == 0) return impl;
-    switch (impl) {
-        case AttentionImpl::Gemm:
-            switch (compute) {
-                case DType::Float32: forward_gemm<float>(q, k, v, out, lse, bh, seq_len, head_dim, causal, scale); break;
-                case DType::Float16: forward_gemm<__half>(q, k, v, out, lse, bh, seq_len, head_dim, causal, scale); break;
-                case DType::BFloat16:
-                    forward_gemm<__nv_bfloat16>(q, k, v, out, lse, bh, seq_len, head_dim, causal, scale);
-                    break;
-                default: throw std::runtime_error("cuda::attention_forward: compute dtype must be Float32, Float16 or BFloat16");
-            }
-            break;
-        case AttentionImpl::Tiled:
-            tiled_forward(q, k, v, out, lse, bh, seq_len, head_dim, causal, scale);
-            break;
+    if (impl == AttentionImpl::Tiled) {
+        tiled_forward(static_cast<const float*>(q), static_cast<const float*>(k), static_cast<const float*>(v),
+                      static_cast<float*>(out), lse, bh, seq_len, head_dim, causal, scale);
+        return impl;
+    }
+    switch (compute) {
+        case DType::Float16: forward_gemm<__half>(q, k, v, out, lse, bh, seq_len, head_dim, causal, scale, io); break;
+        case DType::BFloat16: forward_gemm<__nv_bfloat16>(q, k, v, out, lse, bh, seq_len, head_dim, causal, scale, io); break;
+        default: forward_gemm<float>(q, k, v, out, lse, bh, seq_len, head_dim, causal, scale, io); break;
     }
     return impl;
 }
 
-void attention_backward(const float* q, const float* k, const float* v, const float* out, const float* dout,
-                        const float* lse, float* dq, float* dk, float* dv,
+void attention_backward(const void* q, const void* k, const void* v, const void* out, const void* dout,
+                        const float* lse, void* dq, void* dk, void* dv,
                         int batch, int heads, int seq_len, int head_dim, bool causal, float scale, AttentionImpl impl,
-                        DType compute) {
+                        DType compute, DType io) {
     int bh = batch * heads;
+    check_attention_dtypes(compute, io, impl);
     if (bh == 0 || seq_len == 0) return;
     int64_t rows = (int64_t)bh * seq_len;
     DeviceBuffer delta((size_t)rows * sizeof(float));
-    k_attention_delta<<<(unsigned)((rows * 32 + 255) / 256), 256>>>(out, dout, delta.f(), rows, head_dim);
+    DG_CUDA_DISPATCH_FLOAT(io, "cuda::attention_backward", {
+        k_attention_delta<scalar_t><<<(unsigned)((rows * 32 + 255) / 256), 256>>>(
+            static_cast<const scalar_t*>(out), static_cast<const scalar_t*>(dout), delta.f(), rows, head_dim);
+    });
     CUDA_CHECK(cudaGetLastError());
-    if (impl == AttentionImpl::Gemm) {
-        switch (compute) {
-            case DType::Float32:
-                backward_gemm<float>(q, k, v, dout, lse, delta.f(), dq, dk, dv, bh, seq_len, head_dim, causal, scale);
-                break;
-            case DType::Float16:
-                backward_gemm<__half>(q, k, v, dout, lse, delta.f(), dq, dk, dv, bh, seq_len, head_dim, causal, scale);
-                break;
-            case DType::BFloat16:
-                backward_gemm<__nv_bfloat16>(q, k, v, dout, lse, delta.f(), dq, dk, dv, bh, seq_len, head_dim, causal,
-                                             scale);
-                break;
-            default: throw std::runtime_error("cuda::attention_backward: compute dtype must be Float32, Float16 or BFloat16");
-        }
+    if (impl == AttentionImpl::Tiled) {
+        tiled_backward(static_cast<const float*>(q), static_cast<const float*>(k), static_cast<const float*>(v),
+                       static_cast<const float*>(dout), lse, delta.f(), static_cast<float*>(dq), static_cast<float*>(dk),
+                       static_cast<float*>(dv), bh, seq_len, head_dim, causal, scale);
         return;
     }
-    tiled_backward(q, k, v, dout, lse, delta.f(), dq, dk, dv, bh, seq_len, head_dim, causal, scale);
+    switch (compute) {
+        case DType::Float16:
+            backward_gemm<__half>(q, k, v, dout, lse, delta.f(), dq, dk, dv, bh, seq_len, head_dim, causal, scale, io);
+            break;
+        case DType::BFloat16:
+            backward_gemm<__nv_bfloat16>(q, k, v, dout, lse, delta.f(), dq, dk, dv, bh, seq_len, head_dim, causal, scale, io);
+            break;
+        default:
+            backward_gemm<float>(q, k, v, dout, lse, delta.f(), dq, dk, dv, bh, seq_len, head_dim, causal, scale, io);
+            break;
+    }
 }
 
 }  // namespace cuda

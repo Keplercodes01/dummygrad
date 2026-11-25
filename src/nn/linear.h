@@ -21,6 +21,11 @@ public:
         return linear(x, W, b);
     }
 
+    // Under autocast on a GPU, the output stays in the autocast dtype; otherwise the same as forward
+    std::shared_ptr<Tensor> forward_autocast(const std::shared_ptr<Tensor>& x) {
+        return linear(x, W, b, autocast_dtype());
+    }
+
     void visit(ModuleVisitor& v) override {
         v.parameter("weight", W);
         v.parameter("bias", b);

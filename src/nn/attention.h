@@ -39,14 +39,14 @@ struct FlashAttentionBackward : public Node {
 
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
         if (grads.empty() || !grads[0] || !q || !k || !v || !out) return {nullptr, nullptr, nullptr};
-        auto grad_out = grads[0];
+        auto grad_out = grads[0]->to(out->dtype);
         auto gq = std::make_shared<Tensor>(q->shape, q->device, q->dtype, false);
         auto gk = std::make_shared<Tensor>(k->shape, k->device, k->dtype, false);
         auto gv = std::make_shared<Tensor>(v->shape, v->device, v->dtype, false);
-        cuda::attention_backward(q->data_ptr<float>(), k->data_ptr<float>(), v->data_ptr<float>(),
-                                 out->data_ptr<float>(), grad_out->data_ptr<float>(), lse->data_ptr<float>(),
-                                 gq->data_ptr<float>(), gk->data_ptr<float>(), gv->data_ptr<float>(),
-                                 batch_size, num_heads, seq_len, d_k, causal, scale, impl, compute);
+        cuda::attention_backward(q->data_ptr<void>(), k->data_ptr<void>(), v->data_ptr<void>(),
+                                 out->data_ptr<void>(), grad_out->data_ptr<void>(), lse->data_ptr<float>(),
+                                 gq->data_ptr<void>(), gk->data_ptr<void>(), gv->data_ptr<void>(),
+                                 batch_size, num_heads, seq_len, d_k, causal, scale, impl, compute, q->dtype);
         return {gq, gk, gv};
     }
 };
@@ -155,7 +155,7 @@ struct RepeatKVBackward : public Node {
         auto gin = std::make_shared<Tensor>(in_shape, dev, g->dtype, false);
 #ifdef USE_CUDA
         if (dev == Device::CUDA) {
-            cuda::repeat_kv_backward(g->data_ptr<float>(), gin->data_ptr<float>(), batch, kv_heads, group, head_elems);
+            cuda::repeat_kv_backward(g->data_ptr<void>(), gin->data_ptr<void>(), batch, kv_heads, group, head_elems, g->dtype);
             return {gin};
         }
 #endif
@@ -181,7 +181,7 @@ struct RepeatKVBackward : public Node {
 inline std::shared_ptr<Tensor> repeat_kv(const std::shared_ptr<Tensor>& x_in, int64_t group) {
     DG_PROFILE_OP("repeat_kv");
     if (group == 1) return x_in;
-    auto x = contiguous(float32_input(x_in));
+    auto x = contiguous(native_input(x_in));
     if (x->ndim() != 4) throw std::invalid_argument("repeat_kv: expected [batch, kv_heads, seq, head_dim]");
     int64_t batch = x->shape[0], kv_heads = x->shape[1], head_elems = x->shape[2] * x->shape[3];
     std::vector<int64_t> out_shape{batch, kv_heads * group, x->shape[2], x->shape[3]};
@@ -189,7 +189,7 @@ inline std::shared_ptr<Tensor> repeat_kv(const std::shared_ptr<Tensor>& x_in, in
     auto out = std::make_shared<Tensor>(out_shape, dev, x->dtype, false);
 #ifdef USE_CUDA
     if (dev == Device::CUDA) {
-        cuda::repeat_kv_forward(x->data_ptr<float>(), out->data_ptr<float>(), batch, kv_heads, group, head_elems);
+        cuda::repeat_kv_forward(x->data_ptr<void>(), out->data_ptr<void>(), batch, kv_heads, group, head_elems, x->dtype);
     } else
 #endif
     {
@@ -271,9 +271,10 @@ public:
         int B = x->shape[0];
         int S = x->shape[1];
 
-        auto Q = W_q.forward(x); // [B, S, n_heads * d_k]
-        auto K = W_k.forward(x); // [B, S, n_kv_heads * d_k]
-        auto V = W_v.forward(x); // [B, S, n_kv_heads * d_k]
+        // Under autocast these stay in half precision through RoPE, GQA repetition and the attention kernel
+        auto Q = W_q.forward_autocast(x); // [B, S, n_heads * d_k]
+        auto K = W_k.forward_autocast(x); // [B, S, n_kv_heads * d_k]
+        auto V = W_v.forward_autocast(x); // [B, S, n_kv_heads * d_k]
 
         // Reshape Q, K, V to 4D tensors
         auto Q_4d = reshape(Q, {B, S, n_heads, d_k});
@@ -304,17 +305,26 @@ public:
 #ifdef USE_CUDA
         if (x->device == Device::CUDA && !mask) {
             DG_PROFILE_OP("attention");
+            // The tiled kernels and a mix of dtypes run in fp32
+            bool half_io = native_half(Q_split) && native_half(K_split) && native_half(V_split) &&
+                           cuda::attention_impl(S, d_k) == cuda::AttentionImpl::Gemm;
+            if (!half_io) {
+                Q_split = float32_input(Q_split);
+                K_split = float32_input(K_split);
+                V_split = float32_input(V_split);
+            }
+            DType io = Q_split->dtype;
             auto Q_c = make_contiguous(Q_split);
             auto K_c = make_contiguous(K_split);
             auto V_c = make_contiguous(V_split);
             // Q/K/V carry the weights' requires_grad even when the input x does not
             bool qkv_grad = grad_enabled() && (Q_split->requires_grad || K_split->requires_grad || V_split->requires_grad);
-            attn_out = std::make_shared<Tensor>(Q_split->shape, Device::CUDA, DType::Float32, qkv_grad);
+            attn_out = std::make_shared<Tensor>(Q_split->shape, Device::CUDA, io, qkv_grad);
             auto lse = std::make_shared<Tensor>(std::vector<int64_t>{B, n_heads, S}, Device::CUDA, DType::Float32, false);
             DType compute = autocast_dtype();
-            auto impl = cuda::attention_forward(Q_c->data_ptr<float>(), K_c->data_ptr<float>(), V_c->data_ptr<float>(),
-                                                attn_out->data_ptr<float>(), lse->data_ptr<float>(), B, n_heads, S, d_k,
-                                                causal, scale, compute);
+            auto impl = cuda::attention_forward(Q_c->data_ptr<void>(), K_c->data_ptr<void>(), V_c->data_ptr<void>(),
+                                                attn_out->data_ptr<void>(), lse->data_ptr<float>(), B, n_heads, S, d_k,
+                                                causal, scale, compute, io);
             if (qkv_grad) {
                 auto grad_fn = std::make_shared<FlashAttentionBackward>(Q_c, K_c, V_c, saved_output(attn_out), lse,
                                                                         B, n_heads, S, d_k, causal, scale, impl, compute);

@@ -46,22 +46,26 @@ inline cublasHandle_t get_cublas_handle() {
     return handle;
 }
 
-// cuBLAS strided-batched GEMM, column-major: C = alpha op_a(A) op_b(B) + beta C. C is fp32; A and
-// B are fp32, or both of the compute dtype: Float16/BFloat16 run on tensor cores and accumulate in
-// fp32. Float32 runs SGEMM, on TF32 tensor cores only with set_allow_tf32(true) (see the math mode
+// cuBLAS strided-batched GEMM, column-major: C = alpha op_a(A) op_b(B) + beta C. A and B are fp32, or
+// both of the compute dtype: Float16/BFloat16 run on tensor cores and accumulate in fp32. C is fp32, or
+// with c_dtype = compute rounded to it once, at the end. Float32 runs SGEMM, on TF32 tensor cores only with set_allow_tf32(true) (see the math mode
 // above). batch == 1 ignores the strides.
 inline void gemm_strided_batched(cublasOperation_t op_a, cublasOperation_t op_b, int m, int n, int k, float alpha,
                                  const void* A, int lda, long long stride_a, const void* B, int ldb, long long stride_b,
-                                 float beta, float* C, int ldc, long long stride_c, int batch, DType compute) {
+                                 float beta, void* C, int ldc, long long stride_c, int batch, DType compute,
+                                 DType c_dtype = DType::Float32) {
+    if (c_dtype != DType::Float32 && c_dtype != compute) {
+        throw std::runtime_error("gemm_strided_batched: the output must be Float32 or the compute dtype");
+    }
     cublasHandle_t handle = get_cublas_handle();
     if (compute == DType::Float32) {
         const float* a = static_cast<const float*>(A);
         const float* b = static_cast<const float*>(B);
         if (batch == 1) {
-            CUBLAS_CHECK(cublasSgemm(handle, op_a, op_b, m, n, k, &alpha, a, lda, b, ldb, &beta, C, ldc));
+            CUBLAS_CHECK(cublasSgemm(handle, op_a, op_b, m, n, k, &alpha, a, lda, b, ldb, &beta, static_cast<float*>(C), ldc));
         } else {
             CUBLAS_CHECK(cublasSgemmStridedBatched(handle, op_a, op_b, m, n, k, &alpha, a, lda, stride_a,
-                                                   b, ldb, stride_b, &beta, C, ldc, stride_c, batch));
+                                                   b, ldb, stride_b, &beta, static_cast<float*>(C), ldc, stride_c, batch));
         }
         return;
     }
@@ -69,12 +73,13 @@ inline void gemm_strided_batched(cublasOperation_t op_a, cublasOperation_t op_b,
         throw std::runtime_error("gemm_strided_batched: compute dtype must be Float32, Float16 or BFloat16");
     }
     cudaDataType_t type = compute == DType::Float16 ? CUDA_R_16F : CUDA_R_16BF;
+    cudaDataType_t c_type = c_dtype == DType::Float32 ? CUDA_R_32F : type;
     if (batch == 1) {
         CUBLAS_CHECK(cublasGemmEx(handle, op_a, op_b, m, n, k, &alpha, A, type, lda, B, type, ldb,
-                                  &beta, C, CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+                                  &beta, C, c_type, ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
     } else {
         CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, op_a, op_b, m, n, k, &alpha, A, type, lda, stride_a,
-                                                B, type, ldb, stride_b, &beta, C, CUDA_R_32F, ldc, stride_c,
+                                                B, type, ldb, stride_b, &beta, C, c_type, ldc, stride_c,
                                                 batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
     }
 }

@@ -1982,6 +1982,97 @@ static std::string amp_weight_cast_cache() {
 // Attention under autocast against fp32: output, lse and the three gradients on the GEMM path,
 // causal and not, with a sequence length that is not a multiple of 8. The tiled kernels ignore
 // autocast, so there the results must be bit-identical.
+// Activations that stay in half precision between ops: the dtypes along the way, the number of
+// conversions, and outputs and gradients of whole blocks against fp32
+static std::string amp_half_activations(DType compute) {
+    manual_seed(21);
+    Linear layer(8, 6);
+    layer.cuda();
+    auto x = upload(random_values(32, -1, 1), {4, 8}, Device::CUDA, false);
+    TensorPtr half;
+    {
+        AutocastGuard autocast(compute);
+        half = layer.forward_autocast(x);
+        if (half->dtype != compute) return "forward_autocast did not keep the autocast dtype";
+        if (layer.forward(x)->dtype != DType::Float32) return "Linear::forward must return fp32";
+        for (const auto& t : {silu(half), gelu(half), relu(half), mul(half, half), silu(transpose(half, 0, 1))}) {
+            if (t->dtype != compute) return "an op with a half-precision kernel left the autocast dtype";
+        }
+        if (mul(half, upload(random_values(6, -1, 1), {1, 6}, Device::CUDA, false))->dtype != DType::Float32) return "a mixed product must be fp32";
+    }
+    if (silu(half)->dtype != DType::Float32) return "outside autocast, a half input must compute in fp32";
+    if (layer.forward_autocast(x)->dtype != DType::Float32) return "outside autocast, forward_autocast must return fp32";
+
+    auto freqs = precompute_freqs_cis(8, 16);
+    auto cos_t = freqs.first->to(Device::CUDA), sin_t = freqs.second->to(Device::CUDA);
+    auto xv = random_values(2 * 10 * 32, -1, 1), cv = random_values(2 * 10 * 32, -1, 1);
+    auto check_block = [&](const std::string& label, Module& block, const std::function<TensorPtr(const TensorPtr&)>& forward) -> std::string {
+        auto run = [&](bool amp) {
+            block.zero_grad();
+            auto in = upload(xv, {2, 10, 32}, Device::CUDA, true);
+            TensorPtr y;
+            if (amp) {
+                AutocastGuard autocast(compute);
+                y = forward(in);
+            } else {
+                y = forward(in);
+            }
+            scalar_sum(reshape(mul(y, upload(cv, {2, 10, 32}, Device::CUDA, false)), {1, 640}))->backward();
+            std::vector<std::vector<float>> out{download(y->to(DType::Float32)), download(in->grad)};
+            for (auto& p : block.parameters()) {
+                if (!p->grad || p->grad->dtype != DType::Float32) return std::vector<std::vector<float>>{};
+                out.push_back(download(p->grad));
+            }
+            return out;
+        };
+        auto full = run(false), amp = run(true);
+        if (amp.empty() || amp.size() != full.size()) return label + ": a parameter has no fp32 gradient";
+        bool differs = false;
+        for (size_t k = 0; k < full.size(); ++k) {
+            float scale = 0.0f, worst = 0.0f;
+            for (size_t i = 0; i < full[k].size(); ++i) {
+                scale = std::max(scale, std::fabs(full[k][i]));
+                worst = std::max(worst, std::fabs(full[k][i] - amp[k][i]));
+            }
+            differs = differs || worst > 0.0f;
+            if (!(worst <= 2e-2f * scale + 1e-4f)) return label + ": result " + std::to_string(k) + " differs from fp32 by " + std::to_string(worst) + " (scale " + std::to_string(scale) + ")";
+        }
+        return differs ? "" : label + ": autocast had no effect";
+    };
+    ModernTransformerBlock modern(32, 4, 2, 64);
+    modern.cuda();
+    auto forward_modern = [&](const TensorPtr& in) { return modern.forward(in, nullptr, cos_t, sin_t); };
+    auto err = check_block("ModernTransformerBlock", modern, forward_modern);
+    if (!err.empty()) return err;
+    auto mask = masking::alibi_bias(4, 10)->to(Device::CUDA);
+    err = check_block("ModernTransformerBlock with a mask", modern, [&](const TensorPtr& in) { return modern.forward(in, mask, cos_t, sin_t); });
+    if (!err.empty()) return err;
+    TransformerBlock gpt(32, 4);
+    gpt.cuda();
+    err = check_block("TransformerBlock", gpt, [&](const TensorPtr& in) { return gpt.forward(in); });
+    if (!err.empty()) return err;
+    int gemm_max_seq = cuda::attention_gemm_max_seq();
+    cuda::set_attention_gemm_max_seq(0);
+    err = check_block("ModernTransformerBlock with tiled attention", modern, forward_modern);
+    cuda::set_attention_gemm_max_seq(gemm_max_seq);
+    if (!err.empty()) return err;
+
+    // With the weights' copies cached, a block converts only its two normalized inputs
+    NoGradGuard no_grad;
+    AutocastGuard autocast(compute);
+    auto in = upload(xv, {2, 10, 32}, Device::CUDA, false);
+    forward_modern(in);
+    reset_profile();
+    set_profiling(true);
+    forward_modern(in);
+    set_profiling(false);
+    int64_t casts = 0;
+    for (const auto& e : profile_report(ProfilePhase::Forward)) {
+        if (e.name == "autocast_cast" || e.name == "cast") casts += e.calls;
+    }
+    return casts <= 2 ? "" : "a block converted " + std::to_string(casts) + " tensors, expected 2";
+}
+
 static std::string amp_attention_parity(DType compute) {
     const int B = 2, H = 3, S = 40, D = 32;
     const int64_t n = (int64_t)B * H * S * D;
@@ -2250,9 +2341,11 @@ int main() {
         run_case(r, "amp/matmul_parity_fp16_cuda", [] { return amp_matmul_parity(DType::Float16); });
         run_case(r, "amp/weight_cast_cache_cuda", amp_weight_cast_cache);
         run_case(r, "amp/attention_parity_fp16_cuda", [] { return amp_attention_parity(DType::Float16); });
+        run_case(r, "amp/half_activations_fp16_cuda", [] { return amp_half_activations(DType::Float16); });
         if (cuda_has_bf16_tensor_cores()) {
             run_case(r, "amp/matmul_parity_bf16_cuda", [] { return amp_matmul_parity(DType::BFloat16); });
             run_case(r, "amp/attention_parity_bf16_cuda", [] { return amp_attention_parity(DType::BFloat16); });
+            run_case(r, "amp/half_activations_bf16_cuda", [] { return amp_half_activations(DType::BFloat16); });
         } else {
             std::cout << "[SKIP] amp/*_parity_bf16_cuda (needs compute capability 8.0+)\n";
         }

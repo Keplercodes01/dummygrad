@@ -8,6 +8,7 @@
 #include "cuda_ops.cuh"
 #include "cuda_common.h"
 #include "cuda_reduce.cuh"
+#include "cuda_dtype.cuh"
 #include "allocator.h"
 
 #include <algorithm>
@@ -220,14 +221,15 @@ struct BroadcastGradY {
 
 // Column t of a row-major [K, cols] gradient, summed over its K rows in row order: the same terms
 // in the same order as BroadcastGradY for a [K, cols] + [1, cols] add
+template <typename T>
 struct ColumnSum {
-    const float* grad;
+    const T* grad;
     int64_t cols;
     struct Ctx {
         int64_t col;
     };
     __device__ Ctx context(int64_t t) const { return Ctx{t}; }
-    __device__ float operator()(const Ctx& ctx, int64_t k) const { return grad[k * cols + ctx.col]; }
+    __device__ float operator()(const Ctx& ctx, int64_t k) const { return to_float(grad[k * cols + ctx.col]); }
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -491,7 +493,8 @@ __global__ void k_embedding_backward(const float* grad, const int* positions, co
 // GQA: [B, kv, S, D] -> [B, kv * group, S, D] (query head h reads kv head h / group)
 // ---------------------------------------------------------------------------------------------
 
-__global__ void k_repeat_kv_forward(const float* in, float* out, int64_t batch, int64_t kv, int64_t group, int64_t head) {
+template <typename T>
+__global__ void k_repeat_kv_forward(const T* in, T* out, int64_t batch, int64_t kv, int64_t group, int64_t head) {
     int64_t heads = kv * group;
     int64_t total = batch * heads * head;
     for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (int64_t)gridDim.x * blockDim.x) {
@@ -502,15 +505,16 @@ __global__ void k_repeat_kv_forward(const float* in, float* out, int64_t batch, 
     }
 }
 
-__global__ void k_repeat_kv_backward(const float* grad, float* gin, int64_t batch, int64_t kv, int64_t group, int64_t head) {
+template <typename T>
+__global__ void k_repeat_kv_backward(const T* grad, T* gin, int64_t batch, int64_t kv, int64_t group, int64_t head) {
     int64_t total = batch * kv * head;
     for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (int64_t)gridDim.x * blockDim.x) {
         int64_t e = i % head;
         int64_t k = (i / head) % kv;
         int64_t b = i / (head * kv);
         float acc = 0.0f;
-        for (int64_t g = 0; g < group; ++g) acc += grad[((b * kv + k) * group + g) * head + e];
-        gin[i] = acc;
+        for (int64_t g = 0; g < group; ++g) acc += to_float(grad[((b * kv + k) * group + g) * head + e]);
+        gin[i] = from_float<T>(acc);
     }
 }
 
@@ -773,8 +777,10 @@ void broadcast_binary_backward_y(int op, const float* grad, const float* x, cons
     reduce_terms(BroadcastGradY{op, grad, x, y, b}, numel(y_shape), K, gy);
 }
 
-void bias_grad(const float* grad, float* db, int64_t rows, int64_t cols) {
-    reduce_terms(ColumnSum{grad, cols}, cols, rows, db);
+void bias_grad(const void* grad, float* db, int64_t rows, int64_t cols, DType dtype) {
+    DG_CUDA_DISPATCH_FLOAT(dtype, "cuda::bias_grad", {
+        reduce_terms(ColumnSum<scalar_t>{static_cast<const scalar_t*>(grad), cols}, cols, rows, db);
+    });
 }
 
 void scalar_forward(int op, const float* a, float s, float* out, int64_t n) {
@@ -886,17 +892,21 @@ void embedding_backward(const float* grad, const std::vector<int>& positions, co
     CUDA_CHECK(cudaGetLastError());
 }
 
-void repeat_kv_forward(const float* in, float* out, int64_t batch, int64_t kv_heads, int64_t group, int64_t head_elems) {
+void repeat_kv_forward(const void* in, void* out, int64_t batch, int64_t kv_heads, int64_t group, int64_t head_elems, DType dtype) {
     int64_t n = batch * kv_heads * group * head_elems;
     if (n == 0) return;
-    k_repeat_kv_forward<<<grid_for(n), kThreads>>>(in, out, batch, kv_heads, group, head_elems);
+    DG_CUDA_DISPATCH_FLOAT(dtype, "cuda::repeat_kv_forward", {
+        k_repeat_kv_forward<scalar_t><<<grid_for(n), kThreads>>>(static_cast<const scalar_t*>(in), static_cast<scalar_t*>(out), batch, kv_heads, group, head_elems);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 
-void repeat_kv_backward(const float* grad, float* gin, int64_t batch, int64_t kv_heads, int64_t group, int64_t head_elems) {
+void repeat_kv_backward(const void* grad, void* gin, int64_t batch, int64_t kv_heads, int64_t group, int64_t head_elems, DType dtype) {
     int64_t n = batch * kv_heads * head_elems;
     if (n == 0) return;
-    k_repeat_kv_backward<<<grid_for(n), kThreads>>>(grad, gin, batch, kv_heads, group, head_elems);
+    DG_CUDA_DISPATCH_FLOAT(dtype, "cuda::repeat_kv_backward", {
+        k_repeat_kv_backward<scalar_t><<<grid_for(n), kThreads>>>(static_cast<const scalar_t*>(grad), static_cast<scalar_t*>(gin), batch, kv_heads, group, head_elems);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 
