@@ -7,6 +7,29 @@
 int main() {
     manual_seed(0);
 
+    // The README's first example: learn |x|^2, then differentiate what was learned
+    {
+        Sequential net;
+        net.add<Linear>(2, 32).add<GELU>().add<Linear>(32, 1);
+        optim::AdamW opt(1e-2f);
+
+        auto x = normal({256, 2});
+        auto y = sum(square(x), 1);
+        float first = 0.0f, last = 0.0f;
+        for (int step = 0; step < 500; ++step) {
+            net.zero_grad();
+            auto loss = mse_loss(net.forward(x), y);
+            loss->backward();
+            opt.step(net.parameters());
+            (step == 0 ? first : last) = loss->item();
+        }
+        auto point = tensor({1, 2}, {1, 2}, Device::CPU, /*requires_grad=*/true);
+        auto g = autograd::grad({sum(net.forward(point))}, {point}, {}, true, /*create_graph=*/true)[0];
+        std::cout << "|x|^2 fit: loss " << first << " -> " << last << ", gradient at (1, 2), near (2, 4): ";
+        g->show();
+        if (!(last < 0.1f * first)) return 1;
+    }
+
     // Second derivatives: the Hessian of sum(x^3) is diag(6x)
     auto f = [](const TensorPtr& x) { return sum(pow(x, 3.0f)); };
     std::cout << "Hessian of sum(x^3) at (1, 2):\n";
