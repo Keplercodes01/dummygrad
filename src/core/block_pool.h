@@ -3,6 +3,9 @@
 // joined again, so memory freed at one size serves requests of any other. Only addresses are managed, the memory
 // itself is never touched, which is what a GPU allocator needs (and what lets it be tested without one).
 //
+// A freed block first waits in a bin for the next request of the same size, which a training step makes over and over;
+// only when a request finds nothing are the waiting blocks joined with their neighbours and split anew.
+//
 // Free blocks sit in lists by size class, 16 classes per power of two, found through bitmaps. Requests up to 1 MB
 // come out of 2 MB segments of their own, so that small, long-lived tensors do not pin large segments.
 // Not thread-safe.
@@ -41,13 +44,26 @@ public:
     void* allocate(size_t bytes) {
         size_t size = round_up(bytes > 0 ? bytes : 1, kQuantum);
         bool small = size <= kSmallLimit;
+        auto bin = waiting_.find(size);
+        if (bin != waiting_.end() && !bin->second.empty()) {
+            Block* same = bin->second.back();
+            bin->second.pop_back();
+            same->waits = false;
+            in_use_ += same->size;
+            return same->ptr;
+        }
         Arena& arena = small ? small_ : large_;
         Block* b = find(arena, size);
+        if (!b) {
+            join_waiting();
+            b = find(arena, size);
+        }
         if (b) {
             remove(arena, b);
         } else if (!(b = new_segment(size, small))) {
             return nullptr;
         }
+        b->request = size;
         // What is left over stays available, unless it is too little to be worth it
         size_t rest = b->size - size;
         if (small ? rest >= kQuantum : rest > kSmallLimit) {
@@ -70,29 +86,18 @@ public:
     // False if ptr is not a live block of this pool
     bool free(void* ptr) {
         auto it = live_.find(ptr);
-        if (it == live_.end()) return false;
+        if (it == live_.end() || it->second->waits) return false;
         Block* b = it->second;
-        live_.erase(it);
         in_use_ -= b->size;
-        Arena& arena = b->small ? small_ : large_;
-        if (b->left && b->left->free) {
-            Block* l = b->left;
-            remove(arena, l);
-            join(l, b);
-            b = l;
-        }
-        if (b->right && b->right->free) {
-            Block* r = b->right;
-            remove(arena, r);
-            join(b, r);
-        }
-        insert(arena, b);
+        b->waits = true;
+        waiting_[b->request].push_back(b);
         return true;
     }
 
     // Gives back every segment nothing uses and returns how many bytes that was
     size_t release_unused() {
         size_t bytes = 0;
+        join_waiting();
         for (Arena* arena : {&small_, &large_}) {
             std::vector<Block*> whole;
             for (auto& level : arena->lists)
@@ -122,9 +127,12 @@ private:
     struct Block {
         char* ptr = nullptr;
         size_t size = 0;
+        size_t request = 0;                       // the size it was handed out for, at most size
         Block *left = nullptr, *right = nullptr;  // neighbours in the segment
         Block *prev = nullptr, *next = nullptr;   // in a free list
-        bool free = false, small = false;
+        bool free = false;                        // in a free list
+        bool waits = false;                       // freed, in a bin
+        bool small = false;
     };
     struct Arena {
         Block* lists[64][16] = {};
@@ -204,6 +212,30 @@ private:
         return a.lists[k][low_bit(a.subs[k])];
     }
 
+    // Moves every waiting block to the free lists, joined with its free neighbours
+    void join_waiting() {
+        for (auto& bin : waiting_) {
+            for (Block* b : bin.second) {
+                live_.erase(b->ptr);
+                b->waits = false;
+                Arena& arena = b->small ? small_ : large_;
+                if (b->left && b->left->free) {
+                    Block* l = b->left;
+                    remove(arena, l);
+                    join(l, b);
+                    b = l;
+                }
+                if (b->right && b->right->free) {
+                    Block* r = b->right;
+                    remove(arena, r);
+                    join(b, r);
+                }
+                insert(arena, b);
+            }
+            bin.second.clear();
+        }
+    }
+
     Block* new_segment(size_t size, bool small) {
         size_t bytes = small ? kSmallSegment : size <= kLargeSegment / 2 ? kLargeSegment : round_up(size, kSmallSegment);
         void* p = allocate_(bytes);
@@ -240,7 +272,8 @@ private:
     std::function<void*(size_t)> allocate_;
     std::function<void(void*)> release_;
     Arena small_, large_;
-    std::unordered_map<void*, Block*> live_;
+    std::unordered_map<void*, Block*> live_;  // by address: handed out, or waiting in a bin
+    std::unordered_map<size_t, std::vector<Block*>> waiting_;
     std::vector<Block*> spare_;
     size_t in_use_ = 0, reserved_ = 0;
 };

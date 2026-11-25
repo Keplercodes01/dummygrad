@@ -1128,7 +1128,9 @@ static std::string block_pool() {
             }
         }
         if (pool.free(reinterpret_cast<void*>((uintptr_t)12345))) return "an unknown pointer was freed";
-        for (auto& b : live) pool.free(reinterpret_cast<void*>(b.first));
+        void* twice = pool.allocate(100);
+        if (!pool.free(twice) || pool.free(twice)) return "a block was freed twice";
+        for (auto& b : live) if (!pool.free(reinterpret_cast<void*>(b.first))) return "a live block was unknown";
         if (pool.in_use() != 0) return "memory in use after everything was freed";
         pool.release_unused();
         if (m.held != 0 || pool.reserved() != 0) return "neighbours were not joined back into whole segments";
