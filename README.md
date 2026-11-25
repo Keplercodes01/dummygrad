@@ -14,13 +14,13 @@ Got rid of Python and its bindings, GIL, multi-layer dispatcher overhead. It's a
 
 manual_seed(0);
 Sequential net;
-net.add<Linear>(2, 32).add<GELU>().add<Linear>(32, 1);
+net.add<Linear>(2, 64).add<GELU>().add<Linear>(64, 1);
 optim::AdamW opt(1e-2f);
 
 auto x = normal({256, 2});
 auto y = sum(square(x), 1);                                    // learn |x|^2
 
-for (int step = 0; step < 500; ++step) {
+for (int step = 0; step < 2000; ++step) {
     net.zero_grad();
     auto loss = mse_loss(net.forward(x), y);
     loss->backward();

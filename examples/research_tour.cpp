@@ -10,13 +10,13 @@ int main() {
     // The README's first example: learn |x|^2, then differentiate what was learned
     {
         Sequential net;
-        net.add<Linear>(2, 32).add<GELU>().add<Linear>(32, 1);
+        net.add<Linear>(2, 64).add<GELU>().add<Linear>(64, 1);
         optim::AdamW opt(1e-2f);
 
         auto x = normal({256, 2});
         auto y = sum(square(x), 1);
         float first = 0.0f, last = 0.0f;
-        for (int step = 0; step < 500; ++step) {
+        for (int step = 0; step < 2000; ++step) {
             net.zero_grad();
             auto loss = mse_loss(net.forward(x), y);
             loss->backward();
@@ -25,9 +25,13 @@ int main() {
         }
         auto point = tensor({1, 2}, {1, 2}, Device::CPU, /*requires_grad=*/true);
         auto g = autograd::grad({sum(net.forward(point))}, {point}, {}, true, /*create_graph=*/true)[0];
-        std::cout << "|x|^2 fit: loss " << first << " -> " << last << ", gradient at (1, 2), near (2, 4): ";
-        g->show();
-        if (!(last < 0.1f * first)) return 1;
+        // The network's gradient, checked against a central difference of the network itself
+        NoGradGuard no_grad;
+        auto at = [&](float a, float b) { return net.forward(tensor({a, b}, {1, 2}))->item(); };
+        float h = 1e-2f, d0 = (at(1 + h, 2) - at(1 - h, 2)) / (2 * h), d1 = (at(1, 2 + h) - at(1, 2 - h)) / (2 * h);
+        std::cout << "|x|^2 fit: loss " << first << " -> " << last << "; gradient at (1, 2): autograd " << g->to_vector()[0] << ", "
+                  << g->to_vector()[1] << ", finite difference " << d0 << ", " << d1 << " (of |x|^2 itself: 2, 4)\n";
+        if (!(last < 0.1f * first) || std::fabs(g->to_vector()[0] - d0) > 0.05f || std::fabs(g->to_vector()[1] - d1) > 0.05f) return 1;
     }
 
     // Second derivatives: the Hessian of sum(x^3) is diag(6x)
