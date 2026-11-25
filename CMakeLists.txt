@@ -33,6 +33,7 @@ set(DUMMYGRAD_SOURCES
     src/core/parallel.cpp
     src/ops/ops.cpp
     src/kernels/kernels_host.cpp
+    src/linalg/dense.cpp
     src/backends/cpu/cpu_ops.cpp
     src/backends/cpu/cpu_gemm.cpp
     src/backends/tpu/pjrt_client.cpp

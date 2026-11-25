@@ -72,17 +72,22 @@ void micro_kernel(int64_t kc, const float* a, const float* b, float* c, int64_t 
         for (int r = 0; r < kRegs; ++r) store(c + i * ldc + r * kLanes, load(c + i * ldc + r * kLanes) + acc[i][r]);
 }
 
-// Element (i, j) of op(X)
-inline float at(bool trans, const float* x, int64_t ld, int64_t i, int64_t j) { return trans ? x[j * ld + i] : x[i * ld + j]; }
-
 void pack_a(bool trans, const float* a, int64_t lda, int64_t i0, int64_t mc, int64_t p0, int64_t kc, float* out) {
     for (int64_t i = 0; i < mc; i += kMR) {
         int64_t rows = std::min<int64_t>(kMR, mc - i);
-        for (int64_t p = 0; p < kc; ++p) {
-            for (int64_t r = 0; r < rows; ++r) out[r] = at(trans, a, lda, i0 + i + r, p0 + p);
-            for (int64_t r = rows; r < kMR; ++r) out[r] = 0.0f;
-            out += kMR;
+        if (rows < kMR) std::fill(out, out + kMR * kc, 0.0f);
+        if (trans) {
+            // op(A)'s rows are A's columns: each packed row of kMR is contiguous in memory
+            const float* src = a + p0 * lda + i0 + i;
+            if (rows == kMR) for (int64_t p = 0; p < kc; ++p) std::memcpy(out + p * kMR, src + p * lda, kMR * sizeof(float));
+            else for (int64_t p = 0; p < kc; ++p) std::memcpy(out + p * kMR, src + p * lda, (size_t)rows * sizeof(float));
+        } else {
+            for (int64_t r = 0; r < rows; ++r) {
+                const float* src = a + (i0 + i + r) * lda + p0;
+                for (int64_t p = 0; p < kc; ++p) out[p * kMR + r] = src[p];
+            }
         }
+        out += kMR * kc;
     }
 }
 
