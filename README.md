@@ -15,6 +15,11 @@ Got rid of Python and its bindings, GIL, multi-layer dispatcher overhead. It's a
 
 Full details for every release are in [CHANGELOG.md](CHANGELOG.md).
 
+### Next release: the research release (in development)
+- **Higher-order autograd:** `autograd::grad` with `create_graph`, Jacobians, Hessians, hooks, checkpointing. See [Research toolkit](#research-toolkit).
+- **The op library of a research framework:** about 250 ops, convolutions of every kind, recurrent and transformer layers, 15 optimizers, `linalg`, `fft`, `distributions`.
+- **2.4 to 2.7 times faster on CPU.**
+
 ### v0.8.0: the audit release
 - **A full audit of the codebase, every finding fixed.** Graphs whose backward never ran leaked (a reference cycle in attention, softmax, tanh and sigmoid); a bad token id corrupted GPU memory; multi-GPU training dropped or raced gradients; non-square CUDA masks, large max-pool inputs, RoPE positions past `max_seq_len` and mismatched head counts read or wrote out of bounds. See [CHANGELOG.md](CHANGELOG.md).
 - **Faster:** 12-21% fp32 and 4-11% fp16 per step over v0.7.0 on a T4. Every op that round-tripped through the host on CUDA (sum, mean, var, mse, conv, max-pool, concat, ...) has a GPU kernel; the tied LM head no longer copies the embedding's transpose.
@@ -102,7 +107,7 @@ Full details for every release are in [CHANGELOG.md](CHANGELOG.md).
 - **Fused, deterministic kernels**: RMSNorm, LayerNorm, cross entropy, embedding, RoPE, GQA head repetition and AdamW; reductions sum in a fixed order (no atomics), so identical runs give bitwise-identical gradients.
 - **Multi-GPU**: `MultiGPURunner` runs one replica per GPU in a single process and averages gradients GPU to GPU after each backward pass.
 - **Apple Silicon**: MPS tensors live in unified memory; a few elementwise ops, masks, loss gradients and AdamW run as Metal kernels, everything else on the CPU over the same memory. Not covered by tests.
-- **CPU SIMD Fallback**: Vectorized kernels for AVX2/FMA on x86_64 and NEON on ARM with optional OpenBLAS/oneMKL integration.
+- **CPU**: threaded, vectorized kernels (AVX2, AVX-512 or NEON, whatever the machine has) around OpenBLAS, Accelerate or MKL, or a built-in matrix multiply without one. Results do not depend on the thread count.
 
 ---
 
@@ -170,8 +175,9 @@ CMake prints whether it found CUDA (`Building with GPU support`) or is building 
 |---|---|---|
 | `ENABLE_CUDA` | `ON` | Build the CUDA backend when `nvcc` is found; set `OFF` to force CPU-only |
 | `CMAKE_CUDA_ARCHITECTURES` | `native` (CMake ≥ 3.24) | GPU generations to compile for, e.g. `75` for T4, `80` for A100, `89` for RTX 40xx |
-| `DUMMYGRAD_BUILD_TESTS` | `ON`* | Build the `test_engine` test suite |
-| `DUMMYGRAD_BUILD_EXAMPLES` | `ON`* | Build the examples: `quickstart`, `custom_op`, `train_lm`, `train_colab` |
+| `DUMMYGRAD_USE_BLAS` | `ON` | Use a BLAS library for CPU matrix products when one is found |
+| `DUMMYGRAD_BUILD_TESTS` | `ON`* | Build the test suites, `test_engine` and `test_research` |
+| `DUMMYGRAD_BUILD_EXAMPLES` | `ON`* | Build the examples: `quickstart`, `custom_op`, `research_tour`, `train_lm`, `train_colab` |
 
 \* Only when dummygrad is the top-level project; off when used inside your own project.
 
@@ -179,6 +185,7 @@ CMake prints whether it found CUDA (`Building with GPU support`) or is building 
 
 ```bash
 ./build/test_engine      # gradient checks, CUDA-vs-CPU checks, engine tests, training
+./build/test_research    # every op's first and second derivatives, values, layers, optimizers
 ./build/quickstart       # a tour of the API, trains a small network on XOR
 ```
 
@@ -346,9 +353,55 @@ for (int64_t step = 0; step < steps; ++step) {
 
 The scaler follows PyTorch's `GradScaler`: it starts at 65536, halves on overflow and doubles after 2000 clean steps. `scaler.skipped_steps()` counts skipped steps, and `scaler.save_to(state)` / `scaler.load_from(state)` carry it through `TrainingState` checkpoints. Use `dg_bench --fp16` to measure the speedup on your GPU.
 
+### Research toolkit
+
+[`examples/research_tour.cpp`](examples/research_tour.cpp) is a runnable tour. Tensors are `TensorPtr` (`std::shared_ptr<Tensor>`), ops are free functions with PyTorch's names and semantics, and every one is differentiable to second order.
+
+```cpp
+// Higher-order gradients: differentiate through a gradient
+auto dx = autograd::grad({score}, {x}, {}, /*retain_graph=*/true, /*create_graph=*/true)[0];
+auto penalty = mean(square(sub_scalar(norm(dx, 2.0f, 1), 1.0f)));
+penalty->backward();
+auto H = autograd::hessian(f, x);                          // also jacobian, hvp, vjp, jvp
+
+// Recompute a block in backward instead of storing its activations
+auto y = autograd::checkpoint([&](const TensorPtr& t) { return block.forward(t); }, x);
+
+// A new op from a value and a vector-Jacobian product; second derivatives come for free
+TensorPtr swishy(const TensorPtr& x) {
+    return autograd::custom_function("swishy", [](const TensorList& in) { return mul(in[0], sigmoid(in[0])); }, {x}, {/*save input*/ 0},
+        [](const OpContext& c, const TensorPtr& g) -> TensorList {
+            auto v = c.input(0); auto s = sigmoid(v);
+            return {mul(g, mul(s, add_scalar(mul(v, rsub_scalar(1.0f, s)), 1.0f)))};
+        });
+}
+
+auto scores = einsum("bqd,bkd->bqk", {q, k});
+auto [u, s, vt] = linalg::svd(a);                          // linalg: qr, eigh, cholesky, solve, ...
+auto spectrum = fft::rfft(signal);                         // complex tensors have a trailing dimension of 2
+distributions::Normal posterior(mu, sigma);
+auto z = posterior.rsample();                              // gradients flow to mu and sigma
+
+auto net = std::make_shared<Sequential>();
+net->add<Conv2d>(3, 64, 3, 1, 1).add<BatchNorm2d>(64).add<ReLU>().add<MaxPool2d>(2).add<Flatten>().add<Linear>(64 * 16 * 16, 10);
+LSTM lstm(128, 256, {/*layers=*/2, /*dropout=*/0.1f, /*bidirectional=*/true});
+optim::Muon muon(0.02f);                                   // optim: SGD, AdamW, NAdam, RAdam, Lion, LBFGS, ...
+optim::OneCycleLR schedule(0.02f, total_steps);
+```
+
+| Area | What is there |
+|---|---|
+| Autograd | `grad`, `create_graph`, `jacobian`, `hessian`, `hvp`, `vjp`, `jvp`, hooks, `retain_grad`, `checkpoint`, `custom_function`, anomaly detection, in-place-modification checks |
+| Ops | elementwise, broadcasting, views, indexing and scatter, reductions, sorting, `einsum`, convolutions, pooling, resampling, losses including CTC |
+| Layers | containers, convolutions, normalizations, dropout, recurrent, attention, transformers, pooling, embeddings |
+| Optimizers | SGD, Adam(W), AMSGrad, NAdam, RAdam, Adamax, Adagrad, Adadelta, RMSprop, Rprop, LBFGS, Lion, Muon, Adafactor; 11 schedules; EMA, SWA |
+| Numerics | `linalg`, `fft`, `distributions`, reproducible counter-based random numbers |
+
+On a GPU, factorizations, Fourier transforms, sorting and general `scatter` run on the host and copy their data there and back; everything else runs on the device. Run `./build/test_research` to check all of it on your machine.
+
 ### Writing your own ops
 
-A new op is a forward function plus a backward `Node`. [`examples/custom_op.cpp`](examples/custom_op.cpp) is a complete, compiled example (squared ReLU). The shape of it:
+`make_op` and `autograd::custom_function` ([Research toolkit](#research-toolkit)) are the short way. For full control over the kernels, a new op is a forward function plus a backward `Node`. [`examples/custom_op.cpp`](examples/custom_op.cpp) is a complete, compiled example (squared ReLU). The shape of it:
 
 ```cpp
 struct SquaredReluBackward : public Node {
@@ -679,6 +732,7 @@ dummygrad is pre-1.0: the core training path (CPU and CUDA, FP32) is covered by 
 
 - **Mixed precision covers matrix products.** Under `AutocastGuard`, CUDA matmuls and attention (on its cuBLAS path, up to 2048 tokens) run on fp16/bf16 tensor cores. Normalization and elementwise kernels, the softmax, and attention beyond 2048 tokens stay fp32. Tensors are always stored in fp32; non-fp32 tensors are only for storage and conversion. bf16 needs an Ampere or newer GPU.
 - **Attention** runs as cuBLAS GEMMs for sequences up to 2048 tokens (any head dimension) and as tiled kernels beyond that for head dimensions up to 128 (other sizes zero-padded to 16, 32, 64 or 128). Larger head dimensions past 2048 tokens use the GEMM path a chunk of heads at a time, whose memory is quadratic in the sequence length.
+- **Data types:** ops compute in fp32. There are no float64, integer, boolean or complex tensors: indices and masks are floats (exact up to 2^24), and complex numbers are pairs. `vmap`, sparse tensors, `torch.compile`-style fusion, and multi-process or sharded training are not implemented.
 - **Multi-GPU** runs in one process and averages gradients GPU to GPU, one parameter at a time (no bucketing or overlap with backward yet). Its test needs two GPUs (Kaggle's T4 x2).
 - **Metal and TPU** paths are not covered by the test suite (macOS CI runs the CPU backend; there is no TPU in CI).
 
