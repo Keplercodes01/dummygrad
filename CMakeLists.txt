@@ -171,6 +171,9 @@ endif()
 if(DUMMYGRAD_BUILD_BENCHMARKS)
     add_executable(dg_bench bench/bench.cpp)
     target_link_libraries(dg_bench PRIVATE dummygrad_engine)
+
+    add_executable(dg_bench_ops bench/bench_ops.cpp)
+    target_link_libraries(dg_bench_ops PRIVATE dummygrad_engine)
 endif()
 
 # Gradient-check test suite: `ctest --output-on-failure` or run ./test_engine directly

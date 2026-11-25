@@ -1,7 +1,7 @@
 #pragma once
 // Convolution, transposed convolution, pooling and resampling in 1, 2 and 3 spatial dimensions, with
 // PyTorch's argument conventions (weights [out, in / groups, ...]). Convolutions unfold the input into
-// columns and multiply; transposed convolutions multiply and fold. Included from functional.h.
+// columns and multiply, a few samples at a time; transposed convolutions multiply and fold. Included from functional.h.
 
 #include "loss_ops.h"
 
@@ -75,6 +75,94 @@ inline TensorPtr add_channel_bias(const TensorPtr& x, const TensorPtr& bias, int
     return add(x, reshape(bias, shape));
 }
 
+// Columns take kernel-size times the input's memory, so they are made for a few samples at a time
+inline std::atomic<int64_t> g_conv_column_bytes{(int64_t)128 << 20};
+
+// A convolution of x [B, C, ...] with weight [O, C / groups, ...] as products of matrices with the columns of x
+struct ConvShape {
+    kern::Windows w;
+    int64_t B, C, O, groups;
+    std::vector<int64_t> x_shape, weight_shape;
+    int64_t K() const { return w.kernel_size(); }
+    int64_t L() const { return w.out_size(); }
+    // Columns that are x itself
+    bool pointwise() const {
+        bool plain = K() == 1;
+        for (int d = 0; d < 3; ++d) plain = plain && w.stride[d] == 1 && w.pad[d] == 0;
+        return plain;
+    }
+    // [O, C K], or one matrix per group
+    TensorPtr matrix(const TensorPtr& weight) const {
+        return groups == 1 ? reshape(weight, {O, C * K()}) : reshape(weight, {1, groups, O / groups, C / groups * K()});
+    }
+    // [n, C K, L] (split in groups) of n samples
+    TensorPtr columns(const TensorPtr& x, int64_t n) const {
+        auto part = w;
+        part.planes = n * C;
+        auto col = pointwise() ? x : unfold_windows(x, part);
+        return groups == 1 ? reshape(col, {n, C * K(), L()}) : reshape(col, {n, groups, C / groups * K(), L()});
+    }
+    // The output of n samples, before and after it has spatial dimensions
+    TensorPtr rows(const TensorPtr& y, int64_t n) const {
+        return groups == 1 ? reshape(y, {n, O, L()}) : reshape(y, {n, groups, O / groups, L()});
+    }
+    TensorPtr input_gradient(const TensorPtr& weight, const TensorPtr& g, int64_t n) const {
+        auto part = w;
+        part.planes = n * C;
+        auto shape = x_shape;
+        shape[0] = n;
+        auto col = matmul(transpose(matrix(weight), -2, -1), rows(g, n));
+        return pointwise() ? reshape(col, shape) : fold_windows(reshape(col, {n * C, K(), L()}), shape, part);
+    }
+    TensorPtr weight_gradient(const TensorPtr& x, const TensorPtr& g, int64_t n) const {
+        return reshape(sum(matmul(rows(g, n), transpose(columns(x, n), -2, -1)), 0, false), weight_shape);
+    }
+    // Samples to take at once
+    int64_t chunk() const {
+        int64_t bytes = std::max<int64_t>(1, C * K() * L() * (int64_t)sizeof(float));
+        return std::max<int64_t>(1, std::min(B, g_conv_column_bytes / bytes));
+    }
+};
+
+// out [B, O, L]. The columns are made again for the gradient instead of being kept for it.
+inline TensorPtr conv_rows(const TensorPtr& x_in, const TensorPtr& weight_in, const ConvShape& s) {
+    if (s.pointwise()) return reshape(matmul(s.matrix(weight_in), s.columns(x_in, s.B)), {s.B, s.O, s.L()});
+    auto x = op_detail::dense(x_in), weight = op_detail::dense(weight_in);
+    const int64_t step = s.chunk();
+    const DType compute = autocast_dtype();
+    TensorPtr out;
+    {
+        NoGradGuard no_grad;
+        TensorList parts;
+        for (int64_t b = 0; b < s.B; b += step) {
+            int64_t n = std::min(step, s.B - b);
+            parts.push_back(reshape(matmul(s.matrix(weight), s.columns(narrow(x, 0, b, n), n)), {n, s.O, s.L()}));
+        }
+        out = parts.size() == 1 ? parts[0] : cat(parts, 0);
+        out = out->detach();
+    }
+    return make_op("conv", out, {x, weight}, {0, 1}, [s, step, compute](const OpContext& c, const TensorPtr& g) -> TensorList {
+        AutocastGuard autocast(compute);  // products in the precision the forward had
+        auto x = c.input(0), weight = c.input(1);
+        if (c.graph()) {
+            return {c.needs(0) ? s.input_gradient(weight, g, s.B) : nullptr, c.needs(1) ? s.weight_gradient(x, g, s.B) : nullptr};
+        }
+        auto gd = contiguous(g);
+        TensorList gx;
+        TensorPtr gw;
+        for (int64_t b = 0; b < s.B; b += step) {
+            int64_t n = std::min(step, s.B - b);
+            auto part = narrow(gd, 0, b, n);
+            if (c.needs(0)) gx.push_back(s.input_gradient(weight, part, n));
+            if (c.needs(1)) {
+                auto w = s.weight_gradient(narrow(x, 0, b, n), part, n);
+                gw = gw ? add(gw, w) : w;
+            }
+        }
+        return {gx.empty() ? nullptr : gx.size() == 1 ? gx[0] : cat(gx, 0), gw};
+    });
+}
+
 }  // namespace conv_detail
 
 // Cross-correlation of x [B, C, d1, ..] with weight [out, C / groups, k1, ..], for 1 to 3 spatial dims
@@ -89,16 +177,8 @@ inline TensorPtr conv_nd(const TensorPtr& x, const TensorPtr& weight, const Tens
     if (weight->shape[1] != C / groups) throw std::invalid_argument("conv: weight " + shape_string(weight->shape) + " does not match input " + shape_string(x->shape) + " with " + std::to_string(groups) + " groups");
     std::vector<int64_t> kernel(weight->shape.begin() + 2, weight->shape.end());
     auto w = conv_detail::windows(x->shape, n, kernel, stride, padding, dilation, "conv");
-    int64_t K = w.kernel_size(), L = w.out_size(), per_group = C / groups;
-    // [B, groups, C / groups * K, L]; a group's weight [O / groups, C / groups * K] multiplies it
-    auto col = conv_detail::unfold_windows(x, w);
-    TensorPtr out;
-    if (groups == 1) {
-        out = matmul(reshape(weight, {O, C * K}), reshape(col, {B, C * K, L}));
-    } else {
-        out = matmul(reshape(weight, {1, groups, O / groups, per_group * K}), reshape(col, {B, groups, per_group * K, L}));
-    }
-    out = reshape(out, conv_detail::spatial_out({B, O}, w, n));
+    conv_detail::ConvShape shape{w, B, C, O, groups, x->shape, weight->shape};
+    auto out = reshape(conv_detail::conv_rows(x, weight, shape), conv_detail::spatial_out({B, O}, w, n));
     return conv_detail::add_channel_bias(out, bias, n);
 }
 

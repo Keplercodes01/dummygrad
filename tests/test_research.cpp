@@ -849,6 +849,23 @@ static std::string values_conv() {
 }
 
 // CTC against a sum over every alignment
+// The same convolution in one piece and a sample at a time, with and without groups
+static std::string conv_chunks() {
+    for (int64_t groups : {1, 2}) {
+        auto x = input({5, 4, 6, 5}), w = input({6, 4 / groups, 3, 2}), b = input({6}), g = input({5, 6, 3, 4});
+        auto run_once = [&](int64_t bytes) {
+            auto before = conv_detail::g_conv_column_bytes.exchange(bytes);
+            auto xl = leaf_of(x->detach()), wl = leaf_of(w->detach()), bl = leaf_of(b->detach());
+            auto y = conv_nd(xl, wl, bl, {2, 1}, {1, 0}, {1}, groups);
+            y->backward(g);
+            conv_detail::g_conv_column_bytes = before;
+            return TensorList{y->detach(), xl->grad, wl->grad, bl->grad};
+        };
+        auto whole = run_once((int64_t)1 << 40), pieces = run_once(1);
+        for (size_t i = 0; i < whole.size(); ++i) CHECK(near(pieces[i], whole[i], 1e-5f, 1e-5f));
+    }
+    return "";
+}
 static std::string values_ctc() {
     auto lp = log_softmax(input({5, 1, 3}), 2);
     auto v = lp->to_vector();
@@ -1706,6 +1723,7 @@ int main(int argc, char** argv) {
     run("values/math", values_math);
     run("values/einsum", values_einsum);
     run("values/conv", values_conv);
+    run("values/conv_chunks", conv_chunks);
     run("values/ctc", values_ctc);
     run("values/losses", values_losses);
     run("values/random", values_random);
