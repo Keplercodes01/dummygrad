@@ -18,7 +18,7 @@ Full details for every release are in [CHANGELOG.md](CHANGELOG.md).
 ### Next release: the research release (in development)
 - **Higher-order autograd:** `autograd::grad` with `create_graph`, Jacobians, Hessians, hooks, checkpointing. See [Research toolkit](#research-toolkit).
 - **The op library of a research framework:** about 300 ops, convolutions of every kind, recurrent and transformer layers, 15 optimizers, `linalg`, `fft`, `distributions`.
-- **2.4 to 2.7 times faster on CPU.**
+- **2.4 to 3.3 times faster on CPU.**
 
 ### v0.8.0: the audit release
 - **A full audit of the codebase, every finding fixed.** Graphs whose backward never ran leaked (a reference cycle in attention, softmax, tanh and sigmoid); a bad token id corrupted GPU memory; multi-GPU training dropped or raced gradients; non-square CUDA masks, large max-pool inputs, RoPE positions past `max_seq_len` and mismatched head counts read or wrote out of bounds. See [CHANGELOG.md](CHANGELOG.md).

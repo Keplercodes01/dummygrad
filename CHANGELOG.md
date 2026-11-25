@@ -23,7 +23,7 @@ The research release: higher-order autograd, the op, layer, optimizer, linear-al
 - `-DDUMMYGRAD_USE_BLAS=OFF`, `set_num_threads`, `DUMMYGRAD_NUM_THREADS`.
 
 ### Faster
-- **CPU: 2.4 to 2.7 times faster training steps** than v0.8.0 on a 4-thread CI machine (OpenBLAS, same job): tiny 51.0 to 18.9 ms, small 1086 to 460 ms. Kernels run on a thread pool and vectorize (including `exp`, `log` and `tanh`), a shared weight's matmul is one GEMM over the whole batch, Linear adds its bias in place, the tied LM head multiplies by the transpose without copying, and backward runs on the calling thread.
+- **CPU: 2.4 to 3.3 times faster training steps** than v0.8.0 on 4-thread CI machines (OpenBLAS, both versions in one job): tiny 51.0 to 18.9 ms and small 1086 to 460 ms on one, 39.5 to 12.0 and 791 to 306 on another. Kernels run on a thread pool and vectorize (including `exp`, `log` and `tanh`), a shared weight's matmul is one GEMM over the whole batch, Linear adds its bias in place, the tied LM head multiplies by the transpose without copying, and backward runs on the calling thread.
 - Without a BLAS, a packed, vectorized, threaded matrix multiply replaces the triple loop.
 - **GPU (not yet measured):** broadcast, strided-copy and RoPE kernels index with 32-bit division, or none for equal shapes; an activation several matmuls read is converted to fp16 once and saved once.
 
