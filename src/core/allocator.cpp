@@ -9,7 +9,7 @@
 #endif
 
 void* CPUCachingAllocator::allocate(size_t bytes) {
-    size_t alloc_size = round_up(bytes);
+    size_t alloc_size = round_up(std::max<size_t>(bytes, 1));  // an empty tensor still needs a pointer
     std::lock_guard<std::mutex> lock(mtx);
     
     auto& blocks = free_blocks[alloc_size];
@@ -29,7 +29,7 @@ void* CPUCachingAllocator::allocate(size_t bytes) {
 
 void CPUCachingAllocator::free(void* ptr, size_t bytes) {
     if (!ptr) return;
-    size_t alloc_size = round_up(bytes);
+    size_t alloc_size = round_up(std::max<size_t>(bytes, 1));
     std::lock_guard<std::mutex> lock(mtx);
     
     // Instead of OS free(), we put it in the cache for instant reuse
@@ -48,7 +48,7 @@ void CPUCachingAllocator::empty_cache() {
 
 void* CUDACachingAllocator::allocate(size_t bytes) {
 #ifdef USE_CUDA
-    size_t alloc_size = round_up(bytes);
+    size_t alloc_size = round_up(std::max<size_t>(bytes, 1));
     int dev = 0;
     cudaGetDevice(&dev);
     std::lock_guard<std::mutex> lock(mtx);
@@ -93,7 +93,7 @@ void* CUDACachingAllocator::allocate(size_t bytes) {
 void CUDACachingAllocator::free(void* ptr, size_t bytes) {
     if (!ptr) return;
 #ifdef USE_CUDA
-    size_t alloc_size = round_up(bytes);
+    size_t alloc_size = round_up(std::max<size_t>(bytes, 1));
     std::lock_guard<std::mutex> lock(mtx);
     // Return the block to the pool of the GPU it was allocated on, not the caller's current device
     auto it = ptr_device.find(ptr);

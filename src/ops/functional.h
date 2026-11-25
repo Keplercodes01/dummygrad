@@ -2696,16 +2696,20 @@ struct CudaMatmulBackward : public Node {
 };
 #endif
 
-inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b) {
+// a @ b with batch broadcasting. The output is fp32; under autocast on a GPU, out_dtype = autocast_dtype()
+// keeps it in that dtype (as in linear).
+inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b,
+                                      DType out_dtype = DType::Float32) {
     DG_PROFILE_OP("matmul");
+    (void)out_dtype;  // CUDA only
     if (a->device != b->device) {
         throw std::runtime_error("matmul: devices mismatch between tensor a and tensor b");
     }
     if (a->ndim() < 1 || b->ndim() < 1) throw std::runtime_error("matmul: tensors must have at least one dimension");
     // A vector is a row on the left and a column on the right; its dimension is dropped afterwards
-    if (a->ndim() == 1 && b->ndim() == 1) return squeeze(squeeze(matmul(unsqueeze(a, 0), unsqueeze(b, 1)), 1), 0);
-    if (a->ndim() == 1) return squeeze(matmul(unsqueeze(a, 0), b), -2);
-    if (b->ndim() == 1) return squeeze(matmul(a, unsqueeze(b, 1)), -1);
+    if (a->ndim() == 1 && b->ndim() == 1) return squeeze(squeeze(matmul(unsqueeze(a, 0), unsqueeze(b, 1), out_dtype), 1), 0);
+    if (a->ndim() == 1) return squeeze(matmul(unsqueeze(a, 0), b, out_dtype), -2);
+    if (b->ndim() == 1) return squeeze(matmul(a, unsqueeze(b, 1), out_dtype), -1);
 #ifdef USE_CUDA
     if (a->device == Device::CUDA || b->device == Device::CUDA) {
         // The GEMMs broadcast a whole unbatched operand; batch dimensions that broadcast in part are expanded
@@ -2723,13 +2727,14 @@ inline std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const st
                 while (shape.size() < t->shape.size()) shape.insert(shape.begin(), 1);
                 return contiguous(expand(t, shape));
             };
-            return matmul(with_batch(a), with_batch(b));
+            return matmul(with_batch(a), with_batch(b), out_dtype);
         }
         DType compute = autocast_dtype();
         bool grad_a = needs_grad(a), grad_b = needs_grad(b);
         // dA = dC B^T needs only B and dB = A^T dC only A: keep just the operands backward will use
         std::shared_ptr<Tensor> saved_a, saved_b;
-        auto out = cuda::matmul(a, b, compute, grad_b ? &saved_a : nullptr, grad_a ? &saved_b : nullptr);
+        auto out = cuda::matmul(a, b, compute, grad_b ? &saved_a : nullptr, grad_a ? &saved_b : nullptr,
+                                out_dtype == compute ? compute : DType::Float32);
         out->requires_grad = grad_a || grad_b;
         if (grad_a || grad_b) {
             auto grad_fn = std::make_shared<CudaMatmulBackward>(a->shape, b->shape, a->dtype, b->dtype, std::move(saved_a),
@@ -2783,7 +2788,7 @@ inline std::shared_ptr<Tensor> linear(const std::shared_ptr<Tensor>& x, const st
     (void)out_dtype;  // CUDA only
     DG_PROFILE_OP("linear");
     if (!x || !w) throw std::invalid_argument("linear: null input or weight");
-    if (!b) return matmul(x, w);
+    if (!b) return matmul(x, w, out_dtype);
     if (w->ndim() != 2) throw std::invalid_argument("linear: weight must be 2-D [in, out], got " + shape_string(w->shape));
     if (b->size() != w->shape[1]) {
         throw std::invalid_argument("linear: bias " + shape_string(b->shape) + " does not match " +
@@ -2827,4 +2832,5 @@ inline std::shared_ptr<Tensor> linear(const std::shared_ptr<Tensor>& x, const st
 #include "contract_ops.h"
 #include "loss_ops.h"
 #include "conv_ops.h"
+#include "operators.h"
 #include "graph_backward.h"

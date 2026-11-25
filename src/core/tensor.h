@@ -11,6 +11,8 @@
 
 #include <type_traits>
 
+class IndexItem;  // ops/operators.h
+
 class Tensor : public std::enable_shared_from_this<Tensor> {
 public:
     std::shared_ptr<Storage> storage;
@@ -131,6 +133,11 @@ public:
     void register_hook(std::function<std::shared_ptr<Tensor>(const std::shared_ptr<Tensor>&)> hook);
     // Keeps the gradient of a non-leaf tensor in grad
     void retain_grad();
+
+    // x->index({Slice(1, 3), 0, Ellipsis}): see ops/operators.h. index_put returns a changed copy.
+    inline std::shared_ptr<Tensor> index(const std::vector<IndexItem>& items);
+    inline std::shared_ptr<Tensor> index_put(const std::vector<IndexItem>& items, const std::shared_ptr<Tensor>& value,
+                                             bool accumulate = false);
 };
 
 // Host<->accelerator copies made through Tensor::to, counted process-wide. Every copy inside a

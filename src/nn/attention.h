@@ -3,6 +3,7 @@
 #include "functional.h"
 #include "linear.h"
 #include "modern_layers.h"
+#include "kv_cache.h"
 
 #ifdef USE_CUDA
 // Backward of the CUDA attention kernel; q, k, v, out are contiguous [batch, heads, seq, head_dim]
@@ -228,39 +229,59 @@ public:
     int d_k;
     bool causal;
 
-    // Number of key/value heads (n_kv_heads, or n_heads when 0) after checking the head layout:
-    // n_heads must divide d_model and the kv heads must divide n_heads, or the attention kernels
-    // would index past K and V
-    static int checked_kv_heads(int d_model, int n_heads, int n_kv_heads) {
-        if (n_heads <= 0 || d_model <= 0 || d_model % n_heads != 0) {
+    struct Options {
+        int n_kv_heads = 0;  // key and value heads (0: n_heads)
+        bool causal = false;
+        bool qkv_bias = true, out_bias = true;
+        int head_dim = 0;    // width of one head (0: d_model / n_heads)
+    };
+
+    // Width of one head, after checking the layout: the kv heads must divide the heads, or the attention
+    // kernels would index past K and V
+    static int checked_head_dim(int d_model, int n_heads, const Options& o) {
+        if (n_heads <= 0 || d_model <= 0 || o.head_dim < 0 || (o.head_dim == 0 && d_model % n_heads != 0)) {
             throw std::invalid_argument("MultiHeadAttention: d_model (" + std::to_string(d_model) +
                                         ") must be a positive multiple of n_heads (" + std::to_string(n_heads) + ")");
         }
-        int kv = n_kv_heads > 0 ? n_kv_heads : n_heads;
-        if (n_kv_heads < 0 || kv > n_heads || n_heads % kv != 0) {
-            throw std::invalid_argument("MultiHeadAttention: n_kv_heads (" + std::to_string(n_kv_heads) +
+        int kv = o.n_kv_heads > 0 ? o.n_kv_heads : n_heads;
+        if (o.n_kv_heads < 0 || kv > n_heads || n_heads % kv != 0) {
+            throw std::invalid_argument("MultiHeadAttention: n_kv_heads (" + std::to_string(o.n_kv_heads) +
                                         ") must divide n_heads (" + std::to_string(n_heads) + ")");
         }
-        return kv;
+        return o.head_dim > 0 ? o.head_dim : d_model / n_heads;
     }
 
     MultiHeadAttention(int d_model, int n_heads, int n_kv_heads = 0, bool causal = false)
-        : W_q(d_model, d_model),
-          W_k(d_model, checked_kv_heads(d_model, n_heads, n_kv_heads) * (d_model / n_heads)),
-          W_v(d_model, (n_kv_heads > 0 ? n_kv_heads : n_heads) * (d_model / n_heads)),
-          W_o(d_model, d_model),
+        : MultiHeadAttention(d_model, n_heads, make_options(n_kv_heads, causal)) {}
+
+    // W_q comes first, so a bad layout throws before anything is allocated
+    MultiHeadAttention(int d_model, int n_heads, const Options& o)
+        : W_q(d_model, n_heads * checked_head_dim(d_model, n_heads, o), 0.0f, o.qkv_bias),
+          W_k(d_model, (o.n_kv_heads > 0 ? o.n_kv_heads : n_heads) * checked_head_dim(d_model, n_heads, o), 0.0f, o.qkv_bias),
+          W_v(d_model, (o.n_kv_heads > 0 ? o.n_kv_heads : n_heads) * checked_head_dim(d_model, n_heads, o), 0.0f, o.qkv_bias),
+          W_o(n_heads * checked_head_dim(d_model, n_heads, o), d_model, 0.0f, o.out_bias),
           d_model(d_model),
           n_heads(n_heads),
-          n_kv_heads(n_kv_heads > 0 ? n_kv_heads : n_heads),
-          d_k(d_model / n_heads),
-          causal(causal) {}
+          n_kv_heads(o.n_kv_heads > 0 ? o.n_kv_heads : n_heads),
+          d_k(checked_head_dim(d_model, n_heads, o)),
+          causal(o.causal) {}
 
+    static Options make_options(int n_kv_heads, bool causal) {
+        Options o;
+        o.n_kv_heads = n_kv_heads;
+        o.causal = causal;
+        return o;
+    }
+
+    // Queries attend to this call's tokens, or with a cache to those of earlier calls as well (inference; the
+    // cache decides start_pos, and a mask must then cover every key: [.., S, cached + S])
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x_in,
                                     const std::shared_ptr<Tensor>& mask = nullptr,
                                     const std::shared_ptr<Tensor>& cos_freqs = nullptr,
                                     const std::shared_ptr<Tensor>& sin_freqs = nullptr,
-                                    int start_pos = 0) {
+                                    int start_pos = 0, KVCache* cache = nullptr) {
         if (!x_in) throw std::runtime_error("MultiHeadAttention: input tensor is null");
+        if (cache) start_pos = (int)cache->length;
         if (x_in->ndim() < 2) throw std::runtime_error("MultiHeadAttention: input must be at least 2D (S, D) or (B, S, D)");
         auto x = x_in;
         bool is_2d = (x->ndim() == 2);
@@ -291,6 +312,17 @@ public:
         auto K_split = transpose(K_4d, 1, 2);
         auto V_split = transpose(reshape(V, {B, S, n_kv_heads, d_k}), 1, 2);
 
+        // With a cache, the queries see the tokens of earlier calls too
+        int64_t past = 0;
+        if (cache) {
+            past = cache->length;
+            auto stored = cache->append(K_split, V_split);
+            if (past > 0) {
+                K_split = stored.first;
+                V_split = stored.second;
+            }
+        }
+
         // Grouped Query Attention (GQA): each kv head serves a group of query heads
         if (n_kv_heads < n_heads) {
             int64_t group = n_heads / n_kv_heads;
@@ -303,7 +335,7 @@ public:
 
         std::shared_ptr<Tensor> attn_out;
 #ifdef USE_CUDA
-        if (x->device == Device::CUDA && !mask) {
+        if (x->device == Device::CUDA && !mask && past == 0) {
             DG_PROFILE_OP("attention");
             // The tiled kernels and a mix of dtypes run in fp32
             bool half_io = native_half(Q_split) && native_half(K_split) && native_half(V_split) &&
@@ -333,23 +365,19 @@ public:
                 grad_fn->add_next_edge(get_grad_edge(V_split).function);
                 attn_out->grad_fn = grad_fn;
             }
-        } else {
+        } else
+#endif
+        {
             auto scores = mul_scalar(matmul(Q_split, transpose(K_split, -2, -1)), scale);
             if (mask) scores = add(scores, mask);
-            else if (causal) scores = causal_mask(scores);
+            else if (causal && past == 0) scores = causal_mask(scores);
+            else if (causal && S > 1) scores = add(scores, cached_causal_mask(S, past, x->device));
             auto weights = softmax(scores);
             attn_out = matmul(weights, V_split); // [B, n_heads, S, d_k]
         }
-#else
-        auto scores = mul_scalar(matmul(Q_split, transpose(K_split, -2, -1)), scale);
-        if (mask) scores = add(scores, mask);
-        else if (causal) scores = causal_mask(scores);
-        auto weights = softmax(scores);
-        attn_out = matmul(weights, V_split); // [B, n_heads, S, d_k]
-#endif
 
-        // Transpose back to [B, S, n_heads, d_k] -> Reshape to [B, S, d_model]
-        auto merged = reshape(transpose(attn_out, 1, 2), {B, S, d_model});
+        // Transpose back to [B, S, n_heads, d_k] -> Reshape to [B, S, n_heads * d_k]
+        auto merged = reshape(transpose(attn_out, 1, 2), {B, S, n_heads * d_k});
 
         // Final output projection
         auto out = W_o.forward(merged);

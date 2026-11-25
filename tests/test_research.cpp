@@ -6,114 +6,9 @@
 //
 // Exit code is 0 only if every test passes. An argument runs only tests whose name contains it.
 
-#include "dummy_core.h"
-#ifdef USE_CUDA
-#include <cuda_runtime.h>
-#endif
-
-#include <chrono>
-#include <cmath>
-#include <cstdio>
-#include <functional>
-#include <iostream>
-#include <random>
-#include <sstream>
-#include <string>
-#include <vector>
+#include "test_util.h"
 
 using Fn = std::function<TensorPtr(const TensorList&, Device)>;
-
-static std::string g_filter;
-static int g_passed = 0;
-static std::vector<std::string> g_failures;
-static std::mt19937 g_rng(7);
-
-static void run(const std::string& name, const std::function<std::string()>& body) {
-    if (!g_filter.empty() && name.find(g_filter) == std::string::npos) return;
-    std::string err;
-    try {
-        err = body();
-    } catch (const std::exception& e) {
-        err = std::string("threw: ") + e.what();
-    }
-    if (err.empty()) {
-        ++g_passed;
-    } else {
-        g_failures.push_back(name + ": " + err);
-        std::cout << "[FAIL] " << name << ": " << err << std::endl;
-    }
-}
-
-static bool has_cuda() {
-#ifdef USE_CUDA
-    int n = 0;
-    return cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
-#else
-    return false;
-#endif
-}
-
-// Values uniform on [lo, hi], at least min_abs away from 0 and from each other's kinks
-static TensorPtr input(const std::vector<int64_t>& shape, float lo = -1.0f, float hi = 1.0f, float min_abs = 0.0f) {
-    std::uniform_real_distribution<float> dist(lo, hi);
-    int64_t n = 1;
-    for (int64_t d : shape) n *= d;
-    std::vector<float> v((size_t)n);
-    for (auto& x : v) do { x = dist(g_rng); } while (std::fabs(x) < min_abs);
-    return tensor(v, shape);
-}
-// Shuffled, evenly spaced values, so maxima and orderings survive a finite-difference step
-static TensorPtr distinct(const std::vector<int64_t>& shape, float gap = 0.15f, float offset = 0.05f) {
-    int64_t n = 1;
-    for (int64_t d : shape) n *= d;
-    std::vector<float> v((size_t)n);
-    for (int64_t i = 0; i < n; ++i) v[(size_t)i] = gap * (float)(i - n / 2) + offset;
-    std::shuffle(v.begin(), v.end(), g_rng);
-    return tensor(v, shape);
-}
-
-static std::string near(const std::vector<float>& a, const std::vector<float>& b, float atol, float rtol = 0.0f) {
-    if (a.size() != b.size()) return "sizes " + std::to_string(a.size()) + " and " + std::to_string(b.size());
-    for (size_t i = 0; i < a.size(); ++i) {
-        if (std::isnan(a[i]) && std::isnan(b[i])) continue;
-        if (a[i] == b[i]) continue;
-        if (!(std::fabs(a[i] - b[i]) <= atol + rtol * std::max(std::fabs(a[i]), std::fabs(b[i])))) {
-            std::ostringstream os;
-            os << "element " << i << ": got " << a[i] << ", expected " << b[i];
-            return os.str();
-        }
-    }
-    return "";
-}
-static std::string near(const TensorPtr& a, const std::vector<float>& b, float atol = 1e-5f, float rtol = 1e-5f) { return near(a->to_vector(), b, atol, rtol); }
-// A template, so that a braced list is never taken for a tensor
-template <typename T, typename = std::enable_if_t<std::is_same_v<T, TensorPtr>>>
-static std::string near(const TensorPtr& a, const T& b, float atol = 1e-5f, float rtol = 1e-5f) {
-    if (a->shape != b->shape) return "shapes " + shape_string(a->shape) + " and " + shape_string(b->shape);
-    return near(a->to_vector(), b->to_vector(), atol, rtol);
-}
-static std::string scalar(const TensorPtr& a, float b, float atol = 1e-5f, float rtol = 1e-5f) { return near(std::vector<float>{a->item()}, {b}, atol, rtol); }
-static std::string shape_is(const TensorPtr& a, const std::vector<int64_t>& s) { return a->shape == s ? "" : "shape " + shape_string(a->shape) + ", expected " + shape_string(s); }
-static std::string expect_throw(const std::function<void()>& f, const std::string& what) {
-    try {
-        f();
-    } catch (const std::exception&) {
-        return "";
-    }
-    return what + " did not throw";
-}
-#define CHECK(expr)                             \
-    do {                                        \
-        std::string err_ = (expr);              \
-        if (!err_.empty()) return #expr ": " + err_; \
-    } while (0)
-
-static TensorPtr leaf_of(const TensorPtr& t) {
-    if (t->requires_grad) return t;
-    auto l = t->detach();
-    l->requires_grad = true;
-    return l;
-}
 
 struct OpTest {
     std::string name;
@@ -522,6 +417,20 @@ static void build_ops() {
     op("irfft_odd", {input({1, 4, 2})}, [](const TensorList& x, Device) { return fft::irfft(x[0], -1, 7); });
     op("fft_convolve", {input({5}), input({3})}, [](const TensorList& x, Device) { return fft::fft_convolve(x[0], x[1]); });
     op("stft", {input({1, 16})}, [](const TensorList& x, Device d) { return fft::stft(x[0], 8, 4, fft::hann_window(8)->to(d)); });
+
+    // Operators and indexing
+    op("operators", {input({2, 3}), input({3}, 0.5f, 1.5f)}, [](const TensorList& x, Device) { return (x[0] * x[1] - 2.0f) / (x[1] + 1.0f) - 0.5f * -x[0]; });
+    op("index_slices", {input({3, 4, 5})}, [](const TensorList& x, Device) { return x[0]->index({Slice(1), Ellipsis, Slice(std::nullopt, std::nullopt, -2)}); });
+    op("index_mixed", {input({3, 4, 5})}, [](const TensorList& x, Device) { return x[0]->index({1, NewAxis, Slice(0, 3, 2)}); });
+    op("index_rows", {input({3, 4})}, [](const TensorList& x, Device d) { return x[0]->index({tensor({2, 0, -1}, {3}, d)}); });
+    op("index_pairs", {input({3, 4, 2})}, [](const TensorList& x, Device d) { return x[0]->index({tensor({2, 0}, {2}, d), tensor({1, -1}, {2}, d)}); });
+    op("index_split", {input({3, 2, 4})}, [](const TensorList& x, Device d) { return x[0]->index({tensor({2, 0}, {2, 1}, d), Slice(), tensor({1, 3, 3}, {3}, d)}); });
+    op("index_middle", {input({2, 3, 4})}, [](const TensorList& x, Device d) { return x[0]->index({Slice(), tensor({2, 0}, {2}, d), tensor({1, 3}, {2}, d)}); });
+    op("index_mask", {input({2, 3})}, [](const TensorList& x, Device d) { return x[0]->index({Mask(tensor({1, 0, 1, 0, 1, 1}, {2, 3}, d))}); });
+    op("index_put_slice", {input({3, 4}), input({2, 1})}, [](const TensorList& x, Device) { return x[0]->index_put({Slice(0, 2), Slice(1)}, x[1]); });
+    op("index_put_add", {input({3, 4}), input({4})}, [](const TensorList& x, Device) { return x[0]->index_put({1}, x[1], true); });
+    op("index_put_rows", {input({3, 4}), input({2, 4})}, [](const TensorList& x, Device d) { return x[0]->index_put({tensor({2, 0}, {2}, d)}, x[1]); });
+    op("index_put_repeated", {input({4}), input({3})}, [](const TensorList& x, Device d) { return x[0]->index_put({tensor({1, 3, 1}, {3}, d)}, x[1], true); });
 
     // Distributions
     op("normal_log_prob", {input({4}), input({4}, 0.5f, 1.5f), input({4})}, [](const TensorList& x, Device) { return distributions::Normal(x[0], x[1]).log_prob(x[2]); });
@@ -1565,7 +1474,5 @@ int main(int argc, char** argv) {
     run("optim/schedules", schedules);
     run("optim/averaging", averaging);
 
-    std::cout << "\n" << g_passed << " passed, " << g_failures.size() << " failed\n";
-    for (const auto& f : g_failures) std::cout << "  FAILED " << f << "\n";
-    return g_failures.empty() ? 0 : 1;
+    return report();
 }

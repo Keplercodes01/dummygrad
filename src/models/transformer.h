@@ -42,10 +42,10 @@ public:
         : ln1(d_model), attn(d_model, n_heads, /*n_kv_heads=*/0, causal), ln2(d_model), ffn(d_model, d_ff) {}
 
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x,
-                                    const std::shared_ptr<Tensor>& mask = nullptr) {
+                                    const std::shared_ptr<Tensor>& mask = nullptr, KVCache* cache = nullptr) {
         // Pre-LN Residual Connection 1: x = x + Attention(LN1(x))
         auto norm1 = ln1.forward(x);
-        auto attn_out = attn.forward(norm1, mask);
+        auto attn_out = attn.forward(norm1, mask, nullptr, nullptr, 0, cache);
         auto x1 = add(x, attn_out);
 
         // Pre-LN Residual Connection 2: x = x + FFN(LN2(x))
@@ -142,6 +142,19 @@ public:
         return matmul_nt(x_norm, token_emb.weight);
     }
 
+    // Logits of new tokens [batch, time] that follow the ones in the caches (one cache per block; an empty
+    // vector starts a new sequence). last_only computes just the last position's logits. Inference only.
+    std::shared_ptr<Tensor> forward_cached(const std::shared_ptr<Tensor>& input_ids, std::vector<KVCache>& caches, bool last_only = true) {
+        if (!input_ids || input_ids->ndim() != 2) throw std::invalid_argument("GPT::forward_cached: input_ids must be [batch, time]");
+        if (caches.empty()) caches.resize(blocks.size());
+        if (caches.size() != blocks.size()) throw std::invalid_argument("GPT::forward_cached: one cache per block is needed");
+        int64_t T = input_ids->shape[1], past = caches[0].length;
+        auto x = add(token_emb.forward(input_ids), pos_emb.forward(arange((double)past, (double)(past + T))));
+        for (size_t i = 0; i < blocks.size(); ++i) x = blocks[i]->forward(x, nullptr, &caches[i]);
+        if (last_only && T > 1) x = contiguous(narrow(x, 1, T - 1, 1));
+        return matmul_nt(ln_f.forward(x), token_emb.weight);
+    }
+
     void visit(ModuleVisitor& v) override {
         v.module("token_emb", token_emb);
         v.module("pos_emb", pos_emb);
@@ -154,6 +167,19 @@ public:
 // Modern Transformer Block (RMSNorm + Attention/RoPE + SwiGLU)
 // Architecture standard across LLaMA 3, Mistral, Gemma 2, Qwen 2, and DeepSeek
 // ============================================================================
+struct ModernTransformerConfig {
+    int vocab_size = 0, max_seq_len = 0, d_model = 0, n_heads = 0, n_layers = 0;
+    int n_kv_heads = 0;   // 0: n_heads
+    int hidden_dim = 0;   // of the feed-forward blocks (0: 8/3 d_model)
+    int head_dim = 0;     // 0: d_model / n_heads
+    bool qkv_bias = true, out_bias = true, ffn_bias = true;
+    float norm_eps = 1e-6f;
+    float rope_theta = 10000.0f;
+    RopeScaling rope_scaling;
+    bool tie_embeddings = true;  // false: a separate output matrix, lm_head
+    bool causal = true;
+};
+
 class ModernTransformerBlock : public Module {
 public:
     RMSNorm rms1;
@@ -167,14 +193,30 @@ public:
           rms2(d_model),
           ffn(d_model, hidden_dim) {}
 
+    explicit ModernTransformerBlock(const ModernTransformerConfig& c)
+        : rms1(c.d_model, c.norm_eps),
+          attn(c.d_model, c.n_heads, attention_options(c)),
+          rms2(c.d_model, c.norm_eps),
+          ffn(c.d_model, c.hidden_dim, c.ffn_bias) {}
+
+    static MultiHeadAttention::Options attention_options(const ModernTransformerConfig& c) {
+        MultiHeadAttention::Options o;
+        o.n_kv_heads = c.n_kv_heads;
+        o.causal = c.causal;
+        o.qkv_bias = c.qkv_bias;
+        o.out_bias = c.out_bias;
+        o.head_dim = c.head_dim;
+        return o;
+    }
+
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x,
                                     const std::shared_ptr<Tensor>& mask = nullptr,
                                     const std::shared_ptr<Tensor>& cos_t = nullptr,
                                     const std::shared_ptr<Tensor>& sin_t = nullptr,
-                                    int start_pos = 0) {
+                                    int start_pos = 0, KVCache* cache = nullptr) {
         // Pre-RMSNorm Residual Connection 1: x = x + Attention(RMSNorm1(x), RoPE)
         auto h1 = rms1.forward(x);
-        auto attn_out = attn.forward(h1, mask, cos_t, sin_t, start_pos);
+        auto attn_out = attn.forward(h1, mask, cos_t, sin_t, start_pos, cache);
         auto x1 = add(x, attn_out);
 
         // Pre-RMSNorm Residual Connection 2: x = x + SwiGLU(RMSNorm2(x1))
@@ -214,27 +256,47 @@ public:
 
     std::shared_ptr<Tensor> cos_freqs;
     std::shared_ptr<Tensor> sin_freqs;
+    std::shared_ptr<Tensor> lm_head;  // [vocab, d_model]; null when the embedding is the output matrix too
+    ModernTransformerConfig config;
+
+    static ModernTransformerConfig make_config(int vocab_size, int max_seq_len, int d_model, int n_heads, int n_layers, int n_kv_heads, int hidden_dim) {
+        ModernTransformerConfig c;
+        c.vocab_size = vocab_size;
+        c.max_seq_len = max_seq_len;
+        c.d_model = d_model;
+        c.n_heads = n_heads;
+        c.n_layers = n_layers;
+        c.n_kv_heads = n_kv_heads;
+        c.hidden_dim = hidden_dim;
+        return c;
+    }
 
     ModernTransformer(int vocab_size, int max_seq_len, int d_model, int n_heads, int n_layers, int n_kv_heads = 0, int hidden_dim = 0)
-        : token_emb(vocab_size, d_model),
-          rms_f(d_model),
-          vocab_size(vocab_size),
-          max_seq_len(max_seq_len),
-          d_model(d_model),
-          n_heads(n_heads),
-          n_kv_heads(n_kv_heads > 0 ? n_kv_heads : n_heads),
-          head_dim(d_model / n_heads) {
+        : ModernTransformer(make_config(vocab_size, max_seq_len, d_model, n_heads, n_layers, n_kv_heads, hidden_dim)) {}
+
+    explicit ModernTransformer(const ModernTransformerConfig& c)
+        : token_emb(c.vocab_size, c.d_model),
+          rms_f(c.d_model, c.norm_eps),
+          vocab_size(c.vocab_size),
+          max_seq_len(c.max_seq_len),
+          d_model(c.d_model),
+          n_heads(c.n_heads),
+          n_kv_heads(c.n_kv_heads > 0 ? c.n_kv_heads : c.n_heads),
+          head_dim(c.head_dim > 0 ? c.head_dim : c.d_model / std::max(1, c.n_heads)),
+          config(c) {
+        const int n_layers = c.n_layers;
         if (n_layers <= 0) throw std::invalid_argument("ModernTransformer: n_layers must be > 0");
         if (n_heads <= 0) throw std::invalid_argument("ModernTransformer: n_heads must be > 0");
-        if (d_model <= 0 || d_model % n_heads != 0) throw std::invalid_argument("ModernTransformer: d_model must be positive and divisible by n_heads");
+        if (d_model <= 0 || (c.head_dim <= 0 && d_model % n_heads != 0)) throw std::invalid_argument("ModernTransformer: d_model must be positive and divisible by n_heads");
 
         // Precompute RoPE rotary frequency tables once at model construction
-        auto [c_t, s_t] = precompute_freqs_cis(head_dim, max_seq_len);
+        auto [c_t, s_t] = precompute_freqs_cis(head_dim, max_seq_len, c.rope_theta, c.rope_scaling);
         cos_freqs = c_t;
         sin_freqs = s_t;
+        if (!c.tie_embeddings) lm_head = xavier({c.vocab_size, c.d_model});
 
         for (int i = 0; i < n_layers; i++) {
-            blocks.push_back(std::make_shared<ModernTransformerBlock>(d_model, n_heads, n_kv_heads, hidden_dim, true));
+            blocks.push_back(std::make_shared<ModernTransformerBlock>(c));
 
             // Scale residual projections at initialization to prevent variance explosion
             float scale = 1.0f / std::sqrt(2.0f * n_layers);
@@ -269,13 +331,29 @@ public:
         auto x_norm = rms_f.forward(x);
 
         // Tied LM head: x_norm @ embedding^T, without materializing the transpose
-        return matmul_nt(x_norm, token_emb.weight);
+        return matmul_nt(x_norm, output_matrix());
     }
+
+    // Logits of new tokens [batch, time] that follow the ones in the caches (one cache per block; an empty
+    // vector starts a new sequence). last_only computes just the last position's logits. Inference only.
+    std::shared_ptr<Tensor> forward_cached(const std::shared_ptr<Tensor>& input_ids, std::vector<KVCache>& caches, bool last_only = true) {
+        if (!input_ids || input_ids->ndim() != 2) throw std::invalid_argument("ModernTransformer::forward_cached: input_ids must be [batch, time]");
+        if (caches.empty()) caches.resize(blocks.size());
+        if (caches.size() != blocks.size()) throw std::invalid_argument("ModernTransformer::forward_cached: one cache per block is needed");
+        int64_t T = input_ids->shape[1];
+        auto x = token_emb.forward(input_ids);
+        for (size_t i = 0; i < blocks.size(); ++i) x = blocks[i]->forward(x, nullptr, cos_freqs, sin_freqs, 0, &caches[i]);
+        if (last_only && T > 1) x = contiguous(narrow(x, 1, T - 1, 1));
+        return matmul_nt(rms_f.forward(x), output_matrix());
+    }
+
+    const std::shared_ptr<Tensor>& output_matrix() const { return lm_head ? lm_head : token_emb.weight; }
 
     void visit(ModuleVisitor& v) override {
         v.module("token_emb", token_emb);
         for (size_t i = 0; i < blocks.size(); ++i) v.module("blocks." + std::to_string(i), *blocks[i]);
         v.module("rms_f", rms_f);
+        if (lm_head) v.parameter("lm_head", lm_head);
         // RoPE tables are recomputed at construction, so they move with the model but aren't saved
         v.buffer("cos_freqs", cos_freqs, /*persistent=*/false);
         v.buffer("sin_freqs", sin_freqs, /*persistent=*/false);

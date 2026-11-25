@@ -7,6 +7,8 @@
 #include "core/tensor.h"
 #include "core/autocast.h"
 #include "core/utils.h"
+#include "core/mapped_file.h"
+#include "json.h"
 #include "core/init.h"
 #include "core/dummy_wrappers.h"
 
@@ -32,9 +34,11 @@
 
 // 5. Neural Network Layers & Optimizers
 #include "nn/linear.h"
+#include "nn/lora.h"
 #include "nn/embedding.h"
 #include "nn/layernorm.h"
 #include "nn/modern_layers.h"
+#include "nn/moe.h"
 #include "nn/attention.h"
 #include "nn/conv1d.h"
 #include "nn/conv2d.h"
@@ -45,9 +49,11 @@
 #include "nn/optimizers.h"
 #include "nn/optim.h"
 
-// 6. Reference Architectures
+// 6. Reference Architectures, Generation & Pretrained Weights
 #include "models/transformer.h"
 #include "models/mars.h"
+#include "nn/generate.h"
+#include "models/pretrained.h"
 
 // Multi-GPU Distributed Engine & Checkpoint Serialization
 #include "multi_gpu.h"

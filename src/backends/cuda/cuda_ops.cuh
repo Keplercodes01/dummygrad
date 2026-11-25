@@ -22,7 +22,7 @@ namespace cuda {
     std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b,
                                    DType compute = DType::Float32,
                                    std::shared_ptr<Tensor>* saved_a = nullptr,
-                                   std::shared_ptr<Tensor>* saved_b = nullptr);
+                                   std::shared_ptr<Tensor>* saved_b = nullptr, DType out_dtype = DType::Float32);
     // a @ b^T for a 2-D b stored [N, K] (a tied LM head reading the [vocab, d] embedding), with no
     // transposed copy: the GEMM reads b transposed. Backward: matmul_backward with trans_b.
     std::shared_ptr<Tensor> matmul_nt(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b,

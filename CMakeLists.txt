@@ -174,4 +174,8 @@ if(DUMMYGRAD_BUILD_TESTS)
     add_executable(test_research tests/test_research.cpp)
     target_link_libraries(test_research PRIVATE dummygrad_engine)
     add_test(NAME test_research COMMAND test_research)
+
+    add_executable(test_models tests/test_models.cpp)
+    target_link_libraries(test_models PRIVATE dummygrad_engine)
+    add_test(NAME test_models COMMAND test_models)
 endif()

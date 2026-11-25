@@ -10,16 +10,8 @@
 #include <stdexcept>
 #include <iostream>
 
-#if defined(__unix__) || defined(__APPLE__)
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#define HAS_MMAP 1
-#else
-#define HAS_MMAP 0
-#endif
-
+#include "json.h"
+#include "mapped_file.h"
 #include "tensor.h"
 #include "types.h"
 
@@ -68,15 +60,45 @@ inline std::string dtype_to_safetensors_str(DType dt) {
     }
 }
 
-// Throws for dtypes dummygrad has no type for (F64, I32, I64, U8, BOOL, ...): reading their bytes
-// as Float32 would load garbage without an error
-inline DType safetensors_str_to_dtype(const std::string& str, const std::string& tensor_name = "") {
-    if (str == "F32" || str == "float32") return DType::Float32;
-    if (str == "F16" || str == "float16") return DType::Float16;
-    if (str == "BF16" || str == "bfloat16") return DType::BFloat16;
-    if (str == "I8" || str == "int8") return DType::Int8;
-    throw std::runtime_error("load_safetensors: unsupported dtype \"" + str + "\"" +
-                             (tensor_name.empty() ? std::string() : " for tensor " + tensor_name));
+// Bytes per element of a safetensors dtype, or 0 if unknown
+inline size_t safetensors_dtype_size(const std::string& s) {
+    if (s == "F64" || s == "I64" || s == "U64") return 8;
+    if (s == "F32" || s == "I32" || s == "U32") return 4;
+    if (s == "F16" || s == "BF16" || s == "I16" || s == "U16") return 2;
+    if (s == "I8" || s == "U8" || s == "BOOL") return 1;
+    return 0;
+}
+
+// A tensor from a checkpoint's bytes. F32, F16, BF16 and I8 keep their dtype. The others become Float32, the
+// type ids and counts have here: integers stay exact up to 2^24, F64 is rounded.
+inline std::shared_ptr<Tensor> tensor_from_bytes(const uint8_t* src, size_t bytes, const std::string& dtype,
+                                                 const std::vector<int64_t>& shape, const std::string& name) {
+    DType native = dtype == "F16" ? DType::Float16 : dtype == "BF16" ? DType::BFloat16 : dtype == "I8" ? DType::Int8 : DType::Float32;
+    auto t = std::make_shared<Tensor>(shape, Device::CPU, native, false);
+    if (dtype == "F32" || dtype == "F16" || dtype == "BF16" || dtype == "I8") {
+        if (bytes > 0) std::memcpy(t->data_ptr<char>(), src, bytes);
+        return t;
+    }
+    float* out = t->data_ptr<float>();
+    int64_t n = t->size();
+    auto convert = [&](auto zero) {
+        using T = decltype(zero);
+        for (int64_t i = 0; i < n; ++i) {
+            T v;
+            std::memcpy(&v, src + (size_t)i * sizeof(T), sizeof(T));
+            out[i] = (float)v;
+        }
+    };
+    if (dtype == "F64") convert(double{});
+    else if (dtype == "I64") convert(int64_t{});
+    else if (dtype == "U64") convert(uint64_t{});
+    else if (dtype == "I32") convert(int32_t{});
+    else if (dtype == "U32") convert(uint32_t{});
+    else if (dtype == "I16") convert(int16_t{});
+    else if (dtype == "U16") convert(uint16_t{});
+    else if (dtype == "U8" || dtype == "BOOL") convert(uint8_t{});
+    else throw std::runtime_error("load_safetensors: unsupported dtype \"" + dtype + "\" for tensor " + name);
+    return t;
 }
 
 // Element count of a shape, or -1 if it is negative or overflows
@@ -124,7 +146,7 @@ inline void save_safetensors(
         if (!first) json_ss << ",";
         first = false;
 
-        json_ss << "\"" << name << "\":{"
+        json_ss << json::quote(name) << ":{"
                 << "\"dtype\":\"" << dtype_to_safetensors_str(tensor->dtype) << "\","
                 << "\"shape\":[";
         for (size_t s = 0; s < tensor->shape.size(); ++s) {
@@ -157,253 +179,91 @@ inline void save_safetensors(
     out.close();
 }
 
-// Minimal, zero-dependency parser for SafeTensors JSON header
+// One tensor of a .safetensors file
 struct SafeTensorEntry {
     std::string name;
     std::string dtype;
     std::vector<int64_t> shape;
-    uint64_t offset_start = 0;
+    uint64_t offset_start = 0;  // bytes from the end of the header
     uint64_t offset_end = 0;
 };
 
-inline std::vector<SafeTensorEntry> parse_safetensors_header(const std::string& json) {
+inline std::vector<SafeTensorEntry> parse_safetensors_header(const std::string& text) {
     std::vector<SafeTensorEntry> entries;
-    size_t pos = 0;
-
-    while (pos < json.size()) {
-        // Find next key name
-        size_t key_start = json.find('"', pos);
-        if (key_start == std::string::npos) break;
-        size_t key_end = json.find('"', key_start + 1);
-        if (key_end == std::string::npos) break;
-
-        std::string key = json.substr(key_start + 1, key_end - key_start - 1);
-        pos = key_end + 1;
-
-        // Find entry dict with matching nested braces
-        size_t dict_start = json.find('{', pos);
-        if (dict_start == std::string::npos) break;
-
-        int depth = 0;
-        size_t dict_end = std::string::npos;
-        for (size_t k = dict_start; k < json.size(); ++k) {
-            if (json[k] == '{') depth++;
-            else if (json[k] == '}') {
-                depth--;
-                if (depth == 0) {
-                    dict_end = k;
-                    break;
-                }
-            }
+    auto header = json::parse(text);
+    if (!header.is_object()) throw std::runtime_error("load_safetensors: the header is not an object");
+    for (const auto& [name, v] : header.object) {
+        if (name == "__metadata__") continue;
+        SafeTensorEntry e;
+        e.name = name;
+        e.dtype = v.at("dtype").as_string();
+        for (const auto& d : v.at("shape").array) e.shape.push_back(d.as_int());
+        const auto& offsets = v.at("data_offsets").array;
+        if (offsets.size() != 2 || offsets[0].as_int() < 0 || offsets[1].as_int() < 0) {
+            throw std::runtime_error("load_safetensors: bad offsets for tensor: " + name);
         }
-        if (dict_end == std::string::npos) break;
-
-        std::string entry_str = json.substr(dict_start, dict_end - dict_start + 1);
-        pos = dict_end + 1;
-
-        if (key == "__metadata__") {
-            continue; // Skip optional HuggingFace metadata dict safely
-        }
-
-        SafeTensorEntry entry;
-        entry.name = key;
-
-        // Parse dtype
-        size_t dt_pos = entry_str.find("\"dtype\"");
-        if (dt_pos != std::string::npos) {
-            size_t colon = entry_str.find(':', dt_pos + 7);
-            if (colon != std::string::npos) {
-                size_t v_start = entry_str.find('"', colon + 1);
-                if (v_start != std::string::npos) {
-                    size_t v_end = entry_str.find('"', v_start + 1);
-                    if (v_end != std::string::npos) {
-                        entry.dtype = entry_str.substr(v_start + 1, v_end - v_start - 1);
-                    }
-                }
-            }
-        }
-
-        // Parse shape array
-        size_t sh_key = entry_str.find("\"shape\"");
-        if (sh_key != std::string::npos) {
-            size_t sh_bracket = entry_str.find('[', sh_key);
-            if (sh_bracket != std::string::npos) {
-                size_t s_end = entry_str.find(']', sh_bracket);
-                if (s_end != std::string::npos) {
-                    std::string s_str = entry_str.substr(sh_bracket + 1, s_end - sh_bracket - 1);
-                    std::stringstream s_stream(s_str);
-                    std::string num_str;
-                    while (std::getline(s_stream, num_str, ',')) {
-                        size_t first = num_str.find_first_not_of(" \t\n\r");
-                        if (first != std::string::npos) {
-                            size_t last = num_str.find_last_not_of(" \t\n\r");
-                            entry.shape.push_back(std::stoll(num_str.substr(first, last - first + 1)));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Parse data_offsets
-        size_t off_key = entry_str.find("\"data_offsets\"");
-        if (off_key != std::string::npos) {
-            size_t off_bracket = entry_str.find('[', off_key);
-            if (off_bracket != std::string::npos) {
-                size_t off_end = entry_str.find(']', off_bracket);
-                if (off_end != std::string::npos) {
-                    std::string off_str = entry_str.substr(off_bracket + 1, off_end - off_bracket - 1);
-                    size_t comma = off_str.find(',');
-                    if (comma != std::string::npos) {
-                        std::string s1 = off_str.substr(0, comma);
-                        std::string s2 = off_str.substr(comma + 1);
-                        size_t f1 = s1.find_first_not_of(" \t\n\r");
-                        size_t l1 = s1.find_last_not_of(" \t\n\r");
-                        size_t f2 = s2.find_first_not_of(" \t\n\r");
-                        size_t l2 = s2.find_last_not_of(" \t\n\r");
-                        if (f1 != std::string::npos && f2 != std::string::npos) {
-                            entry.offset_start = std::stoull(s1.substr(f1, l1 - f1 + 1));
-                            entry.offset_end = std::stoull(s2.substr(f2, l2 - f2 + 1));
-                        }
-                    }
-                }
-            }
-        }
-
-        if (!entry.name.empty()) {
-            entries.push_back(entry);
-        }
+        e.offset_start = (uint64_t)offsets[0].as_int();
+        e.offset_end = (uint64_t)offsets[1].as_int();
+        entries.push_back(std::move(e));
     }
-
     return entries;
 }
 
-// Load tensors from a SafeTensors file using fast zero-copy memory mapping
+// A .safetensors file whose tensors are read one at a time (the file is memory-mapped), so that a large
+// checkpoint never sits in memory twice
+class SafeTensorsFile {
+public:
+    explicit SafeTensorsFile(const std::string& path) : path_(path), file_(path) {
+        if (file_.size() < 8) throw std::runtime_error("load_safetensors: corrupt or empty file: " + path);
+        uint64_t header_len;
+        std::memcpy(&header_len, file_.data(), sizeof(header_len));
+        if (header_len > file_.size() - 8) throw std::runtime_error("load_safetensors: corrupt header size in " + path);
+        for (auto& e : parse_safetensors_header(std::string(reinterpret_cast<const char*>(file_.data() + 8), (size_t)header_len))) {
+            size_t elem = safetensors_dtype_size(e.dtype);
+            if (elem == 0) throw std::runtime_error("load_safetensors: unsupported dtype \"" + e.dtype + "\" for tensor " + e.name);
+            if (e.offset_start > e.offset_end || e.offset_end > file_.size() - 8 - header_len) {
+                throw std::runtime_error("load_safetensors: offsets out of bounds for tensor: " + e.name);
+            }
+            uint64_t bytes = e.offset_end - e.offset_start;
+            int64_t n = checked_numel(e.shape);
+            if (n < 0 || bytes % elem != 0 || (uint64_t)n != bytes / elem) {
+                throw std::runtime_error("load_safetensors: byte size mismatch for tensor: " + e.name);
+            }
+            std::string name = e.name;
+            entries_[name] = std::move(e);
+        }
+        payload_ = file_.data() + 8 + header_len;
+    }
+
+    const std::unordered_map<std::string, SafeTensorEntry>& entries() const { return entries_; }
+    bool has(const std::string& name) const { return entries_.count(name) > 0; }
+
+    // A copy of the tensor on the CPU
+    std::shared_ptr<Tensor> read(const std::string& name) const {
+        auto it = entries_.find(name);
+        if (it == entries_.end()) throw std::runtime_error("load_safetensors: no tensor " + name + " in " + path_);
+        const auto& e = it->second;
+        return tensor_from_bytes(payload_ + e.offset_start, (size_t)(e.offset_end - e.offset_start), e.dtype, e.shape, name);
+    }
+
+private:
+    std::string path_;
+    MappedFile file_;
+    const uint8_t* payload_ = nullptr;
+    std::unordered_map<std::string, SafeTensorEntry> entries_;
+};
+
+// Every tensor of a .safetensors file
 inline std::unordered_map<std::string, std::shared_ptr<Tensor>> load_safetensors(
     const std::string& filepath,
     Device device = Device::CPU
 ) {
+    SafeTensorsFile file(filepath);
     std::unordered_map<std::string, std::shared_ptr<Tensor>> result;
-
-#if HAS_MMAP
-    int fd = open(filepath.c_str(), O_RDONLY);
-    if (fd == -1) {
-        throw std::runtime_error("load_safetensors: Unable to open file: " + filepath);
+    for (const auto& entry : file.entries()) {
+        auto t = file.read(entry.first);
+        result[entry.first] = device == Device::CPU ? t : t->to(device);
     }
-
-    struct stat sb;
-    if (fstat(fd, &sb) == -1) {
-        close(fd);
-        throw std::runtime_error("load_safetensors: Failed to stat file: " + filepath);
-    }
-    size_t file_size = sb.st_size;
-    if (file_size < 8) {
-        close(fd);
-        throw std::runtime_error("load_safetensors: Corrupt or empty file (< 8 bytes): " + filepath);
-    }
-
-    void* mmapped_data = mmap(nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
-    if (mmapped_data == MAP_FAILED) {
-        close(fd);
-        throw std::runtime_error("load_safetensors: mmap failed for: " + filepath);
-    }
-
-    const uint8_t* ptr = static_cast<const uint8_t*>(mmapped_data);
-    uint64_t header_len = *reinterpret_cast<const uint64_t*>(ptr);
-
-    if (header_len > file_size - 8) {
-        munmap(mmapped_data, file_size);
-        close(fd);
-        throw std::runtime_error("load_safetensors: Corrupt file header size");
-    }
-
-    std::string json_header(reinterpret_cast<const char*>(ptr + 8), header_len);
-    auto entries = parse_safetensors_header(json_header);
-    const uint8_t* payload_base = ptr + 8 + header_len;
-    size_t max_payload = file_size - (8 + header_len);
-
-    for (const auto& entry : entries) {
-        if (entry.offset_start > entry.offset_end || entry.offset_end > max_payload) {
-            munmap(mmapped_data, file_size);
-            close(fd);
-            throw std::runtime_error("load_safetensors: Offset out of bounds for tensor: " + entry.name);
-        }
-        DType dtype;
-        int64_t numel = checked_numel(entry.shape);
-        size_t bytes = entry.offset_end - entry.offset_start;
-        try {
-            dtype = safetensors_str_to_dtype(entry.dtype, entry.name);
-        } catch (...) {
-            munmap(mmapped_data, file_size);
-            close(fd);
-            throw;
-        }
-        if (numel < 0 || (uint64_t)numel != bytes / dtype_size(dtype) || bytes % dtype_size(dtype) != 0) {
-            munmap(mmapped_data, file_size);
-            close(fd);
-            throw std::runtime_error("load_safetensors: Byte size mismatch for tensor: " + entry.name);
-        }
-        auto tensor = std::make_shared<Tensor>(entry.shape, Device::CPU, dtype, false);
-        const uint8_t* src = payload_base + entry.offset_start;
-        std::memcpy(tensor->data_ptr<char>(), src, bytes);
-
-        if (device != Device::CPU) {
-            result[entry.name] = tensor->to(device);
-        } else {
-            result[entry.name] = tensor;
-        }
-    }
-
-    munmap(mmapped_data, file_size);
-    close(fd);
-#else
-    std::ifstream in(filepath, std::ios::binary);
-    if (!in.is_open()) {
-        throw std::runtime_error("load_safetensors: Unable to open file: " + filepath);
-    }
-
-    in.seekg(0, std::ios::end);
-    size_t file_size = in.tellg();
-    in.seekg(0, std::ios::beg);
-    if (file_size < 8) {
-        throw std::runtime_error("load_safetensors: Corrupt or empty file (< 8 bytes): " + filepath);
-    }
-
-    uint64_t header_len = 0;
-    in.read(reinterpret_cast<char*>(&header_len), sizeof(header_len));
-    if (header_len > file_size - 8) {
-        throw std::runtime_error("load_safetensors: Corrupt file header size");
-    }
-
-    std::string json_header(header_len, '\0');
-    in.read(&json_header[0], header_len);
-
-    auto entries = parse_safetensors_header(json_header);
-    uint64_t payload_base = 8 + header_len;
-    size_t max_payload = file_size - payload_base;
-
-    for (const auto& entry : entries) {
-        if (entry.offset_start > entry.offset_end || entry.offset_end > max_payload) {
-            throw std::runtime_error("load_safetensors: Offset out of bounds for tensor: " + entry.name);
-        }
-        DType dtype = safetensors_str_to_dtype(entry.dtype, entry.name);
-        int64_t numel = checked_numel(entry.shape);
-        size_t bytes = entry.offset_end - entry.offset_start;
-        if (numel < 0 || (uint64_t)numel != bytes / dtype_size(dtype) || bytes % dtype_size(dtype) != 0) {
-            throw std::runtime_error("load_safetensors: Byte size mismatch for tensor: " + entry.name);
-        }
-        auto tensor = std::make_shared<Tensor>(entry.shape, Device::CPU, dtype, false);
-        in.seekg(payload_base + entry.offset_start);
-        in.read(tensor->data_ptr<char>(), bytes);
-
-        if (device != Device::CPU) {
-            result[entry.name] = tensor->to(device);
-        } else {
-            result[entry.name] = tensor;
-        }
-    }
-    in.close();
-#endif
-
     return result;
 }
 
