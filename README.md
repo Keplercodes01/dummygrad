@@ -9,100 +9,81 @@ A pure C++ deep learning engine engineered for absolute speed, zero abstraction 
 Got rid of Python and its bindings, GIL, multi-layer dispatcher overhead. It's a raw, frontier-grade execution directly on the metal.
 
 
+```cpp
+#include "dummy_core.h"
+
+manual_seed(0);
+Sequential net;
+net.add<Linear>(2, 64).add<GELU>().add<Linear>(64, 1);
+optim::AdamW opt(1e-2f);
+
+auto x = normal({256, 2});
+auto y = sum(square(x), 1);                                    // learn |x|^2
+
+for (int step = 0; step < 2000; ++step) {
+    net.zero_grad();
+    auto loss = mse_loss(net.forward(x), y);
+    loss->backward();
+    opt.step(net.parameters());
+}
+
+// Gradients of gradients, like everything else, are ordinary ops
+auto point = tensor({1, 2}, {1, 2}, Device::CPU, /*requires_grad=*/true);
+auto g = autograd::grad({sum(net.forward(point))}, {point}, {}, true, /*create_graph=*/true)[0];
+```
+
+| | |
+|---|---|
+| **Autograd** | gradients of any order, Jacobians, Hessians, hooks, checkpointing, custom ops, anomaly detection |
+| **Ops** | about 300: broadcasting, views, indexing, reductions, sorting, `einsum`, convolutions, pooling, losses |
+| **Layers** | transformers (RoPE, GQA, SwiGLU, RMSNorm), convolutions, RNN/LSTM/GRU, normalization, dropout |
+| **Training** | 15 optimizers, 12 schedules, fp16/bf16 autocast, multi-GPU, resumable checkpoints, data loaders, EMA |
+| **Numerics** | `linalg`, `fft`, `distributions`, random numbers that repeat on every device |
+| **Devices** | NVIDIA GPUs (CUDA) and CPUs (x86, ARM); experimental Metal and TPU |
+| **Reproducible** | gradients are summed in a fixed order, with no atomics: the same code and seed give the same bits |
+
+**Contents:** [Getting started](#getting-started) · [Research toolkit](#research-toolkit) · [Training](#a-complete-training-run) · [Mixed precision](#mixed-precision) · [Your own ops](#writing-your-own-ops) · [Performance](#performance) · [Testing](#testing) · [Limitations](#status--known-limitations) · [Changelog](CHANGELOG.md)
+
 ---
 
 ## What's New
 
-Full details for every release are in [CHANGELOG.md](CHANGELOG.md).
+**On `main`, for v0.9.0: the research release.** Higher-order autograd (`autograd::grad` with `create_graph`), about 300 ops, convolutions of every kind, recurrent and transformer layers, 15 optimizers, `linalg`, `fft` and `distributions`, and a CPU backend 2.4 to 3.3 times faster. Upgrading from v0.8.0:
+- `mean`, `var` and `std_dev` reduce the dimension you name. On tensors with more than 2 dimensions, 0 and 1 used to mean the last two.
+- A second backward through a freed graph throws instead of silently losing gradients. Pass `retain_graph=true` the first time.
 
-### v0.8.0: the audit release
-- **A full audit of the codebase, every finding fixed.** Graphs whose backward never ran leaked (a reference cycle in attention, softmax, tanh and sigmoid); a bad token id corrupted GPU memory; multi-GPU training dropped or raced gradients; non-square CUDA masks, large max-pool inputs, RoPE positions past `max_seq_len` and mismatched head counts read or wrote out of bounds. See [CHANGELOG.md](CHANGELOG.md).
-- **Faster:** 12-21% fp32 and 4-11% fp16 per step over v0.7.0 on a T4. Every op that round-tripped through the host on CUDA (sum, mean, var, mse, conv, max-pool, concat, ...) has a GPU kernel; the tied LM head no longer copies the embedding's transpose.
-- **Multi-GPU that works:** `MultiGPURunner` averages gradients GPU to GPU, tested on two T4s.
-- **New:** `set_allow_tf32` (off by default), per-parameter weight decay (`no_weight_decay_params`), `matmul_nt`.
-- **Removed:** features that were dead code or unsafe (`CUDAGraph`, `ArenaScope`), and README claims they backed.
+**v0.8.0: the audit release.** Every finding of a full audit fixed, 12-21% faster in fp32 and 4-11% in fp16 on a T4, and multi-GPU training that works.
 
-### v0.7.0: PyTorch-level speed at 23M parameters, 6x faster at 0.4M
-- **fp16 on a T4: 50.5 vs PyTorch's 50.7 ms at 23M parameters, 14.4 vs 21.9 ms at 3.9M, 1.7 vs 10.8 ms at 0.4M.** See [Performance](#performance).
-- **Fused Linear:** the bias is added inside the matrix multiply instead of by a separate pass over the output, and one backward node returns all three gradients.
-- **Backward runs on the calling thread for GPU training,** instead of hopping between worker threads, which made the two smaller models 2.1x and 20% faster. Gradients are bit-identical either way.
-- **Forward profiling:** `dg_bench --profile` (or `set_profiling(true)`) now times forward ops too, including the fp16 conversions, so you can see where a whole step goes.
-
-### v0.6.1: faster fp16 backward
-- **fp16 medium step 57.2 → 53.8 ms on a T4** (PyTorch fp16: 51.8 ms). Each matmul's backward reuses the half-precision copies its forward made instead of converting its inputs again, which takes `MatmulBackward` from 16.7 to 13.9 ms. Saved activations are half-size copies too.
-- **Frozen weights cost no gradient work:** when one matmul input doesn't require grad (a frozen base model under LoRA, a fixed input), backward skips that GEMM and doesn't keep the tensor it would have needed.
-
-### v0.6.0: mixed precision
-- **fp16 training nearly halves step time on larger models.** `AutocastGuard` runs matmuls and attention on tensor cores, and `GradScaler` handles loss scaling. On a T4, the 23M-parameter step goes from 107.6 to 57.2 ms. PyTorch fp16 takes 51.4 ms; dummygrad is faster at 0.4M and 3.9M. See [Mixed precision](#mixed-precision).
-- **Everything else stays fp32**: parameters, gradients, optimizer state, softmax and normalization. Your training code only adds the guard and the scaler.
-- **Safer dtypes:** reading an fp16 tensor as `float` now throws instead of silently computing garbage, and CPU fp16 conversion rounds correctly.
-- **Runs on Kaggle too:** the notebook works on Kaggle's free T4s as well as Colab.
-
-### v0.5.1
-- **Faster than PyTorch at every size we benchmark.** On a T4: 2.9 vs 8.6 ms (0.4M params), 23.9 vs 27.6 ms (3.9M), 103.6 vs 107.7 ms (23M).
-- **Attention on cuBLAS** for sequences up to 2048 tokens, any head dimension: backward went from 17 to 6.6 ms on the 23M model. Longer sequences keep the memory-efficient tiled kernels.
-- **GPT is bitwise reproducible on the GPU too:** LayerNorm backward no longer uses atomics.
-- **Fixed:** LayerNorm on CUDA could silently replace its parameters, so the optimizer stopped updating them.
-
-### v0.5.0: the speed release
-- **Faster than PyTorch on small models, at parity on larger ones.** On a T4, a ModernTransformer training step takes 3.5 ms vs PyTorch's 9.2 ms (0.4M params), 23.6 vs 27.1 ms (3.9M), and 112.6 vs 108.6 ms (23M). See [Performance](#performance).
-- **Everything stays on the GPU.** New kernels for broadcast and scalar ops, RMSNorm, cross entropy, embedding lookup, GQA and gradient clipping removed 1.5 GB of host-device copies per step.
-- **Tiled attention:** FlashAttention-style forward and an atomic-free FlashAttention-2 backward.
-- **Reproducible on the GPU:** the new kernels use fixed-order sums instead of atomics, so ModernTransformer training gives the same results run to run.
-- **Profiler:** `dg_bench --profile` (or `set_profiling(true)`) shows where forward and backward time goes, per op.
-- **Fixed:** broadcasting now follows NumPy rules; `[1, H, S, S]` operands such as ALiBi biases were applied to the wrong heads with batch size above 1.
-
-### v0.4.0: the workflow release
-- **Build models from modules.** A `Module` base class gives every layer and model `parameters()`, `to()`, train/eval, freezing, and strict checkpoint loading from one `visit()` declaration.
-- **Train like a real project.** Resumable checkpoints (model, optimizer state, step, scalars), `DataLoader` and `TokenDataset`, a CSV metrics logger, AdamW and SGD, and a complete [training template](examples/train_lm.cpp).
-- **Write and trust your own ops.** `dummygrad::gradcheck` verifies custom backward passes, `NoGradGuard` runs evaluation without graphs, and `DetectAnomalyGuard` names the op that produced a NaN.
-- **Reproducible:** gradients are summed in a fixed order, so the same code and seed give bitwise-identical results, and resumed runs match uninterrupted ones exactly.
-- **Fixed:** `GPT` was not causal (it attended to future tokens), and SGD never updated CUDA parameters.
-
-### v0.3.0: the trust release
-- **No more silently wrong results on views.** Ops applied to transposed or sliced tensors (`relu(transpose(x))`, ops on `slice()` results) now compute on the right elements, and gradients through slices along any dimension are correct.
-- **Every op and layer is gradient-checked**, including with strided inputs, and a dedicated test checks that strided and dense inputs give identical results.
-- **CI on every change:** the test suite runs on Linux and macOS for every pull request.
-
-### v0.2.1
-- A full [Getting Started](#getting-started) guide: per-OS install, a runnable [quickstart](examples/quickstart.cpp), using dummygrad from your own CMake project, troubleshooting.
-
-### v0.2.0: the correctness release
-- **Correct CUDA training.** Strided copies on the GPU now honor strides (transposed tensors, including the tied LM head, were wrong), softmax and LayerNorm reduce across the whole block for rows wider than 32, and flash-attention backward always produces correct weight gradients.
-- **Correct attention everywhere.** Grouped-query attention no longer reads scrambled K/V heads, and strided gradients flowing through RoPE and tied embeddings are handled on every backend.
-- **A safer autograd engine.** No more gradient corruption in residual connections, and no use-after-free races in the multithreaded backward pass — including when a backward node throws.
-- **Multi-GPU fixes.** Backward runs on each replica's own GPU, and the CUDA caching allocator keeps a separate pool per device.
-- **CUDA RoPE kernels**, FP16/BF16-safe strided copies, the `test_engine` suite and a one-click [Colab notebook](notebooks/dummygrad_colab.ipynb).
-
-> **Upgrading from 0.1:** checkpoints still load, but models using CUDA, grouped-query attention or tied embeddings were trained with incorrect activations or gradients — retrain rather than fine-tune.
+Earlier releases are in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
-## Architecture & Performance Highlights
+## How It Works
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  Models: GPT / ModernTransformer (GQA, RoPE, SwiGLU) / CNNs │
-├──────────────────────────────────────────────────────────┤
-│  Autograd: deterministic gradient sums, calling-thread GPU │
-├──────────────────────────────────────────────────────────┤
-│  Attention: cuBLAS GEMMs ≤ 2048 tokens, tiled kernels past │
-├──────────────────────────────────────────────────────────┤
-│  Compute: cuBLAS / cuBLASLt (FP32, opt-in TF32, FP16, BF16)│
-├──────────────────────────────────────────────────────────┤
-│  Multi-GPU: one process, GPU-to-GPU gradient averaging     │
-├──────────────────────────────────────────────────────────┤
-│  Memory: CUDA caching allocator                            │
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Models    GPT, ModernTransformer, Transformer, MARS         │
+├──────────────────────────────────────────────────────────────┤
+│  Modules   layers, recurrent, attention, optimizers          │
+├──────────────────────────────────────────────────────────────┤
+│  Ops       free functions; each one a value and its gradient │
+├──────────────────────────────────────────────────────────────┤
+│  Autograd  any order, deterministic sums, hooks              │
+├──────────────────────────────────────────────────────────────┤
+│  Kernels   one source for CPU and GPU + cuBLAS, attention    │
+├──────────────────────────────────────────────────────────────┤
+│  Memory    caching allocators, versioned storage             │
+└──────────────────────────────────────────────────────────────┘
 ```
 
+- **One kernel, two backends**: general op kernels are functors in [`src/kernels`](src/kernels), compiled both as threaded CPU loops and as CUDA kernels, so the code the CPU tests cover is the code the GPU runs. The hot training kernels (matmul, attention, norms, cross entropy) are written for the GPU by hand.
 - **Low per-op overhead**: ops are plain C++ functions with no Python or dispatcher layer, which is why small models step several times faster than in PyTorch (see [Performance](#performance)).
 - **cuBLAS matmuls**: `Float32` (TF32 tensor cores only with `set_allow_tf32(true)`, off by default as in PyTorch), and `Float16` / `BFloat16` under `AutocastGuard`. Linear adds its bias in the cuBLASLt epilogue; the tied LM head (`matmul_nt`) reads the embedding transposed in place.
 - **Attention**: cuBLAS GEMMs for sequences up to 2048 tokens (any head dimension), and FlashAttention-style tiled kernels beyond that, with memory linear in sequence length (head dimensions up to 128; larger ones use the GEMM path a chunk of heads at a time). Every path is deterministic.
 - **Fused, deterministic kernels**: RMSNorm, LayerNorm, cross entropy, embedding, RoPE, GQA head repetition and AdamW; reductions sum in a fixed order (no atomics), so identical runs give bitwise-identical gradients.
 - **Multi-GPU**: `MultiGPURunner` runs one replica per GPU in a single process and averages gradients GPU to GPU after each backward pass.
 - **Apple Silicon**: MPS tensors live in unified memory; a few elementwise ops, masks, loss gradients and AdamW run as Metal kernels, everything else on the CPU over the same memory. Not covered by tests.
-- **CPU SIMD Fallback**: Vectorized kernels for AVX2/FMA on x86_64 and NEON on ARM with optional OpenBLAS/oneMKL integration.
+- **CPU**: threaded, vectorized kernels (AVX2, AVX-512 or NEON, whatever the machine has) around OpenBLAS, Accelerate or MKL, or a built-in matrix multiply without one. dummygrad's own kernels give the same results at any thread count.
 
 ---
 
@@ -170,8 +151,9 @@ CMake prints whether it found CUDA (`Building with GPU support`) or is building 
 |---|---|---|
 | `ENABLE_CUDA` | `ON` | Build the CUDA backend when `nvcc` is found; set `OFF` to force CPU-only |
 | `CMAKE_CUDA_ARCHITECTURES` | `native` (CMake ≥ 3.24) | GPU generations to compile for, e.g. `75` for T4, `80` for A100, `89` for RTX 40xx |
-| `DUMMYGRAD_BUILD_TESTS` | `ON`* | Build the `test_engine` test suite |
-| `DUMMYGRAD_BUILD_EXAMPLES` | `ON`* | Build the examples: `quickstart`, `custom_op`, `train_lm`, `train_colab` |
+| `DUMMYGRAD_USE_BLAS` | `ON` | Use a BLAS library for CPU matrix products when one is found |
+| `DUMMYGRAD_BUILD_TESTS` | `ON`* | Build the test suites, `test_engine` and `test_research` |
+| `DUMMYGRAD_BUILD_EXAMPLES` | `ON`* | Build the examples: `quickstart`, `custom_op`, `research_tour`, `train_lm`, `train_colab` |
 
 \* Only when dummygrad is the top-level project; off when used inside your own project.
 
@@ -179,10 +161,11 @@ CMake prints whether it found CUDA (`Building with GPU support`) or is building 
 
 ```bash
 ./build/test_engine      # gradient checks, CUDA-vs-CPU checks, engine tests, training
+./build/test_research    # every op's first and second derivatives, values, layers, optimizers
 ./build/quickstart       # a tour of the API, trains a small network on XOR
 ```
 
-`test_engine` should end with `N passed, 0 failed`; it compares every op's gradients against finite differences, checks the CUDA backend against the CPU when a GPU is present, and trains a small transformer end to end. `quickstart` should show the loss falling towards zero. You can also run everything through CTest: `cd build && ctest --output-on-failure`.
+Both suites should end with `N passed, 0 failed` and take a few seconds; see [Testing](#testing). `quickstart` should show the loss falling towards zero. You can also run everything through CTest: `cd build && ctest --output-on-failure`.
 
 ### 4. Your first program
 
@@ -195,8 +178,7 @@ CMake prints whether it found CUDA (`Building with GPU support`) or is building 
 auto x = ones({2, 3}, Device::CPU, DType::Float32, /*requires_grad=*/true);
 
 // Ops are free functions that build the graph as they run.
-// sum() reduces one axis and keeps it, so two sums give a [1, 1] scalar.
-auto y = sum(sum(mul_scalar(x, 3.0f), -1), -2);
+auto y = sum(mul_scalar(x, 3.0f));
 y->backward();            // x->grad now holds dy/dx
 x->show_grad();           // prints 3s
 
@@ -216,11 +198,13 @@ for (int step = 0; step < 500; ++step) {
 ```
 
 A few conventions worth knowing:
-- Inputs and parameters live on one device; copy data over with `tensor->to(Device::CUDA)` and read results back with `tensor->cpu()->data_ptr<float>()`.
+- Inputs and parameters live on one device; copy data over with `tensor->to(Device::CUDA)` and read results back with `tensor->item()` (one element) or `tensor->to_vector()`.
 - Integer data such as token ids and class labels is stored in `Float32` tensors.
 - Collect a layer's `parameters()` *after* calling `.to()` — moving replaces the tensors.
 
-The bigger building blocks — `ModernTransformer`, `GPT`, `MultiHeadAttention`, `RMSNorm`, `SwiGLU`, RoPE — are shown in the sections below.
+- Reductions over a dimension keep it as size 1 unless you pass `keepdim=false`: `sum(x, 1, false)`. `sum(x)` is a scalar.
+
+[`examples/research_tour.cpp`](examples/research_tour.cpp) goes further: second derivatives, linear algebra, a variational autoencoder, a convolutional network.
 
 ### 5. Use dummygrad in your own project
 
@@ -242,6 +226,8 @@ target_link_libraries(my_app PRIVATE dummygrad::dummygrad)
 ```
 
 Then `#include "dummy_core.h"` in `main.cpp` and build with the usual `cmake -S . -B build && cmake --build build`. CUDA is enabled automatically when `nvcc` is found, and the `ENABLE_CUDA` / `CMAKE_CUDA_ARCHITECTURES` options above work from your project too.
+
+v0.8.0 does not have the research toolkit yet; use `GIT_TAG main` for it until v0.9.0 is released.
 
 Prefer vendoring? Add the repository as a git submodule and replace the `FetchContent` lines with `add_subdirectory(external/dummygrad)`.
 
@@ -320,7 +306,7 @@ TrainingState state = load_checkpoint("ckpt.safetensors", model, &optimizer);   
 - **Checkpoints** hold the model, the optimizer's moment estimates and step counts, and any scalars you add (`TrainingState::scalars`), and are written atomically, so a crash mid-save keeps the previous file intact. Resuming reproduces an uninterrupted run exactly: gradients are summed in a fixed order, so the same code with the same seed gives bitwise-identical results on CPU.
 - **`DataLoader(X, Y, batch_size, shuffle, seed)`** batches in-memory tensors along their first dimension; call `set_epoch(e)` for a deterministic per-epoch shuffle and iterate with `for (auto [x, y] : loader)`.
 - **`TokenDataset`** reads token streams (`from_file` for raw uint16/int32 ids, `from_bytes` for byte-level text), samples random windows with `sample()`, and walks the whole stream for evaluation with `windows()`.
-- **Optimizers:** `Adam` (AdamW, decoupled weight decay) and `SGD` (momentum, weight decay). Their state lives on each parameter's device and follows the model if you move it.
+- **Optimizers:** `Adam` (AdamW, decoupled weight decay) and `SGD` (momentum, weight decay); the rest are in `optim::` (see [Research toolkit](#research-toolkit)) and work the same way. Their state lives on each parameter's device and follows the model if you move it.
 - **`MetricsLogger`** writes long-format CSV, so any metric can be logged at any step. Load it with `pandas.read_csv(path).pivot(index="step", columns="metric", values="value")`.
 
 ### Mixed precision
@@ -346,9 +332,55 @@ for (int64_t step = 0; step < steps; ++step) {
 
 The scaler follows PyTorch's `GradScaler`: it starts at 65536, halves on overflow and doubles after 2000 clean steps. `scaler.skipped_steps()` counts skipped steps, and `scaler.save_to(state)` / `scaler.load_from(state)` carry it through `TrainingState` checkpoints. Use `dg_bench --fp16` to measure the speedup on your GPU.
 
+### Research toolkit
+
+[`examples/research_tour.cpp`](examples/research_tour.cpp) is a runnable tour. Tensors are `TensorPtr` (`std::shared_ptr<Tensor>`), ops are free functions with PyTorch's names and, with few exceptions, its semantics. Differentiable ops support second derivatives.
+
+```cpp
+// Higher-order gradients: differentiate through a gradient
+auto dx = autograd::grad({score}, {x}, {}, /*retain_graph=*/true, /*create_graph=*/true)[0];
+auto penalty = mean(square(sub_scalar(norm(dx, 2.0f, 1), 1.0f)));
+penalty->backward();
+auto H = autograd::hessian(f, x);                          // also jacobian, hvp, vjp, jvp
+
+// Recompute a block in backward instead of storing its activations
+auto y = autograd::checkpoint([&](const TensorPtr& t) { return block.forward(t); }, x);
+
+// A new op from a value and a vector-Jacobian product; second derivatives come for free
+TensorPtr swishy(const TensorPtr& x) {
+    return autograd::custom_function("swishy", [](const TensorList& in) { return mul(in[0], sigmoid(in[0])); }, {x}, {/*save input*/ 0},
+        [](const OpContext& c, const TensorPtr& g) -> TensorList {
+            auto v = c.input(0); auto s = sigmoid(v);
+            return {mul(g, mul(s, add_scalar(mul(v, rsub_scalar(1.0f, s)), 1.0f)))};
+        });
+}
+
+auto scores = einsum("bqd,bkd->bqk", {q, k});
+auto [u, s, vt] = linalg::svd(a);                          // linalg: qr, eigh, cholesky, solve, ...
+auto spectrum = fft::rfft(signal);                         // complex tensors have a trailing dimension of 2
+distributions::Normal posterior(mu, sigma);
+auto z = posterior.rsample();                              // gradients flow to mu and sigma
+
+auto net = std::make_shared<Sequential>();
+net->add<Conv2d>(3, 64, 3, 1, 1).add<BatchNorm2d>(64).add<ReLU>().add<MaxPool2d>(2).add<Flatten>().add<Linear>(64 * 16 * 16, 10);
+LSTM lstm(128, 256, {/*layers=*/2, /*dropout=*/0.1f, /*bidirectional=*/true});
+optim::Muon muon(0.02f);                                   // optim: SGD, AdamW, NAdam, RAdam, Lion, LBFGS, ...
+optim::OneCycleLR schedule(0.02f, total_steps);
+```
+
+| Area | What is there |
+|---|---|
+| Autograd | `grad`, `create_graph`, `jacobian`, `hessian`, `hvp`, `vjp`, `jvp`, hooks, `retain_grad`, `checkpoint`, `custom_function`, anomaly detection, in-place-modification checks |
+| Ops | elementwise, broadcasting, views, indexing and scatter, reductions, sorting, `einsum`, convolutions, pooling, resampling, losses including CTC |
+| Layers | containers, convolutions, normalizations, dropout, recurrent, attention, transformers, pooling, embeddings |
+| Optimizers | SGD, Adam(W), AMSGrad, NAdam, RAdam, Adamax, Adagrad, Adadelta, RMSprop, Rprop, LBFGS, Lion, Muon, Adafactor; 12 schedules; EMA, SWA |
+| Numerics | `linalg`, `fft`, `distributions`, reproducible counter-based random numbers |
+
+On a GPU, factorizations, Fourier transforms, sorting and general `scatter` run on the host and copy their data there and back; everything else runs on the device. Run `./build/test_research` to check all of it on your machine.
+
 ### Writing your own ops
 
-A new op is a forward function plus a backward `Node`. [`examples/custom_op.cpp`](examples/custom_op.cpp) is a complete, compiled example (squared ReLU). The shape of it:
+`make_op` and `autograd::custom_function` ([Research toolkit](#research-toolkit)) are the short way. For full control over the kernels, a new op is a forward function plus a backward `Node`. [`examples/custom_op.cpp`](examples/custom_op.cpp) is a complete, compiled example (squared ReLU). The shape of it:
 
 ```cpp
 struct SquaredReluBackward : public Node {
@@ -669,20 +701,46 @@ Training-step time (forward, backward, AdamW) for the same ModernTransformer arc
 | medium | 53.9 ms | 46.2 ms | **33.6 ms** |
 | large | 324 ms | 257 ms | **202 ms** |
 
-dummygrad's advantage is per-op overhead (no Python, no dispatcher), which dominates small models. In fp16 at larger sizes it is behind: it still converts every matmul's weights to fp16 each step (3.4 ms of medium's 20 ms forward pass, per `--profile`) and runs normalization and elementwise ops in fp32, where PyTorch's autocast keeps more in fp16. That is the next work. Reproduce with the [notebook](notebooks/dummygrad_colab.ipynb), or run `./build/dg_bench` and `python bench/bench_torch.py` on your own GPU; `--profile` breaks forward and backward time down by op.
+dummygrad's advantage is per-op overhead (no Python, no dispatcher), which dominates small models. In fp16 at larger sizes it is behind: its activations go back to fp32 between matrix products, where PyTorch's autocast keeps more of them in fp16. That is the next work. `main` has changed the GPU kernels since v0.8.0, and these tables have not been measured again.
+
+**CPU**, on two 4-thread CI machines with OpenBLAS, v0.8.0 and `main` in the same job:
+
+| config | v0.8.0 | `main` | v0.8.0 | `main` |
+|---|---|---|---|---|
+| tiny | 51.0 ms | **18.9 ms** | 39.5 ms | **12.0 ms** |
+| small | 1086 ms | **460 ms** | 791 ms | **306 ms** |
+ Reproduce with the [notebook](notebooks/dummygrad_colab.ipynb), or run `./build/dg_bench` and `python bench/bench_torch.py` on your own GPU; `--profile` breaks forward and backward time down by op.
+
+---
+
+## Testing
+
+```bash
+./build/test_research            # or with part of a name: ./build/test_research grad2/conv
+./build/test_engine
+```
+
+- **Gradients:** every differentiable op against finite differences, and nearly every one's second derivative too.
+- **GPU against CPU**, when there is one: every op, optimizers, reductions, special values (NaN, infinity), and whole models trained for a few steps.
+- **Values:** against definitions and closed forms (CTC against every alignment, convolutions against their sum, factorizations against their product, samplers against their moments, ...).
+- **Engine:** determinism, graph lifetime, exceptions, resuming runs bit for bit, two-GPU training.
+
+On a Kaggle T4 x2 that is 914 + 268 checks; without a GPU, 652 + 141. CI runs the CPU ones on Linux (with and without a BLAS) and macOS for every change and compiles the CUDA code; GPU runs happen on Kaggle.
 
 ---
 
 ## Status & Known Limitations
 
-dummygrad is pre-1.0: the core training path (CPU and CUDA, FP32) is covered by `test_engine`; other paths are less exercised.
+dummygrad is pre-1.0. The CPU and CUDA paths are covered by the test suites, in fp32 and, for training, fp16.
 
 - **Mixed precision covers matrix products.** Under `AutocastGuard`, CUDA matmuls and attention (on its cuBLAS path, up to 2048 tokens) run on fp16/bf16 tensor cores. Normalization and elementwise kernels, the softmax, and attention beyond 2048 tokens stay fp32. Tensors are always stored in fp32; non-fp32 tensors are only for storage and conversion. bf16 needs an Ampere or newer GPU.
 - **Attention** runs as cuBLAS GEMMs for sequences up to 2048 tokens (any head dimension) and as tiled kernels beyond that for head dimensions up to 128 (other sizes zero-padded to 16, 32, 64 or 128). Larger head dimensions past 2048 tokens use the GEMM path a chunk of heads at a time, whose memory is quadratic in the sequence length.
+- **Data types:** ops compute in fp32. There are no float64, integer, boolean or complex tensors: indices and masks are floats (exact up to 2^24), and complex numbers are pairs. `vmap`, sparse tensors, `torch.compile`-style fusion, and multi-process or sharded training are not implemented.
 - **Multi-GPU** runs in one process and averages gradients GPU to GPU, one parameter at a time (no bucketing or overlap with backward yet). Its test needs two GPUs (Kaggle's T4 x2).
+- **On the CPU even for GPU tensors:** `linalg` factorizations, `fft`, sorting and general `scatter` copy their data to the host and back.
 - **Metal and TPU** paths are not covered by the test suite (macOS CI runs the CPU backend; there is no TPU in CI).
 
-Bug reports with a failing `test_engine` case are the fastest way to get something fixed.
+Bug reports with a failing test case are the fastest way to get something fixed.
 
 ---
 

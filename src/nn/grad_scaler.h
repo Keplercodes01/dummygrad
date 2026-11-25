@@ -143,6 +143,7 @@ private:
             if (p->grad->dtype != DType::Float32) throw std::runtime_error("GradScaler: gradients must be Float32");
             if (!p->grad->is_contiguous()) p->grad = make_contiguous(p->grad);
             auto& g = p->grad;
+            g->storage->bump_version();  // scaled in place below
 #ifdef USE_CUDA
             if (g->device == Device::CUDA) {
                 device_grads.push_back(g->data_ptr<float>());

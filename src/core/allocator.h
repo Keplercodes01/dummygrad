@@ -19,7 +19,8 @@ private:
     std::mutex mtx;
     size_t round_up(size_t bytes) { return (bytes + 63) & ~63; }
 public:
-    static CPUCachingAllocator& get() { static CPUCachingAllocator instance; return instance; }
+    // Never destroyed: tensors in static storage may be freed after any static allocator would be
+    static CPUCachingAllocator& get() { static auto* instance = new CPUCachingAllocator; return *instance; }
     ~CPUCachingAllocator() override { empty_cache(); }
     void* allocate(size_t bytes) override;
     void free(void* ptr, size_t bytes) override;
@@ -56,7 +57,7 @@ public:
         std::lock_guard<std::mutex> lock(mtx);
         stats.peak_in_use = stats.in_use;
     }
-    static CUDACachingAllocator& get() { static CUDACachingAllocator instance; return instance; }
+    static CUDACachingAllocator& get() { static auto* instance = new CUDACachingAllocator; return *instance; }
     ~CUDACachingAllocator() override { empty_cache(); }
     void* allocate(size_t bytes) override;
     void free(void* ptr, size_t bytes) override;

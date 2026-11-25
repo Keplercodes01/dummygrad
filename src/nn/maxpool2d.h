@@ -107,6 +107,10 @@ inline std::shared_ptr<Tensor> max_pool2d(const std::shared_ptr<Tensor>& x_in, i
     g.H_out = (g.H - kH) / strideH + 1;
     g.W_out = (g.W - kW) / strideW + 1;
 
+    // Planes whose flat positions fit in a float use the general pooling op (which also supports
+    // higher-order gradients); the code below handles any size
+    if ((int64_t)g.H * g.W <= (1 << 24)) return max_pool_nd(x, {kH, kW}, {strideH, strideW}).first;
+
     Device dev = x->device;
     std::vector<int64_t> out_shape{x->shape[0], x->shape[1], g.H_out, g.W_out};
     auto out = std::make_shared<Tensor>(out_shape, dev, DType::Float32, false);

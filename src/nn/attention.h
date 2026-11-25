@@ -7,6 +7,17 @@
 #ifdef USE_CUDA
 // Backward of the CUDA attention kernel; q, k, v, out are contiguous [batch, heads, seq, head_dim]
 struct FlashAttentionBackward : public Node {
+    // The same gradients from explicit scores (memory quadratic in the sequence length)
+    std::vector<std::shared_ptr<Tensor>> apply_graph(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        auto qv = graph_input(*this, 0, q), kv = graph_input(*this, 1, k), vv = graph_input(*this, 2, v);
+        auto scores = mul_scalar(matmul(qv, transpose(kv, -2, -1)), scale);
+        if (causal) scores = causal_mask(scores);
+        auto p = softmax(scores);
+        auto gp = matmul(grads[0], transpose(vv, -2, -1));
+        auto gs = mul_scalar(mul(p, sub(gp, sum(mul(gp, p), -1, true))), scale);
+        return {matmul(gs, kv), matmul(transpose(gs, -2, -1), qv), matmul(transpose(p, -2, -1), grads[0])};
+    }
+
     std::shared_ptr<Tensor> q, k, v, out, lse;
     int batch_size, num_heads, seq_len, d_k;
     bool causal;
@@ -127,6 +138,10 @@ public:
 // GQA: each of the kv heads serves `group` consecutive query heads (query head h reads kv head
 // h / group). [B, kv, S, D] -> [B, kv * group, S, D]; the gradient sums each group back.
 struct RepeatKVBackward : public Node {
+    std::vector<std::shared_ptr<Tensor>> apply_graph(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        return {reshape(sum(reshape(grads[0], {batch, kv_heads, group, head_elems}), 2, false), in_shape)};
+    }
+
     int64_t batch, kv_heads, group, head_elems;
     std::vector<int64_t> in_shape;
 
@@ -148,16 +163,17 @@ struct RepeatKVBackward : public Node {
         auto oh = (dev == Device::CPU) ? gin : std::make_shared<Tensor>(in_shape, Device::CPU, g->dtype, false);
         const float* gp = gh->data_ptr<float>();
         float* op = oh->data_ptr<float>();
-        for (int64_t b = 0; b < batch; ++b) {
-            for (int64_t k = 0; k < kv_heads; ++k) {
-                float* dst = op + (b * kv_heads + k) * head_elems;
-                std::fill(dst, dst + head_elems, 0.0f);
-                for (int64_t r = 0; r < group; ++r) {
-                    const float* src = gp + ((b * kv_heads + k) * group + r) * head_elems;
-                    for (int64_t e = 0; e < head_elems; ++e) dst[e] += src[e];
+        const int64_t copies = group, elems = head_elems;
+        parallel_for(0, batch * kv_heads, std::max<int64_t>(1, 32768 / std::max<int64_t>(1, copies * elems)), [=](int64_t begin, int64_t end) {
+            for (int64_t h = begin; h < end; ++h) {
+                float* dst = op + h * elems;
+                std::fill(dst, dst + elems, 0.0f);
+                for (int64_t r = 0; r < copies; ++r) {
+                    const float* src = gp + (h * copies + r) * elems;
+                    for (int64_t e = 0; e < elems; ++e) dst[e] += src[e];
                 }
             }
-        }
+        });
         return {(dev == Device::CPU) ? oh : oh->to(dev)};
     }
 };
@@ -181,12 +197,12 @@ inline std::shared_ptr<Tensor> repeat_kv(const std::shared_ptr<Tensor>& x_in, in
         auto oh = (dev == Device::CPU) ? out : std::make_shared<Tensor>(out_shape, Device::CPU, x->dtype, false);
         const float* xp = xh->data_ptr<float>();
         float* op = oh->data_ptr<float>();
-        for (int64_t b = 0; b < batch; ++b) {
-            for (int64_t h = 0; h < kv_heads * group; ++h) {
-                const float* src = xp + (b * kv_heads + h / group) * head_elems;
-                std::copy(src, src + head_elems, op + (b * kv_heads * group + h) * head_elems);
+        parallel_for(0, batch * kv_heads * group, std::max<int64_t>(1, 65536 / std::max<int64_t>(1, head_elems)), [=](int64_t begin, int64_t end) {
+            for (int64_t h = begin; h < end; ++h) {
+                const float* src = xp + (h / group) * head_elems;
+                std::copy(src, src + head_elems, op + h * head_elems);
             }
-        }
+        });
         if (dev != Device::CPU) out = oh->to(dev);
     }
     out->requires_grad = needs_grad(x);

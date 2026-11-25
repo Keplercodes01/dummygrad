@@ -1,6 +1,5 @@
 #pragma once
 #include "tensor.h"
-#include "functional.h"
 #include <vector>
 
 namespace ops {

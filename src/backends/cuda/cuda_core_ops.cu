@@ -109,7 +109,18 @@ struct BroadcastDims {
     int64_t y_shape[kMaxDims];
 
     __device__ int64_t y_offset(int64_t x_idx) const {
+        if (ndim == 1) return y_strides[0] ? x_idx : 0;  // equal shapes, or a scalar: no division
         int64_t off = 0;
+        if (x_strides[0] * x_shape[0] <= 0x7fffffffLL) {
+            // 32-bit division is several times cheaper than 64-bit
+            uint32_t rest = (uint32_t)x_idx;
+            for (int d = ndim - 1; d > 0; --d) {
+                uint32_t size = (uint32_t)x_shape[d], quot = rest / size;
+                off += (int64_t)(rest - quot * size) * y_strides[d];
+                rest = quot;
+            }
+            return off + (int64_t)rest * y_strides[0];
+        }
         for (int d = ndim - 1; d >= 0; --d) {
             int64_t i = x_idx % x_shape[d];
             x_idx /= x_shape[d];
@@ -561,83 +572,6 @@ __global__ void k_max_pool2d_backward(const float* grad, const float* argmax, fl
 }
 
 // ---------------------------------------------------------------------------------------------
-// Reductions over one of the last two dims of [batch, rows, cols]: over_rows reduces dim -2
-// (one output per batch and column), else dim -1 (one per batch and row). Mirror the host loops of
-// sum, mean, var and std_dev in ops/functional.h.
-// ---------------------------------------------------------------------------------------------
-
-struct AxisSum {
-    const float* x;
-    int64_t rows, cols;
-    bool over_rows;
-    struct Ctx {
-        int64_t base, step;
-    };
-    __device__ Ctx context(int64_t t) const {
-        if (over_rows) {
-            int64_t b = t / cols;
-            return Ctx{b * rows * cols + (t - b * cols), cols};
-        }
-        return Ctx{t * cols, 1};
-    }
-    __device__ float operator()(const Ctx& c, int64_t k) const { return x[c.base + k * c.step]; }
-};
-
-// Squared deviation from each output's mean
-struct AxisSqDev {
-    const float* x;
-    const float* mean;
-    int64_t rows, cols;
-    bool over_rows;
-    struct Ctx {
-        int64_t base, step;
-        float m;
-    };
-    __device__ Ctx context(int64_t t) const {
-        if (over_rows) {
-            int64_t b = t / cols;
-            return Ctx{b * rows * cols + (t - b * cols), cols, mean[t]};
-        }
-        return Ctx{t * cols, 1, mean[t]};
-    }
-    __device__ float operator()(const Ctx& c, int64_t k) const {
-        float d = x[c.base + k * c.step] - c.m;
-        return d * d;
-    }
-};
-
-// Index of the output an input element of [batch, rows, cols] reduces into
-__device__ __forceinline__ int64_t axis_output(int64_t i, int64_t rows, int64_t cols, bool over_rows) {
-    int64_t b = i / (rows * cols);
-    int64_t rem = i - b * rows * cols;
-    int64_t r = rem / cols;
-    return over_rows ? b * cols + (rem - r * cols) : b * rows + r;
-}
-
-__global__ void k_reduce_axis_backward(const float* g, float* ga, int64_t n, int64_t rows, int64_t cols, bool over_rows,
-                                       float divisor) {
-    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
-        ga[i] = g[axis_output(i, rows, cols, over_rows)] / divisor;
-    }
-}
-
-// var: 2 (x - mean) / count * g;  std: (x - mean) / (count * (std + 1e-8)) * g, as the host code
-__global__ void k_moment_backward(const float* x, const float* mean, const float* stat, const float* g, float* ga,
-                                  int64_t n, int64_t rows, int64_t cols, bool over_rows, bool is_std, float count) {
-    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
-        int64_t o = axis_output(i, rows, cols, over_rows);
-        float d = x[i] - mean[o];
-        ga[i] = is_std ? (d / (count * (stat[o] + 1e-8f))) * g[o] : (2.0f * d / count) * g[o];
-    }
-}
-
-__global__ void k_sqrt_inplace(float* x, int64_t n) {
-    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
-        x[i] = sqrtf(x[i]);
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
 // Elementwise losses averaged over their elements (kind: 0 MSE, 1 L1, 2 cross entropy on
 // probabilities), mirroring mse, l1_loss and cross_entropy in ops/functional.h
 // ---------------------------------------------------------------------------------------------
@@ -979,44 +913,6 @@ void max_pool2d_backward(const float* grad, const float* argmax, float* gx, int6
     int64_t n = planes * H * W;
     if (n == 0) return;
     k_max_pool2d_backward<<<grid_for(n), kThreads>>>(grad, argmax, gx, planes, H, W, H_out, W_out, kH, kW, sH, sW);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void reduce_axis(const float* x, float* out, int64_t batch, int64_t rows, int64_t cols, bool over_rows, float divisor) {
-    int64_t n_out = batch * (over_rows ? cols : rows);
-    if (n_out == 0) return;
-    reduce_terms(AxisSum{x, rows, cols, over_rows}, n_out, over_rows ? rows : cols, out);
-    if (divisor != 1.0f) scalar_forward(3, out, divisor, out, n_out);
-}
-
-void reduce_axis_backward(const float* g, float* ga, int64_t batch, int64_t rows, int64_t cols, bool over_rows,
-                          float divisor) {
-    int64_t n = batch * rows * cols;
-    if (n == 0) return;
-    k_reduce_axis_backward<<<grid_for(n), kThreads>>>(g, ga, n, rows, cols, over_rows, divisor);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void moment_axis(const float* x, float* mean, float* out, int64_t batch, int64_t rows, int64_t cols, bool over_rows,
-                 bool take_sqrt) {
-    int64_t n_out = batch * (over_rows ? cols : rows);
-    if (n_out == 0) return;
-    float count = (float)(over_rows ? rows : cols);
-    reduce_axis(x, mean, batch, rows, cols, over_rows, count);
-    reduce_terms(AxisSqDev{x, mean, rows, cols, over_rows}, n_out, over_rows ? rows : cols, out);
-    scalar_forward(3, out, count, out, n_out);
-    if (take_sqrt) {
-        k_sqrt_inplace<<<grid_for(n_out), kThreads>>>(out, n_out);
-        CUDA_CHECK(cudaGetLastError());
-    }
-}
-
-void moment_axis_backward(const float* x, const float* mean, const float* stat, const float* g, float* ga, int64_t batch,
-                          int64_t rows, int64_t cols, bool over_rows, bool is_std) {
-    int64_t n = batch * rows * cols;
-    if (n == 0) return;
-    float count = (float)(over_rows ? rows : cols);
-    k_moment_backward<<<grid_for(n), kThreads>>>(x, mean, stat, g, ga, n, rows, cols, over_rows, is_std, count);
     CUDA_CHECK(cudaGetLastError());
 }
 

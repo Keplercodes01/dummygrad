@@ -38,6 +38,12 @@ struct EmbeddingBackward : public Node {
 
     void release_variables() override { indices.reset(); }
 
+    std::vector<std::shared_ptr<Tensor>> apply_graph(const std::vector<std::shared_ptr<Tensor>>& grads) override {
+        auto ids = reshape(indices, {indices->size()});
+        auto g = reshape(grads[0], {ids->size(), dim});
+        return {index_add(full({vocab, dim}, 0.0f, g->device), 0, ids, g)};
+    }
+
     std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
         if (grads.empty() || !grads[0] || !indices) return {nullptr};
         auto g = grads[0];
@@ -132,10 +138,12 @@ public:
             const float* id_ptr = host_ids->data_ptr<float>();
             const float* w = wh->data_ptr<float>();
             float* o = oh->data_ptr<float>();
-            for (int64_t p = 0; p < n; ++p) {
-                int64_t id = (int64_t)id_ptr[p];
-                std::copy(w + id * dim, w + (id + 1) * dim, o + p * dim);
-            }
+            parallel_for(0, n, std::max<int64_t>(1, 65536 / std::max<int64_t>(1, dim)), [=](int64_t begin, int64_t end) {
+                for (int64_t p = begin; p < end; ++p) {
+                    int64_t id = (int64_t)id_ptr[p];
+                    std::copy(w + id * dim, w + (id + 1) * dim, o + p * dim);
+                }
+            });
             if (dev != Device::CPU) out = oh->to(dev);
         }
 

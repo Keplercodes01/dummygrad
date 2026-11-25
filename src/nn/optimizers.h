@@ -230,12 +230,7 @@ public:
         float* v = s.v->data_ptr<float>();
         const float bias1 = 1.0f - (float)std::pow((double)beta1, (double)s.step);
         const float bias2 = 1.0f - (float)std::pow((double)beta2, (double)s.step);
-        for (int64_t i = 0; i < n; ++i) {
-            w[i] -= lr * wd * w[i];
-            m[i] = beta1 * m[i] + (1.0f - beta1) * grad[i];
-            v[i] = beta2 * v[i] + (1.0f - beta2) * grad[i] * grad[i];
-            w[i] -= lr * (m[i] / bias1) / (std::sqrt(v[i] / bias2) + eps);
-        }
+        kern::host::adam_step(w, grad, m, v, nullptr, n, lr, beta1, beta2, eps, wd, /*decoupled=*/true, bias1, bias2);
         if (p->device == Device::TPU) p->storage->tpu_handle.reset();  // the TPU copy is now stale
     }
 

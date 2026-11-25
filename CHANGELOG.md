@@ -2,6 +2,41 @@
 
 All notable changes to dummygrad are documented here. Versions follow [Semantic Versioning](https://semver.org/); while the major version is 0, minor releases may change behavior.
 
+## [Unreleased]
+
+The research release: higher-order autograd, the op, layer, optimizer, linear-algebra, FFT and distribution libraries of a research framework, and a threaded CPU backend. On a Kaggle T4 x2, `test_research` (914 checks, including every op, optimizer and several whole modules on CUDA against the CPU) and `test_engine` (268, including the two-GPU test) pass.
+
+### Added
+- **Higher-order gradients.** `autograd::grad` returns gradients instead of accumulating them; `create_graph=true` records the gradient computation so it can be differentiated again, to any order. The existing ops support it too: matmul, linear, softmax, the norms, RoPE, attention, the losses. (`checkpoint`, `linalg::eigvals` and the third derivative of `digamma` do not, and say so.) `autograd::jacobian`, `hessian`, `hvp`, `vjp`, `jvp`, `backward` (several outputs, weighted), `checkpoint` (recompute instead of store, with replayed dropout) and `custom_function`.
+- **Autograd tools.** `Tensor::register_hook`, `retain_grad`, `detach`, `clone`, `item`, `to_vector`, `backward(gradient)`; `EnableGradGuard`.
+- **Defining ops.** `make_op(name, out, inputs, saved, vjp)` builds a differentiable op from a value and a vector-Jacobian product written with other ops, with second derivatives for free. New kernels are written once as functors (`src/kernels`) and compiled for the CPU and the GPU.
+- **About 300 ops:** elementwise functions and activations; comparisons, `where`, `clamp`; two-way broadcasting; views (`expand`, `permute`, `select`, `slice_step`, `diagonal`, ...), `cat`, `stack`, `split`, `pad` (constant, reflect, replicate, circular), `flip`, `roll`, `repeat`; reductions over any dimensions (`sum`, `mean`, `var`, `std_dev`, `amax`, `amin`, `prod`, `logsumexp`, `norm`), `cumsum`, `cumprod`, `cummax`, `logcumsumexp`; `gather`, `scatter`, `scatter_add`, `scatter_reduce`, `index_select`, `index_add`, `index_copy`, `masked_select`, `take`; `sort`, `topk`, `median`, `quantile`, `unique`, `searchsorted`, `bincount`, `histc`; `einsum`, `tensordot`, `kron`, `cdist`, `cross`, `outer`; softmax and log-softmax over any dimension.
+- **Convolutions** in 1 to 3 dimensions with stride, padding, dilation and groups, transposed convolutions, `unfold`/`fold`, max, average, Lp and adaptive pooling, unpooling, `interpolate` (nearest, linear, cubic, area), `pixel_shuffle`, `grid_sample`, `affine_grid`.
+- **Losses:** cross entropy (class weights, ignored index, label smoothing, soft targets), NLL, BCE with and without logits, KL, Huber, smooth L1, Poisson and Gaussian NLL, hinge, margin, ranking, cosine, triplet, multi-margin, focal, CTC.
+- **Layers:** `Sequential`, `ModuleList`, `Conv1d/2d/3d`, `ConvTranspose1d/2d/3d`, `BatchNorm`, `GroupNorm`, `InstanceNorm`, `LocalResponseNorm`, dropout variants and `DropPath`, pooling, `Upsample`, `RNN`, `LSTM`, `GRU` (multi-layer, bidirectional) and their cells, `CrossAttention`, `Transformer` encoder-decoder, `Bilinear`, `EmbeddingBag`, `SpectralNorm`, `weight_norm`, activation layers; `init::` (Xavier, Kaiming, truncated normal, ...).
+- **Optimizers** (`optim::`): SGD with Nesterov momentum, Adam, AdamW, AMSGrad, NAdam, RAdam, Adamax, Adagrad, Adadelta, RMSprop, Rprop, LBFGS, Lion, Muon, Adafactor, with per-parameter weight decay and learning rate, and checkpointable state. Schedules: step, multi-step, exponential, linear, polynomial, cosine with restarts, one-cycle, cyclic, sequential, lambda, plateau. `optim::EMA`, `optim::SWA`, `clip_grad_value_`.
+- **`linalg::`**: cholesky, qr, lu, svd, eigh, eigvals, solve, solve_triangular, inv, pinv, det, slogdet, lstsq, matrix_exp, matrix_power, norms, rank, condition number; differentiable, in double precision on the host.
+- **`fft::`**: fft, ifft, rfft, irfft (any length, any dimension), 2-D and n-D, stft, istft, convolution, windows; differentiable, on the host.
+- **`distributions::`**: 20 distributions with log_prob, sampling, reparameterized sampling where one exists, entropy and moments; KL divergences.
+- **Random numbers** from a counter-based generator (Philox): `rand`, `normal`, `randint`, `randperm`, `bernoulli`, `multinomial`, `dropout`, `gumbel_softmax` give the same values on every device and thread count for a seed.
+- `test_research`: gradients and second derivatives of every op against finite differences, CUDA against the CPU, values against definitions. `examples/research_tour.cpp`.
+- `-DDUMMYGRAD_USE_BLAS=OFF`, `set_num_threads`, `DUMMYGRAD_NUM_THREADS`.
+
+### Faster
+- **CPU: 2.4 to 3.3 times faster training steps** than v0.8.0 on 4-thread CI machines (OpenBLAS, both versions in one job): tiny 51.0 to 18.9 ms and small 1086 to 460 ms on one, 39.5 to 12.0 and 791 to 306 on another. Kernels run on a thread pool and vectorize (including `exp`, `log` and `tanh`), a shared weight's matmul is one GEMM over the whole batch, Linear adds its bias in place, the tied LM head multiplies by the transpose without copying, and backward runs on the calling thread.
+- Without a BLAS, a packed, vectorized, threaded matrix multiply replaces the triple loop.
+- **GPU (speed not yet compared with v0.8.0 in one session):** broadcast, strided-copy and RoPE kernels index with 32-bit division, or none for equal shapes; an activation several matmuls read is converted to fp16 once and saved once.
+
+### Changed
+- **`mean`, `var` and `std_dev` take a real dimension.** `mean(x, 0)` of a 3-D tensor reduced the second-to-last dimension, and 1 the last; they now reduce dimensions 0 and 1. 2-D results are unchanged.
+- Running backward through a graph that an earlier backward freed throws; it silently lost the gradients of the shared part. Pass `retain_graph=true` the first time.
+- Ops built with `make_op` throw when a tensor saved for backward was modified in place.
+- 1-D operands and partially broadcast batch dimensions work in `matmul` on every device.
+- Running out of GPU memory returns cached blocks and retries before throwing.
+
+### Fixed
+- Tensors in static storage crashed the program on exit (the allocator was destroyed first).
+
 ## [0.8.0] - 2026-10-28
 
 The audit release: every finding of a full-codebase audit fixed, plus the benchmark tooling. On a Kaggle T4, same session, median ms per step:

@@ -18,6 +18,10 @@
 #include "ops/ops.h"
 #include "ops/functional.h"
 #include "ops/cool_ops.h"
+#include "autograd/functional_api.h"
+#include "linalg/linalg.h"
+#include "spectral/spectral.h"
+#include "distributions.h"
 #include "ops/masking.h"
 
 // 4. Hardware Backends
@@ -35,7 +39,11 @@
 #include "nn/conv1d.h"
 #include "nn/conv2d.h"
 #include "nn/maxpool2d.h"
+#include "nn/layers.h"
+#include "nn/recurrent.h"
+#include "nn/transformer_layers.h"
 #include "nn/optimizers.h"
+#include "nn/optim.h"
 
 // 6. Reference Architectures
 #include "models/transformer.h"

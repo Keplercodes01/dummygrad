@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
+#include <string>
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -60,7 +61,22 @@ void* CUDACachingAllocator::allocate(size_t bytes) {
     } else {
         cudaError_t err = cudaMalloc(&ptr, alloc_size);
         if (err != cudaSuccess || !ptr) {
-            throw std::bad_alloc();
+            // Blocks cached for other sizes may hold the memory: give this device's back and try again
+            cudaDeviceSynchronize();
+            for (auto& pair : free_blocks[dev]) {
+                for (void* cached : pair.second) {
+                    cudaFree(cached);
+                    ptr_device.erase(cached);
+                    stats.reserved -= std::min(stats.reserved, pair.first);
+                }
+                pair.second.clear();
+            }
+            ptr = nullptr;
+            err = cudaMalloc(&ptr, alloc_size);
+        }
+        if (err != cudaSuccess || !ptr) {
+            throw std::runtime_error("out of GPU memory: " + std::to_string(alloc_size >> 20) + " MB requested, " +
+                                     std::to_string(stats.in_use >> 20) + " MB in use by tensors");
         }
         ptr_device[ptr] = dev;
         stats.reserved += alloc_size;

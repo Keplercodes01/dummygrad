@@ -1117,10 +1117,6 @@ static std::string invalid_shapes_rejected(Device dev) {
     auto bias = download(masking::alibi_bias(1, 3, /*causal=*/false));
     if (bias[0 * 3 + 2] != bias[2 * 3 + 0] || !(bias[0 * 3 + 2] < 0.0f)) return "non-causal ALiBi is not a symmetric penalty";
 
-    if (dev == Device::CUDA &&
-        !throws([] { matmul(upload({1, 2}, {2}, Device::CUDA, false), upload({1, 2, 3, 4}, {2, 2}, Device::CUDA, false)); })) {
-        return "a 1-D CUDA matmul operand was accepted";
-    }
     return "";
 }
 

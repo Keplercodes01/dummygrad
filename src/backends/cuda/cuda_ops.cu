@@ -334,14 +334,48 @@ __global__ void k_make_contiguous(T* dst, const T* src, TensorLayout layout, int
     int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_elements) return;
 
-    int64_t temp = idx;
     int64_t src_offset = 0;
-    for (int d = layout.ndim - 1; d >= 0; --d) {
-        int64_t coord = temp % layout.shape[d];
-        temp /= layout.shape[d];
-        src_offset += coord * layout.strides[d];
+    if (total_elements <= 0x7fffffffLL) {
+        // 32-bit division is several times cheaper than 64-bit
+        uint32_t rest = (uint32_t)idx;
+        for (int d = layout.ndim - 1; d > 0; --d) {
+            uint32_t size = (uint32_t)layout.shape[d], quot = rest / size;
+            src_offset += (int64_t)(rest - quot * size) * layout.strides[d];
+            rest = quot;
+        }
+        src_offset += (int64_t)rest * layout.strides[0];
+    } else {
+        int64_t rest = idx;
+        for (int d = layout.ndim - 1; d >= 0; --d) {
+            src_offset += (rest % layout.shape[d]) * layout.strides[d];
+            rest /= layout.shape[d];
+        }
     }
     dst[idx] = src[src_offset];
+}
+
+// Pair j of head h at step s of sequence b, for flat pair index idx
+__device__ __forceinline__ void rope_position(int64_t idx, int64_t total, int half_dim, int n_heads, int seq_len, int& j,
+                                              int& h, int& s, int& b) {
+    if (total <= 0x7fffffffLL) {
+        uint32_t rest = (uint32_t)idx;
+        uint32_t q = rest / (uint32_t)half_dim;
+        j = (int)(rest - q * (uint32_t)half_dim);
+        rest = q;
+        q = rest / (uint32_t)n_heads;
+        h = (int)(rest - q * (uint32_t)n_heads);
+        rest = q;
+        q = rest / (uint32_t)seq_len;
+        s = (int)(rest - q * (uint32_t)seq_len);
+        b = (int)q;
+    } else {
+        j = (int)(idx % half_dim);
+        int64_t rest = idx / half_dim;
+        h = (int)(rest % n_heads);
+        rest /= n_heads;
+        s = (int)(rest % seq_len);
+        b = (int)(rest / seq_len);
+    }
 }
 
 __global__ void k_rope_forward(const float* in, const float* cos_freqs, const float* sin_freqs,
@@ -351,12 +385,8 @@ __global__ void k_rope_forward(const float* in, const float* cos_freqs, const fl
     if (idx >= total) return;
 
     int half_dim = head_dim / 2;
-    int j = idx % half_dim;
-    int64_t rem = idx / half_dim;
-    int h = rem % n_heads;
-    rem /= n_heads;
-    int s = rem % seq_len;
-    int b = rem / seq_len;
+    int j, h, s, b;
+    rope_position(idx, total, half_dim, n_heads, seq_len, j, h, s, b);
 
     int pos = start_pos + s;
     float c = cos_freqs[pos * half_dim + j];
@@ -377,12 +407,8 @@ __global__ void k_rope_backward(const float* grad_out, const float* cos_freqs, c
     if (idx >= total) return;
 
     int half_dim = head_dim / 2;
-    int j = idx % half_dim;
-    int64_t rem = idx / half_dim;
-    int h = rem % n_heads;
-    rem /= n_heads;
-    int s = rem % seq_len;
-    int b = rem / seq_len;
+    int j, h, s, b;
+    rope_position(idx, total, half_dim, n_heads, seq_len, j, h, s, b);
 
     int pos = start_pos + s;
     float c = cos_freqs[pos * half_dim + j];
@@ -400,12 +426,28 @@ template <typename T>
 static void make_contiguous_typed(Tensor& dst, const Tensor& src) {
     int ndim = src.ndim();
     int64_t total = src.size();
-    if (ndim <= 8) {
+    // Size-1 dimensions go away and neighbours walked contiguously merge, so the kernel divides less
+    std::vector<int64_t> shape, strides;
+    for (int i = 0; i < ndim; ++i) {
+        if (src.shape[i] == 1) continue;
+        if (!shape.empty() && strides.back() == src.strides[i] * src.shape[i]) {
+            shape.back() *= src.shape[i];
+            strides.back() = src.strides[i];
+        } else {
+            shape.push_back(src.shape[i]);
+            strides.push_back(src.strides[i]);
+        }
+    }
+    if (shape.empty()) {
+        shape.push_back(1);
+        strides.push_back(0);
+    }
+    if (shape.size() <= 8) {
         TensorLayout layout;
-        layout.ndim = ndim;
-        for (int i = 0; i < ndim; ++i) {
-            layout.shape[i] = src.shape[i];
-            layout.strides[i] = src.strides[i];
+        layout.ndim = (int)shape.size();
+        for (size_t i = 0; i < shape.size(); ++i) {
+            layout.shape[i] = shape[i];
+            layout.strides[i] = strides[i];
         }
         int threads = 256;
         int blocks = (int)((total + threads - 1) / threads);
@@ -657,13 +699,13 @@ static void check_compute_dtype(DType compute, const char* who) {
 
 // A contiguous tensor as a GEMM operand of the compute dtype: itself when it already has that
 // dtype, else a converted copy (rounded to nearest even when narrowing)
-// A leaf tensor (a parameter: no grad_fn) covering its whole storage keeps its converted copy in
-// the storage's cast cache, so a weight converts once per optimizer step instead of every forward
-// (and every backward that needs it). Activations convert every time; they are new each step.
+// A tensor covering its whole storage keeps its converted copy in the storage's cast cache. A weight
+// converts once per optimizer step instead of every forward (and every backward that needs it), and an
+// activation several matmuls read (the normalized input of Q, K and V) converts once and is saved once.
 static std::shared_ptr<Tensor> gemm_operand(const std::shared_ptr<Tensor>& t, DType compute) {
     if (t->dtype == compute) return t;
     Storage& st = *t->storage;
-    bool cacheable = !t->grad_fn && t->global_offset == 0 && t->is_contiguous() &&
+    bool cacheable = t->global_offset == 0 && t->is_contiguous() &&
                      st.total_bytes == (size_t)t->size() * dtype_size(t->dtype);
     std::unique_lock<std::mutex> lock(st.cast_mutex, std::defer_lock);
     if (cacheable) {
