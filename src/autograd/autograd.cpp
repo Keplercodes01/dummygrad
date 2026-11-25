@@ -13,6 +13,7 @@
 #endif
 
 static std::atomic<bool> g_detect_anomaly{false};
+static thread_local bool t_engine_worker = false;  // set on the engine's pool threads
 
 void set_detect_anomaly(bool enabled) { g_detect_anomaly = enabled; }
 bool detect_anomaly_enabled() { return g_detect_anomaly; }
@@ -57,6 +58,7 @@ AutogradEngine::AutogradEngine() {
     if (num_threads == 0) num_threads = 4;
     for (int i = 0; i < num_threads; ++i) {
         workers.emplace_back([this]() {
+            t_engine_worker = true;
             while (true) {
                 std::function<void()> task;
                 {
@@ -292,7 +294,8 @@ void AutogradEngine::execute(const std::vector<Root>& roots, const Options& opti
     }
 
     BackwardExecution mode = g_backward_execution;
-    if (mode == BackwardExecution::Auto || create_graph) mode = BackwardExecution::CallingThread;
+    // A backward started by a node (checkpointing) must not wait on the pool it is running on
+    if (mode == BackwardExecution::Auto || create_graph || t_engine_worker) mode = BackwardExecution::CallingThread;
     if (mode == BackwardExecution::CallingThread) {
         // Newest node first, as PyTorch does: every node is created after the nodes it feeds
         // gradients to, so this follows the forward pass in reverse and frees saved tensors early.
