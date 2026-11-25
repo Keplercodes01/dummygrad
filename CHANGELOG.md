@@ -4,7 +4,7 @@ All notable changes to dummygrad are documented here. Versions follow [Semantic 
 
 ## [Unreleased]
 
-The research release: higher-order autograd, the op, layer, optimizer, linear-algebra, FFT and distribution libraries of a research framework, and a threaded CPU backend. On a Kaggle T4 x2, `test_research` (914 checks, including about 220 ops, 13 optimizers and several whole modules on CUDA against the CPU) and `test_engine` (268, including the two-GPU test) pass.
+The research release: higher-order autograd, the op, layer, optimizer, linear-algebra, FFT and distribution libraries of a research framework, and a threaded CPU backend. On a Kaggle T4 x2, `test_research` (985 checks, including about 240 ops, 13 optimizers and several whole modules on CUDA against the CPU), `test_engine` (269, including the two-GPU test) and `test_models` (22) pass.
 
 ### Added
 - **Higher-order gradients.** `autograd::grad` returns gradients instead of accumulating them; `create_graph=true` records the gradient computation so it can be differentiated again, to any order. The existing ops support it too: matmul, linear, softmax, the norms, RoPE, attention, the losses. (`checkpoint`, `linalg::eigvals` and the third derivative of `digamma` do not, and say so.) `autograd::jacobian`, `hessian`, `hvp`, `vjp`, `jvp`, `backward` (several outputs, weighted), `checkpoint` (recompute instead of store, with replayed dropout) and `custom_function`.
@@ -34,8 +34,8 @@ The research release: higher-order autograd, the op, layer, optimizer, linear-al
 - **CPU: 2.4 to 3.3 times faster training steps** than v0.8.0 on 4-thread CI machines (OpenBLAS, both versions in one job): tiny 51.0 to 18.9 ms and small 1086 to 460 ms on one, 39.5 to 12.0 and 791 to 306 on another. Kernels run on a thread pool and vectorize (including `exp`, `log` and `tanh`), a shared weight's matmul is one GEMM over the whole batch, Linear adds its bias in place, the tied LM head multiplies by the transpose without copying, and backward runs on the calling thread.
 - Without a BLAS, a packed, vectorized, threaded matrix multiply replaces the triple loop.
 - **On the GPU instead of the host:** sorting (`sort`, `argsort`, `topk`, `median`, `quantile`) by radix sort, `index_add`, `scatter` and long `scatter_add` by sorting their targets (deterministic), `fft` through cuFFT.
-- **Attention with masks, cross-attention and cached attention** use the fused GPU path; they ran as separate ops that stored their score matrices.
-- **Convolutions keep no columns.** The unfolded input, kernel-size times the input, was made for the whole batch and kept for backward; it is now made a few samples at a time, and again in backward. 1x1 convolutions use the input itself.
+- **Cached generation:** 1.2 ms per token against 4.5 without a cache (batch 1), 2.1 against 65 (batch 16); T4, 23M parameters, half way through 64 new tokens after a 64-token prompt.
+- **Convolutions keep no columns** (memory and time not yet compared with before). The unfolded input, kernel-size times the input, was made for the whole batch and kept for backward; it is now made a few samples at a time, and again in backward. 1x1 convolutions use the input itself.
 - **GPU memory is split and joined**, so memory freed at one size serves others; a training step's repeated sizes are still served at once. Copies to the GPU up to 32 MB go through page-locked memory and do not wait for queued work.
 - **GPU (speed not yet compared with v0.8.0 in one session):** broadcast, strided-copy and RoPE kernels index with 32-bit division, or none for equal shapes; an activation several matmuls read is converted to fp16 once and saved once.
 
@@ -47,7 +47,7 @@ The research release: higher-order autograd, the op, layer, optimizer, linear-al
 - Running out of GPU memory returns cached blocks and retries before throwing.
 - `load_safetensors` converts F64, integer and boolean tensors to Float32 instead of refusing them, and refuses malformed headers.
 - `TokenDataset::tokens()` returns a copy; `SelfAttention`, `MultiHeadAttention` and `scaled_dot_product_attention` share `fused_attention`.
-- `cuda::attention_forward` and `attention_backward` take an `AttentionShape`.
+- `cuda::attention_forward` and `attention_backward` take an `AttentionShape`. Masked, cross- and cached attention are one op on the GPU and keep no score matrices for backward. That is not faster: a padded [8, 8, 256, 64] call with its backward takes 2.5 ms against 2.3 as separate ops in fp32 and 2.0 against 2.0 in fp16, with more scratch memory during the call.
 
 ### Fixed
 - Tensors in static storage crashed the program on exit (the allocator was destroyed first).

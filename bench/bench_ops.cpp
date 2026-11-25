@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
             double cached = (now_ms() - a) / (double)o.max_new_tokens;
             auto ids = randint(0, 8192, {batch, 64 + o.max_new_tokens / 2}, g_device);  // half way through
             double full = time_ms([&] { model.forward(ids)->to_vector(); });
-            std::printf("| generate, 45M parameters, batch %-2lld                    | %9.3f ms per token with a cache, %.3f ms without: %.0f tokens/s\n",
+            std::printf("| generate, 23M parameters, batch %-2lld                    | %9.3f ms per token with a cache, %.3f ms without: %.0f tokens/s\n",
                         (long long)batch, cached, full, 1000.0 * (double)batch / cached);
         }
     }
