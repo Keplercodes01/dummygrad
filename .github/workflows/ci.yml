@@ -37,7 +37,7 @@ jobs:
         run: ctest --test-dir build --output-on-failure --verbose
 
       - name: Benchmark smoke run
-        run: ./build/dg_bench tiny
+        run: ./build/dg_bench tiny && ./build/dg_bench small --seconds 5
 
   # No GPU on hosted runners: compile the CUDA backend and everything that includes it, so kernel
   # and header errors surface here instead of on a GPU machine. Running it happens on Colab.
