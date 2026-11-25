@@ -32,6 +32,7 @@ set(DUMMYGRAD_SOURCES
     src/core/profiler.cpp
     src/core/parallel.cpp
     src/core/staging.cpp
+    src/core/mapped_file.cpp
     src/ops/ops.cpp
     src/kernels/kernels_host.cpp
     src/linalg/dense.cpp

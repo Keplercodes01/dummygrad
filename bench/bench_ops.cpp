@@ -16,7 +16,7 @@
 
 static Device g_device = Device::CPU;
 
-static void sync() {
+static void finish() {
 #ifdef USE_CUDA
     if (g_device == Device::CUDA) cudaDeviceSynchronize();
 #endif
@@ -26,13 +26,13 @@ static double now_ms() { return std::chrono::duration<double, std::milli>(std::c
 // The median time of one call, after two that do not count
 static double time_ms(const std::function<void()>& f, double budget_ms = 150.0) {
     for (int i = 0; i < 2; ++i) f();
-    sync();
+    finish();
     std::vector<double> t;
     double start = now_ms();
     while (t.size() < 5 || (now_ms() - start < budget_ms && t.size() < 200)) {
         double a = now_ms();
         f();
-        sync();
+        finish();
         t.push_back(now_ms() - a);
     }
     std::nth_element(t.begin(), t.begin() + (std::ptrdiff_t)t.size() / 2, t.end());
@@ -130,7 +130,7 @@ int main(int argc, char** argv) {
             double s = now_ms();
             auto sent = batch->to(g_device);
             t.push_back(now_ms() - s);
-            sync();
+            finish();
         }
         std::nth_element(t.begin(), t.begin() + 5, t.end());
         std::printf("| copy 3 MB to a busy GPU                              | %9.3f ms until the program goes on\n", t[5]);

@@ -719,6 +719,97 @@ static std::string gpt2_checkpoints() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Tokenizers
+// ---------------------------------------------------------------------------------------------
+
+static std::string joined(const std::vector<std::string>& words) {
+    std::string s;
+    for (const auto& w : words) s += (s.empty() ? "" : "|") + w;
+    return s;
+}
+
+static std::string tokenizer_splitting() {
+    using tokenizer_detail::Splitter;
+    Splitter gpt2, llama;
+    llama.kind = Splitter::Kind::Llama3;
+    auto expect = [](const Splitter& s, const std::string& text, const std::string& want) -> std::string {
+        auto got = joined(s.split(text));
+        return got == want ? "" : "split into " + got + ", expected " + want;
+    };
+    // What the original regular expressions give
+    CHECK(expect(gpt2, "Hello world's 123  test\n\n x!?", "Hello| world|'s| 123| | test|\n\n| x|!?"));
+    CHECK(expect(gpt2, "I'll've DON'T  ", "I|'ll|'ve| DON|'|T|  "));
+    CHECK(expect(gpt2, "caf\xc3\xa9 \xe4\xbd\xa0\xe5\xa5\xbd, 3.14", "caf\xc3\xa9| \xe4\xbd\xa0\xe5\xa5\xbd|,| 3|.|14"));
+    CHECK(expect(llama, "Hello world's 12345 DON'T", "Hello| world|'s| |123|45| DON|'T"));
+    CHECK(expect(llama, "a\n\n  b  c\t", "a|\n\n| | b| | c|\t"));
+    CHECK(expect(llama, "x = [1];\n\ny", "x| =| [|1|];\n\n|y"));
+    llama.max_digits = 1;
+    CHECK(expect(llama, "12", "1|2"));
+    return expect(gpt2, "", "");
+}
+
+static std::string tokenizer_training() {
+    std::string text;
+    for (int i = 0; i < 30; ++i) text += "the cat sat on the mat and the dog sat on the log. ";
+    auto tok = Tokenizer::train(text, 300, {"<|end|>"});
+    if (tok.vocab_size() > 300 || tok.vocab_size() < 270) return "vocabulary of " + std::to_string(tok.vocab_size());
+    auto ids = tok.encode("the cat sat on the mat");
+    if (ids.size() > 8) return "the training words are not merged: " + std::to_string(ids.size()) + " tokens";
+    // Anything comes back: other words, other scripts, broken UTF-8
+    for (const std::string& s : {std::string("the dog's log"), std::string("Z\xc3\xbcrich \xe6\x9d\xb1\xe4\xba\xac \xf0\x9f\x98\x80\n\t x"), std::string("\xff\xfe a\xc3"), std::string("")}) {
+        if (tok.decode(tok.encode(s)) != s) return "round trip of \"" + s + "\" gives \"" + tok.decode(tok.encode(s)) + "\"";
+    }
+    auto with = tok.encode("a<|end|>b");
+    if (with.size() != 3 || with[1] != tok.token_id("<|end|>")) return "a special token was not recognized";
+    if (tok.decode(with) != "ab" || tok.decode(with, true) != "a<|end|>b") return "decoding special tokens";
+    if (tok.encode("<|end|>", /*special=*/false).size() < 3) return "a special token was recognized without being asked for";
+    // The most frequent pair is merged first: "th" or "he" or " t", whichever the count says
+    auto tiny = Tokenizer::train("ababab ababab", 257);
+    if (tiny.token_id("ab") != 256) return "the first merge is not ab";
+    TempDir dir("tokenizer");
+    tok.save(dir.path + "/tokenizer.json");
+    auto again = Tokenizer::from_file(dir.path + "/tokenizer.json");
+    for (const char* s : {"the cat sat", "unseen w\xc3\xb6rds", "x<|end|>"}) if (again.encode(s) != tok.encode(s)) return std::string("a saved tokenizer encodes differently: ") + s;
+    return expect_throw([&] { Tokenizer::train("a", 100); }, "a vocabulary without room for the bytes");
+}
+
+static std::string tokenizer_files() {
+    TempDir dir("tokenizer_files");
+    // Llama 3's kind: byte-level, its own splitting rule, whole words first, a beginning-of-text token
+    const std::string space = "\xc4\xa0";  // a space, spelled as a character
+    write_file(dir.path + "/llama.json",
+               "{\"added_tokens\": [{\"id\": 12, \"content\": \"<|begin_of_text|>\", \"special\": true}], \"normalizer\": null,"
+               " \"pre_tokenizer\": {\"type\": \"Sequence\", \"pretokenizers\": [{\"type\": \"Split\", \"pattern\": {\"Regex\":"
+               " \"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\\\r\\\\n\\\\p{L}\\\\p{N}]?\\\\p{L}+|\\\\p{N}{1,3}| ?[^\\\\s\\\\p{L}\\\\p{N}]+[\\\\r\\\\n]*|\\\\s*[\\\\r\\\\n]+|\\\\s+(?!\\\\S)|\\\\s+\"},"
+               " \"behavior\": \"Isolated\", \"invert\": false}, {\"type\": \"ByteLevel\", \"add_prefix_space\": false, \"trim_offsets\": true, \"use_regex\": false}]},"
+               " \"post_processor\": {\"type\": \"Sequence\", \"processors\": [{\"type\": \"ByteLevel\"}, {\"type\": \"TemplateProcessing\", \"single\":"
+               " [{\"SpecialToken\": {\"id\": \"<|begin_of_text|>\", \"type_id\": 0}}, {\"Sequence\": {\"id\": \"A\", \"type_id\": 0}}]}]},"
+               " \"model\": {\"type\": \"BPE\", \"ignore_merges\": true, \"vocab\": {\"a\": 0, \"b\": 1, \"c\": 2, \"" + space + "\": 3, \"1\": 4, \"ab\": 5, \"bc\": 6,"
+               " \"" + space + "a\": 7, \"" + space + "ab\": 8, \"abc\": 9, \"11\": 10, \"cab\": 11},"
+               " \"merges\": [\"b c\", \"a b\", \"" + space + " a\", \"" + space + "a b\", \"1 1\"]}}");
+    auto llama = Tokenizer::from_file(dir.path + "/llama.json");
+    auto ids = llama.encode("ab ab1111abcb");
+    // ab | ' ab' | 111 | 1 | abcb: b c merges before a b
+    if (ids != std::vector<int64_t>{12, 5, 8, 10, 4, 4, 0, 6, 1}) return "Llama-style ids" + joined([&] { std::vector<std::string> v; for (auto i : ids) v.push_back(std::to_string(i)); return v; }());
+    if (llama.encode("cab") != std::vector<int64_t>{12, 11}) return "a word in the vocabulary was split";
+    if (llama.decode(ids) != "ab ab1111abcb") return "Llama-style decoding: " + llama.decode(ids);
+
+    // Llama 2's kind: characters, a visible space, unknown characters as bytes
+    const std::string meta = "\xe2\x96\x81";
+    write_file(dir.path + "/spm.json",
+               "{\"added_tokens\": [{\"id\": 1, \"content\": \"<s>\", \"special\": true}], \"normalizer\": {\"type\": \"Sequence\", \"normalizers\":"
+               " [{\"type\": \"Prepend\", \"prepend\": \"" + meta + "\"}, {\"type\": \"Replace\", \"pattern\": {\"String\": \" \"}, \"content\": \"" + meta + "\"}]},"
+               " \"pre_tokenizer\": null, \"model\": {\"type\": \"BPE\", \"unk_token\": \"<unk>\", \"byte_fallback\": true, \"vocab\": {\"<unk>\": 0, \"<s>\": 1, \"<0xC3>\": 2,"
+               " \"<0xA9>\": 3, \"" + meta + "\": 4, \"h\": 5, \"i\": 6, \"hi\": 7, \"" + meta + "hi\": 8}, \"merges\": [[\"h\", \"i\"], [\"" + meta + "\", \"hi\"]]}}");
+    auto spm = Tokenizer::from_file(dir.path + "/spm.json");
+    auto got = spm.encode("hi hi\xc3\xa9");
+    if (got != std::vector<int64_t>{8, 8, 2, 3}) return "sentencepiece-style ids";
+    if (spm.decode(got) != "hi hi\xc3\xa9") return "sentencepiece-style decoding: " + spm.decode(got);
+    write_file(dir.path + "/bad.json", "{\"model\": {\"type\": \"WordPiece\"}}");
+    return expect_throw([&] { Tokenizer::from_file(dir.path + "/bad.json"); }, "an unsupported tokenizer");
+}
+
+// ---------------------------------------------------------------------------------------------
 // Adapters and experts
 // ---------------------------------------------------------------------------------------------
 
@@ -1105,6 +1196,9 @@ int main(int argc, char** argv) {
     run("json", json_values);
     run("llama_checkpoints", llama_checkpoints);
     run("gpt2_checkpoints", gpt2_checkpoints);
+    run("tokenizer_splitting", tokenizer_splitting);
+    run("tokenizer_training", tokenizer_training);
+    run("tokenizer_files", tokenizer_files);
     run("no_bias_linear", no_bias_linear);
     run("lora", lora);
     run("experts", experts);

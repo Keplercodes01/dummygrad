@@ -64,5 +64,6 @@
 
 // Training workflow: data loading, checkpoints, metric logging
 #include "data.h"
+#include "tokenizer.h"
 #include "training.h"
 #include "nn/grad_scaler.h"
