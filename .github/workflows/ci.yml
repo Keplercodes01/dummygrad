@@ -55,8 +55,15 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
-      - name: Benchmark smoke run
-        run: ./build/dg_bench tiny && ./build/dg_bench small --seconds 5
+      # Both matrix multiplies on the same machine: runners differ, so numbers from two jobs don't compare
+      - name: Benchmark against OpenBLAS
+        run: |
+          lscpu | grep -E "Model name|^CPU\(s\)"
+          ./build/dg_bench tiny && ./build/dg_bench small --seconds 5 --profile
+          sudo apt-get update -qq && sudo apt-get install -y -qq libopenblas-dev > /dev/null
+          cmake -S . -B build-blas -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=OFF > /dev/null
+          cmake --build build-blas -j 4 --target dg_bench > /dev/null
+          ./build-blas/dg_bench tiny && ./build-blas/dg_bench small --seconds 5 --profile
 
   # No GPU on hosted runners: compile the CUDA backend and everything that includes it, so kernel
   # and header errors surface here instead of on a GPU machine. Running it happens on Colab.
