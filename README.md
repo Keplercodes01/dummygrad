@@ -161,7 +161,7 @@ CMake prints whether it found CUDA (`Building with GPU support`) or is building 
 
 ```bash
 ./build/test_engine      # gradient checks, CUDA-vs-CPU checks, engine tests, training
-./build/test_research    # every op's first and second derivatives, values, layers, optimizers
+./build/test_research    # first and second derivatives, values, layers, optimizers
 ./build/quickstart       # a tour of the API, trains a small network on XOR
 ```
 
@@ -701,7 +701,7 @@ Training-step time (forward, backward, AdamW) for the same ModernTransformer arc
 | medium | 53.9 ms | 46.2 ms | **33.6 ms** |
 | large | 324 ms | 257 ms | **202 ms** |
 
-dummygrad's advantage is per-op overhead (no Python, no dispatcher), which dominates small models. In fp16 at larger sizes it is behind: its activations go back to fp32 between matrix products, where PyTorch's autocast keeps more of them in fp16. That is the next work. `main` has changed the GPU kernels since v0.8.0, and these tables have not been measured again.
+dummygrad's advantage is per-op overhead (no Python, no dispatcher), which dominates small models. In fp16 at larger sizes v0.8.0 is behind. `main` has since kept activations in fp16 between matrix products, which made fp16 steps 16% (small), 14% (medium) and 7% (large) faster than before that change, in one session; these tables have not been measured again.
 
 **CPU**, on two 4-thread CI machines with OpenBLAS, v0.8.0 and `main` in the same job:
 
@@ -720,8 +720,8 @@ dummygrad's advantage is per-op overhead (no Python, no dispatcher), which domin
 ./build/test_engine
 ```
 
-- **Gradients:** every differentiable op against finite differences, and nearly every one's second derivative too.
-- **GPU against CPU**, when there is one: every op, optimizers, reductions, special values (NaN, infinity), and whole models trained for a few steps.
+- **Gradients:** about 220 ops against finite differences, and nearly all of their second derivatives. Some ops and layers, mostly thin compositions of these, have no test of their own yet.
+- **GPU against CPU**, when there is one: the same ops, optimizers, reductions, special values (NaN, infinity), and whole models trained for a few steps.
 - **Values:** against definitions and closed forms (CTC against every alignment, convolutions against their sum, factorizations against their product, samplers against their moments, ...).
 - **Engine:** determinism, graph lifetime, exceptions, resuming runs bit for bit, two-GPU training.
 
@@ -733,7 +733,7 @@ On a Kaggle T4 x2 that is 914 + 268 checks; without a GPU, 652 + 141. CI runs th
 
 dummygrad is pre-1.0. The CPU and CUDA paths are covered by the test suites, in fp32 and, for training, fp16.
 
-- **Mixed precision covers matrix products.** Under `AutocastGuard`, CUDA matmuls and attention (on its cuBLAS path, up to 2048 tokens) run on fp16/bf16 tensor cores. Normalization and elementwise kernels, the softmax, and attention beyond 2048 tokens stay fp32. Tensors are always stored in fp32; non-fp32 tensors are only for storage and conversion. bf16 needs an Ampere or newer GPU.
+- **Mixed precision covers matrix products.** Under `AutocastGuard`, CUDA matmuls and attention (on its cuBLAS path, up to 2048 tokens) run on fp16/bf16 tensor cores. So do the activations between them in the built-in blocks: gated and activated feed-forward outputs, RoPE, queries, keys and values. Normalization, the residual stream, the attention softmax, and attention beyond 2048 tokens stay fp32, as do parameters, gradients of parameters, and optimizer state. bf16 needs an Ampere or newer GPU.
 - **Attention** runs as cuBLAS GEMMs for sequences up to 2048 tokens (any head dimension) and as tiled kernels beyond that for head dimensions up to 128 (other sizes zero-padded to 16, 32, 64 or 128). Larger head dimensions past 2048 tokens use the GEMM path a chunk of heads at a time, whose memory is quadratic in the sequence length.
 - **Data types:** ops compute in fp32. There are no float64, integer, boolean or complex tensors: indices and masks are floats (exact up to 2^24), and complex numbers are pairs. `vmap`, sparse tensors, `torch.compile`-style fusion, and multi-process or sharded training are not implemented.
 - **Multi-GPU** runs in one process and averages gradients GPU to GPU, one parameter at a time (no bucketing or overlap with backward yet). Its test needs two GPUs (Kaggle's T4 x2).

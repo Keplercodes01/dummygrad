@@ -4,7 +4,7 @@ All notable changes to dummygrad are documented here. Versions follow [Semantic 
 
 ## [Unreleased]
 
-The research release: higher-order autograd, the op, layer, optimizer, linear-algebra, FFT and distribution libraries of a research framework, and a threaded CPU backend. On a Kaggle T4 x2, `test_research` (914 checks, including every op, optimizer and several whole modules on CUDA against the CPU) and `test_engine` (268, including the two-GPU test) pass.
+The research release: higher-order autograd, the op, layer, optimizer, linear-algebra, FFT and distribution libraries of a research framework, and a threaded CPU backend. On a Kaggle T4 x2, `test_research` (914 checks, including about 220 ops, 13 optimizers and several whole modules on CUDA against the CPU) and `test_engine` (268, including the two-GPU test) pass.
 
 ### Added
 - **Higher-order gradients.** `autograd::grad` returns gradients instead of accumulating them; `create_graph=true` records the gradient computation so it can be differentiated again, to any order. The existing ops support it too: matmul, linear, softmax, the norms, RoPE, attention, the losses. (`checkpoint`, `linalg::eigvals` and the third derivative of `digamma` do not, and say so.) `autograd::jacobian`, `hessian`, `hvp`, `vjp`, `jvp`, `backward` (several outputs, weighted), `checkpoint` (recompute instead of store, with replayed dropout) and `custom_function`.
@@ -19,10 +19,11 @@ The research release: higher-order autograd, the op, layer, optimizer, linear-al
 - **`fft::`**: fft, ifft, rfft, irfft (any length, any dimension), 2-D and n-D, stft, istft, convolution, windows; differentiable, on the host.
 - **`distributions::`**: 20 distributions with log_prob, sampling, reparameterized sampling where one exists, entropy and moments; KL divergences.
 - **Random numbers** from a counter-based generator (Philox): `rand`, `normal`, `randint`, `randperm`, `bernoulli`, `multinomial`, `dropout`, `gumbel_softmax` give the same values on every device and thread count for a seed.
-- `test_research`: gradients and second derivatives of every op against finite differences, CUDA against the CPU, values against definitions. `examples/research_tour.cpp`.
+- `test_research`: gradients, and for nearly all of them second derivatives, of about 220 ops against finite differences; CUDA against the CPU; values against definitions. Some ops and layers, mostly thin compositions, have no test of their own yet. `examples/research_tour.cpp`.
 - `-DDUMMYGRAD_USE_BLAS=OFF`, `set_num_threads`, `DUMMYGRAD_NUM_THREADS`.
 
 ### Faster
+- **fp16 on the GPU: 6 to 16% faster, with 17 to 18% less memory.** Under autocast, the outputs of the linears inside attention and feed-forward blocks, relu/gelu/silu, products of equal shapes, RoPE, GQA repetition and attention stay in half precision instead of going back to fp32 between matrix products (`Linear::forward_autocast`, `native_half`). Both gradients of a product come from one kernel. T4, against the code before it in the same session: small 14.0 to 11.7 ms, medium 47.8 to 41.2, large 315 to 294, tiny unchanged; a second session agrees.
 - **CPU: 2.4 to 3.3 times faster training steps** than v0.8.0 on 4-thread CI machines (OpenBLAS, both versions in one job): tiny 51.0 to 18.9 ms and small 1086 to 460 ms on one, 39.5 to 12.0 and 791 to 306 on another. Kernels run on a thread pool and vectorize (including `exp`, `log` and `tanh`), a shared weight's matmul is one GEMM over the whole batch, Linear adds its bias in place, the tied LM head multiplies by the transpose without copying, and backward runs on the calling thread.
 - Without a BLAS, a packed, vectorized, threaded matrix multiply replaces the triple loop.
 - **GPU (speed not yet compared with v0.8.0 in one session):** broadcast, strided-copy and RoPE kernels index with 32-bit division, or none for equal shapes; an activation several matmuls read is converted to fp16 once and saved once.
