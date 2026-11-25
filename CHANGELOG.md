@@ -4,7 +4,7 @@ All notable changes to dummygrad are documented here. Versions follow [Semantic 
 
 ## [Unreleased]
 
-The research release: higher-order autograd, the op, layer, optimizer, linear-algebra, FFT and distribution libraries of a research framework, and a threaded CPU backend. Not yet run on a GPU: CI compiles the CUDA code, and `test_research` checks every new op against the CPU on one.
+The research release: higher-order autograd, the op, layer, optimizer, linear-algebra, FFT and distribution libraries of a research framework, and a threaded CPU backend. On a Kaggle T4 x2, `test_research` (914 checks, including every op, optimizer and several whole modules on CUDA against the CPU) and `test_engine` (268, including the two-GPU test) pass.
 
 ### Added
 - **Higher-order gradients.** `autograd::grad` returns gradients instead of accumulating them; `create_graph=true` records the gradient computation so it can be differentiated again, to any order. The existing ops support it too: matmul, linear, softmax, the norms, RoPE, attention, the losses. (`checkpoint`, `linalg::eigvals` and the third derivative of `digamma` do not, and say so.) `autograd::jacobian`, `hessian`, `hvp`, `vjp`, `jvp`, `backward` (several outputs, weighted), `checkpoint` (recompute instead of store, with replayed dropout) and `custom_function`.
@@ -25,7 +25,7 @@ The research release: higher-order autograd, the op, layer, optimizer, linear-al
 ### Faster
 - **CPU: 2.4 to 3.3 times faster training steps** than v0.8.0 on 4-thread CI machines (OpenBLAS, both versions in one job): tiny 51.0 to 18.9 ms and small 1086 to 460 ms on one, 39.5 to 12.0 and 791 to 306 on another. Kernels run on a thread pool and vectorize (including `exp`, `log` and `tanh`), a shared weight's matmul is one GEMM over the whole batch, Linear adds its bias in place, the tied LM head multiplies by the transpose without copying, and backward runs on the calling thread.
 - Without a BLAS, a packed, vectorized, threaded matrix multiply replaces the triple loop.
-- **GPU (not yet measured):** broadcast, strided-copy and RoPE kernels index with 32-bit division, or none for equal shapes; an activation several matmuls read is converted to fp16 once and saved once.
+- **GPU (speed not yet compared with v0.8.0 in one session):** broadcast, strided-copy and RoPE kernels index with 32-bit division, or none for equal shapes; an activation several matmuls read is converted to fp16 once and saved once.
 
 ### Changed
 - **`mean`, `var` and `std_dev` take a real dimension.** `mean(x, 0)` of a 3-D tensor reduced the second-to-last dimension, and 1 the last; they now reduce dimensions 0 and 1. 2-D results are unchanged.
