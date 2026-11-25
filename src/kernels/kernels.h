@@ -14,6 +14,13 @@
 #include <stdexcept>
 #include <vector>
 
+// Member functions kernels call must compile for the GPU too
+#ifdef __CUDACC__
+#define DG_HOST_DEVICE __host__ __device__
+#else
+#define DG_HOST_DEVICE
+#endif
+
 namespace kern {
 
 // X(Name): the elementwise functions of one input, with up to two constants p and q
@@ -103,9 +110,9 @@ struct Windows {
     int64_t kernel[3] = {1, 1, 1}, stride[3] = {1, 1, 1}, pad[3] = {0, 0, 0}, dilation[3] = {1, 1, 1};
     bool count_include_pad = true;  // average pooling: divide by the window size, else by its valid part
     float divisor = 0.0f;           // average pooling: a fixed divisor when nonzero
-    int64_t in_size() const { return in[0] * in[1] * in[2]; }
-    int64_t out_size() const { return out[0] * out[1] * out[2]; }
-    int64_t kernel_size() const { return kernel[0] * kernel[1] * kernel[2]; }
+    DG_HOST_DEVICE int64_t in_size() const { return in[0] * in[1] * in[2]; }
+    DG_HOST_DEVICE int64_t out_size() const { return out[0] * out[1] * out[2]; }
+    DG_HOST_DEVICE int64_t kernel_size() const { return kernel[0] * kernel[1] * kernel[2]; }
 };
 
 namespace host {

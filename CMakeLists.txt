@@ -55,7 +55,12 @@ if(ENABLE_CUDA)
         endif()
         enable_language(CUDA)
         set(CMAKE_CUDA_STANDARD 17)
-        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --use_fast_math")
+        # Calling a CPU-only function from a kernel is only a warning by default, and runs garbage
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --Werror cross-execution-space-call")
+        # The training kernels use fast math. The general op kernels (kernels_cuda.cu) don't: there,
+        # pow of a negative base, infinities and subnormals must come out as on the CPU.
+        set_source_files_properties(src/backends/cuda/cuda_ops.cu src/backends/cuda/cuda_core_ops.cu
+                                    src/backends/cuda/cuda_attention.cu PROPERTIES COMPILE_OPTIONS "--use_fast_math")
         list(APPEND DUMMYGRAD_SOURCES src/backends/cuda/cuda_ops.cu src/backends/cuda/cuda_core_ops.cu src/backends/cuda/cuda_attention.cu src/kernels/kernels_cuda.cu)
         message(STATUS "CUDA found: ${CMAKE_CUDA_COMPILER} (archs: ${CMAKE_CUDA_ARCHITECTURES}). Building with GPU support.")
     else()

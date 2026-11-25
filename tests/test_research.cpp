@@ -1299,6 +1299,224 @@ static std::string parallel_behavior() {
     return "";
 }
 
+// ---------------------------------------------------------------------------------------------
+// CUDA against the CPU beyond the differentiable ops: special values, reductions, random numbers,
+// optimizers, whole modules. Each body builds its result on the device it is given.
+// ---------------------------------------------------------------------------------------------
+
+struct DeviceTest {
+    std::string name;
+    std::function<TensorPtr(Device)> body;
+    float atol = 1e-5f, rtol = 1e-3f;
+};
+
+// A module trained for a few steps: its output and every parameter, as one vector
+template <typename M>
+static TensorPtr train_module(M& model, Device d, const std::function<TensorPtr(M&)>& loss_fn) {
+    model.to(d);
+    optim::SGD opt(0.05f, 0.9f);
+    TensorList parts;
+    for (int step = 0; step < 2; ++step) {
+        model.zero_grad();
+        auto loss = loss_fn(model);
+        loss->backward();
+        opt.step(model.parameters());
+        parts.push_back(reshape(loss->detach(), {1}));
+    }
+    for (auto& p : model.parameters()) parts.push_back(reshape(p->detach(), {p->size()}));
+    return cat(parts, 0);
+}
+
+static std::vector<DeviceTest> device_tests() {
+    std::vector<DeviceTest> t;
+    auto add_test = [&](std::string name, std::function<TensorPtr(Device)> f, float atol = 1e-5f, float rtol = 1e-3f) { t.push_back({std::move(name), std::move(f), atol, rtol}); };
+
+    const std::vector<float> special = {-2.5f, -1.0f, -0.5f, 0.0f, 0.3f, 1.0f, 2.0f, 3.7f, 1e-30f, -1e30f, NAN, INFINITY, -INFINITY};
+    using F = TensorPtr (*)(const TensorPtr&);
+    const std::vector<std::pair<std::string, F>> unary = {
+        {"abs", abs}, {"sign", sign}, {"exp", exp}, {"expm1", expm1}, {"log", log}, {"log2", log2}, {"log10", log10}, {"log1p", log1p}, {"sqrt", sqrt}, {"rsqrt", rsqrt},
+        {"square", square}, {"reciprocal", reciprocal}, {"asin", asin}, {"acos", acos}, {"atan", atan}, {"sinh", sinh}, {"cosh", cosh}, {"asinh", asinh}, {"acosh", acosh},
+        {"atanh", atanh}, {"erf", erf}, {"erfc", erfc}, {"floor", floor}, {"ceil", ceil}, {"round", round}, {"trunc", trunc}, {"is_nan", is_nan}, {"is_inf", is_inf},
+        {"is_finite", is_finite}, {"logical_not", logical_not}, {"hardswish", hardswish}, {"hardsigmoid", hardsigmoid}, {"selu", selu}};
+    for (const auto& [name, f] : unary) {
+        auto fn = f;
+        add_test("special/" + name, [fn, special](Device d) { return fn(tensor(special, d)); });
+    }
+    add_test("special/clamp", [special](Device d) { return clamp(tensor(special, d), -1.0f, 2.0f); });
+    add_test("special/nan_to_num", [special](Device d) { return nan_to_num(tensor(special, d), 7.0f); });
+    for (float p : {2.0f, 3.0f, -1.0f, 0.5f, 0.0f, 1.5f}) add_test("special/pow_" + std::to_string(p), [p, special](Device d) { return pow(tensor(special, d), p); });
+    using G = TensorPtr (*)(const TensorPtr&, const TensorPtr&);
+    const std::vector<std::pair<std::string, G>> binary = {{"add", add}, {"sub", sub}, {"mul", mul}, {"pow", pow}, {"maximum", maximum}, {"minimum", minimum}, {"atan2", atan2},
+        {"fmod", fmod}, {"remainder", remainder}, {"floor_divide", floor_divide}, {"hypot", hypot}, {"copysign", copysign}, {"eq", eq}, {"ne", ne}, {"lt", lt}, {"le", le},
+        {"gt", gt}, {"ge", ge}, {"logical_and", logical_and}, {"logical_or", logical_or}, {"logical_xor", logical_xor}};
+    for (const auto& [name, f] : binary) {
+        auto fn = f;
+        // Every pair of ordinary values, broadcast both ways
+        add_test("pairs/" + name, [fn](Device d) {
+            std::vector<float> v = {-3.5f, -2.0f, -0.7f, 0.4f, 1.0f, 2.5f, 6.0f};
+            return fn(tensor(v, {7, 1}, d), tensor(v, {1, 7}, d));
+        });
+    }
+
+    // Reductions over every set of dimensions, short and long
+    auto cube = input({5, 6, 7}, 0.6f, 1.4f);
+    auto longer = input({3, 20000});
+    const std::vector<std::vector<int>> dim_sets = {{0}, {1}, {2}, {0, 1}, {0, 2}, {1, 2}, {0, 1, 2}};
+    for (size_t i = 0; i < dim_sets.size(); ++i) {
+        auto dims = dim_sets[i];
+        add_test("reduce/" + std::to_string(i), [dims, cube](Device d) {
+            auto x = cube->to(d);
+            auto one = [&](const TensorPtr& r) { return reshape(r, {r->size()}); };
+            return cat({one(sum(x, dims)), one(mean(x, dims)), one(amax(x, dims)), one(amin(x, dims)), one(var(x, dims, true, 1)), one(norm(x, 2.0f, dims)),
+                        one(count_nonzero(gt(x, 1.0f), dims)), one(logsumexp(x, dims))}, 0);
+        });
+    }
+    add_test("reduce/long", [longer](Device d) {
+        auto x = longer->to(d);
+        auto one = [&](const TensorPtr& r) { return reshape(r, {r->size()}); };
+        return cat({one(sum(x)), one(sum(x, 1)), one(amax(x, 1)), one(amin(x, 0)), one(argmax(x, 1)), one(argmin(x, 1)), one(norm(x)), one(softmax(x, 0))}, 0);
+    }, 1e-2f, 1e-3f);
+    add_test("reduce/nan", [](Device d) {
+        auto x = tensor({1, NAN, 3, 2, 5, 4}, {2, 3}, d);
+        return cat({amax(x, 1, false), amin(x, 1, false), argmax(x, 1)}, 0);
+    });
+    add_test("cumulative", [cube](Device d) {
+        auto x = cube->to(d);
+        return cat({cumsum(x, 0), cumprod(x, 1), cummax(x, 2).first, cummin(x, 1).second, logcumsumexp(x, 2)}, 0);
+    }, 1e-4f);
+
+    // Indexing and ordering on larger tensors
+    auto table = input({50, 8});
+    auto ids = randint(0, 50, {200});
+    auto wide = randint(0, 8, {50, 100});
+    add_test("index/select_add", [table, ids](Device d) {
+        auto rows = index_select(table->to(d), 0, ids->to(d));
+        return index_add(zeros({50, 8}, d), 0, ids->to(d), rows);
+    }, 1e-4f);
+    add_test("index/gather_scatter", [table, wide](Device d) {
+        auto picked = gather(table->to(d), 1, wide->to(d));
+        return scatter_add(zeros({50, 8}, d), 1, wide->to(d), picked);
+    }, 1e-4f);
+    add_test("index/sort_topk", [table](Device d) {
+        auto x = table->to(d);
+        return cat({sort(x, 0).second, topk(x, 4, 0).first, x}, 0);
+    });
+    add_test("views", [cube](Device d) {
+        auto x = cube->to(d);
+        return cat({contiguous(permute(x, {2, 0, 1}))->reshape({210}), reshape(flip(x, {0, 2}), {210}), reshape(roll(x, 3, 2), {210}), reshape(slice_step(x, 1, 0, 6, 2), {105}),
+                    reshape(pad(x, {1, 2, 0, 1}, PadMode::Replicate), {5 * 7 * 10})}, 0);
+    });
+
+    // The same seed gives the same numbers on both devices
+    add_test("random", [](Device d) {
+        manual_seed(21);
+        return cat({rand({1001}, d), normal({1001}, 1.0f, 2.0f, d), dropout(ones({1001}, d), 0.3f), bernoulli({1001}, 0.4f, d), randint(0, 9, {1001}, d)}, 0);
+    }, 1e-4f);
+
+    // Convolutions and pools with every option
+    for (int64_t groups : {1, 2, 4}) {
+        auto x = input({2, 4, 9, 11}), w = input({8, 4 / groups, 3, 3}), wt = input({4, 8 / groups, 3, 3});
+        add_test("conv2d/groups" + std::to_string(groups), [=](Device d) { return conv_nd(x->to(d), w->to(d), nullptr, {2, 1}, {1, 2}, {1, 2}, groups); }, 1e-4f);
+        add_test("conv_transpose2d/groups" + std::to_string(groups), [=](Device d) { return conv_transpose_nd(x->to(d), wt->to(d), nullptr, {2, 1}, {1, 0}, {1, 0}, {1}, groups); }, 1e-4f);
+    }
+    auto img = input({2, 3, 9, 10});
+    add_test("pool", [img](Device d) {
+        auto x = img->to(d);
+        auto m = max_pool_nd(x, {3}, {2}, {1}, {1}, true);
+        auto one = [&](const TensorPtr& r) { return reshape(r, {r->size()}); };
+        return cat({one(m.first), one(m.second), one(avg_pool_nd(x, {3}, {2}, {1}, true, false)), one(adaptive_avg_pool_nd(x, {4, 3})),
+                    one(max_unpool_nd(max_pool_nd(x, {3}).first, max_pool_nd(x, {3}).second, {9, 10})), one(interpolate(x, {5, 7}, InterpolateMode::Linear))}, 0);
+    });
+
+    // Every optimizer, three steps
+    auto p0 = input({6, 5});
+    auto target = input({6, 5});
+    auto opt_test = [&](const std::string& name, std::function<std::shared_ptr<optim::Optimizer>()> make) {
+        add_test("optim/" + name, [=](Device d) {
+            auto p = p0->clone()->detach()->to(d)->detach();
+            if (d == Device::CPU) p = p0->clone()->detach();
+            p->requires_grad = true;
+            auto o = make();
+            for (int i = 0; i < 3; ++i) {
+                o->zero_grad({p});
+                sum(square(sub(p, target->to(d))))->backward();
+                o->step(std::vector<TensorPtr>{p});
+            }
+            return p;
+        }, 1e-4f);
+    };
+    opt_test("SGD", [] { return std::make_shared<optim::SGD>(0.05f, 0.9f, 0.01f, true); });
+    opt_test("AMSGrad", [] { return std::make_shared<optim::Adam>(0.05f, 0.9f, 0.999f, 1e-8f, 0.01f, true); });
+    opt_test("AdamW", [] { return std::make_shared<optim::AdamW>(0.05f); });
+    opt_test("NAdam", [] { return std::make_shared<optim::NAdam>(0.05f); });
+    opt_test("RAdam", [] { return std::make_shared<optim::RAdam>(0.05f); });
+    opt_test("Adamax", [] { return std::make_shared<optim::Adamax>(0.05f); });
+    opt_test("Adagrad", [] { return std::make_shared<optim::Adagrad>(0.05f); });
+    opt_test("Adadelta", [] { return std::make_shared<optim::Adadelta>(1.0f); });
+    opt_test("RMSprop", [] { return std::make_shared<optim::RMSprop>(0.01f, 0.9f, 1e-8f, 0.0f, 0.5f, true); });
+    opt_test("Rprop", [] { return std::make_shared<optim::Rprop>(0.05f); });
+    opt_test("Lion", [] { return std::make_shared<optim::Lion>(0.01f, 0.9f, 0.99f, 0.1f); });
+    opt_test("Muon", [] { return std::make_shared<optim::Muon>(0.02f); });
+    opt_test("Adafactor", [] { return std::make_shared<optim::Adafactor>(0.05f); });
+
+    // Whole modules: forward, backward and two optimizer steps
+    auto pixels = input({4, 2, 8, 8});
+    add_test("module/convnet", [pixels](Device d) {
+        manual_seed(31);
+        Sequential net;
+        net.add<Conv2d>(2, 4, 3, 1, 1).add<BatchNorm2d>(4).add<ReLU>().add<MaxPool2d>(2).add<Conv2d>(4, 4, 3, 1, 1, 4).add<GroupNorm>(2, 4).add<GELU>().add<Flatten>().add<Linear>(64, 3);
+        return train_module<Sequential>(net, d, [=](Sequential& m) { return cross_entropy_loss(m.forward(pixels->to(d)), tensor({0, 1, 2, 1}, {4}, d)); });
+    }, 2e-4f, 5e-3f);
+    auto seq = input({3, 5, 4});
+    add_test("module/lstm", [seq](Device d) {
+        manual_seed(32);
+        LSTM net(4, 6, {2, 0.0f, true});
+        return train_module<LSTM>(net, d, [=](LSTM& m) { return mean(square(m.forward(seq->to(d)).output)); });
+    }, 1e-4f, 5e-3f);
+    add_test("module/gru", [seq](Device d) {
+        manual_seed(33);
+        GRU net(4, 6);
+        return train_module<GRU>(net, d, [=](GRU& m) { return mean(square(m.forward(seq->to(d)).output)); });
+    }, 1e-4f, 5e-3f);
+    add_test("module/transformer", [seq](Device d) {
+        manual_seed(34);
+        TransformerOptions o;
+        o.d_model = 4;
+        o.n_heads = 2;
+        o.d_ff = 8;
+        o.encoder_layers = o.decoder_layers = 1;
+        o.dropout = 0.0f;
+        Transformer net(o);
+        return train_module<Transformer>(net, d, [=](Transformer& m) { return mean(square(m.forward(seq->to(d), seq->to(d)))); });
+    }, 1e-4f, 5e-3f);
+    add_test("module/gradient_penalty", [](Device d) {
+        manual_seed(35);
+        ModernTransformerBlock block(8, 2, 1, 16);
+        block.to(d);
+        auto f = precompute_freqs_cis(4, 8);
+        auto x = leaf_of(normal({1, 3, 8}, 0.0f, 1.0f, d));
+        auto g = autograd::grad({sum(square(block.forward(x, nullptr, f.first->to(d), f.second->to(d))))}, {x}, {}, true, true)[0];
+        sum(square(g))->backward();
+        return x->grad;
+    }, 1e-3f, 5e-3f);
+    add_test("module/checkpoint", [](Device d) {
+        manual_seed(36);
+        Linear a(6, 6);
+        a.to(d);
+        auto x = leaf_of(normal({4, 6}, 0.0f, 1.0f, d));
+        auto y = autograd::checkpoint([&](const TensorPtr& in) { return dropout(tanh(a.forward(in)), 0.3f); }, x);
+        sum(square(y))->backward();
+        return cat({x->grad, a.W->grad}, 0);
+    }, 1e-4f, 5e-3f);
+    add_test("distributions", [](Device d) {
+        auto l = tensor({0.1f, -0.4f, 0.7f}, {3}, d);
+        distributions::Normal n(l, ones({3}, d));
+        manual_seed(37);
+        return cat({n.rsample(), n.log_prob(zeros({3}, d)), distributions::Categorical(l).sample({4}), distributions::Bernoulli(l).entropy()}, 0);
+    }, 1e-4f);
+    return t;
+}
+
 int main(int argc, char** argv) {
     if (argc > 1) g_filter = argv[1];
     manual_seed(0);
@@ -1309,6 +1527,14 @@ int main(int argc, char** argv) {
     for (const auto& t : g_ops) run("grad/" + t.name, [&] { return first_order(t); });
     for (const auto& t : g_ops) if (t.second_order) run("grad2/" + t.name, [&] { return second_order(t); });
     if (cuda) for (const auto& t : g_ops) run("cuda/" + t.name, [&] { return cuda_parity(t); });
+
+    // On a CPU-only machine these still run once, so the bodies themselves are tested
+    for (const auto& t : device_tests()) {
+        run("device/" + t.name, [&]() -> std::string {
+            auto cpu = t.body(Device::CPU);
+            return cuda ? near(t.body(Device::CUDA)->to_vector(), cpu->to_vector(), t.atol, t.rtol) : "";
+        });
+    }
 
     run("autograd/api", autograd_api);
     run("autograd/hooks", autograd_hooks);
