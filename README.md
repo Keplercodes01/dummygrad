@@ -49,11 +49,11 @@ auto g = autograd::grad({sum(net.forward(point))}, {point}, {}, true, /*create_g
 
 ## What's New
 
-**On `main`, for v0.9.0: the research release.** Higher-order autograd (`autograd::grad` with `create_graph`), about 300 ops, convolutions of every kind, recurrent and transformer layers, 15 optimizers, `linalg`, `fft` and `distributions`, and a CPU backend 2.4 to 3.3 times faster. Upgrading from v0.8.0:
+**v0.9.0: the research release.** Higher-order autograd (`autograd::grad` with `create_graph`), about 300 ops, convolutions of every kind, recurrent and transformer layers, 15 optimizers, `linalg`, `fft` and `distributions`, and a CPU backend 2.4 to 3.3 times faster. Upgrading from v0.8.0:
 - `mean`, `var` and `std_dev` reduce the dimension you name. On tensors with more than 2 dimensions, 0 and 1 used to mean the last two.
 - A second backward through a freed graph throws instead of silently losing gradients. Pass `retain_graph=true` the first time.
 
-Also on `main`: `a + b` and `x->index({Slice(1, 3), 0})`, KV caches and text generation, Hugging Face checkpoints and tokenizers, LoRA, mixture of experts, background data loading, a GPU allocator that splits blocks, and masked attention, sorting, scatter and FFT on the GPU.
+Also new: `a + b` and `x->index({Slice(1, 3), 0})`, KV caches and text generation, Hugging Face checkpoints and tokenizers, LoRA, mixture of experts, background data loading, a GPU allocator that splits blocks, and masked attention, sorting, scatter and FFT on the GPU.
 
 **v0.8.0: the audit release.** Every finding of a full audit fixed, 12-21% faster in fp32 and 4-11% in fp16 on a T4, and multi-GPU training that works.
 
@@ -225,7 +225,7 @@ set(CMAKE_CXX_STANDARD 17)
 include(FetchContent)
 FetchContent_Declare(dummygrad
     GIT_REPOSITORY https://github.com/Keplercodes01/dummygrad.git
-    GIT_TAG        v0.8.0)
+    GIT_TAG        v0.9.0)
 FetchContent_MakeAvailable(dummygrad)
 
 add_executable(my_app main.cpp)
@@ -233,8 +233,6 @@ target_link_libraries(my_app PRIVATE dummygrad::dummygrad)
 ```
 
 Then `#include "dummy_core.h"` in `main.cpp` and build with the usual `cmake -S . -B build && cmake --build build`. CUDA is enabled automatically when `nvcc` is found, and the `ENABLE_CUDA` / `CMAKE_CUDA_ARCHITECTURES` options above work from your project too.
-
-v0.8.0 does not have the research toolkit yet; use `GIT_TAG main` for it until v0.9.0 is released.
 
 Prefer vendoring? Add the repository as a git submodule and replace the `FetchContent` lines with `add_subdirectory(external/dummygrad)`.
 
@@ -707,31 +705,33 @@ auto out = gpt.forward(input_ids, /*pos_ids=*/nullptr, /*mask=*/doc_mask);
 
 ## Performance
 
-Training-step time (forward, backward, AdamW) for the same ModernTransformer architecture (RMSNorm, RoPE, GQA, SwiGLU, tied embeddings) in dummygrad and PyTorch 2.11 (eager, and `torch.compile`d), v0.8.0 on a Kaggle T4. Median ms per step over at least 50 steps; all four columns from one session (`bench/compare.py`, as the notebook runs it). PyTorch runs at its best: fused AdamW, `F.rms_norm`, `scaled_dot_product_attention`.
-
-**fp32** (TF32 enabled on both sides; the T4 has none):
-
-| config | params | dummygrad | PyTorch eager | PyTorch compile |
-|---|---|---|---|---|
-| tiny (d=128, 2 layers, batch 8x64) | 0.4M | **1.54 ms** | 7.24 ms | 4.18 ms |
-| small (d=256, 4 layers, batch 16x128) | 3.9M | 22.1 ms | 23.5 ms | **20.9 ms** |
-| medium (d=512, 6 layers, batch 8x256) | 23.1M | **100.4 ms** | 110.1 ms | 104.1 ms |
-| large (d=768, 12 layers, batch 8x512) | 100.2M | **820 ms** | 910 ms | 855 ms |
+Training-step time (forward, backward, AdamW) for the same ModernTransformer architecture (RMSNorm, RoPE, GQA, SwiGLU, tied embeddings) in dummygrad v0.9.0 and PyTorch 2.11 (eager, and `torch.compile`d) on a Kaggle T4. Median ms per step over at least 50 steps; each table is one session of `bench/compare.py`, which runs one program after the other. PyTorch runs at its best: fused AdamW, `F.rms_norm`, `scaled_dot_product_attention`.
 
 **fp16 mixed precision** (`AutocastGuard` + `GradScaler`, against `torch.autocast` + `GradScaler`):
 
-| config | dummygrad | PyTorch eager | PyTorch compile |
-|---|---|---|---|
-| tiny | **1.56 ms** | 9.65 ms | 5.21 ms |
-| small | 15.4 ms | 18.7 ms | **9.5 ms** |
-| medium | 53.9 ms | 46.2 ms | **33.6 ms** |
-| large | 324 ms | 257 ms | **202 ms** |
+| config | params | v0.8.0 | v0.9.0 | PyTorch eager | PyTorch compile | peak MB: v0.9.0 / eager / compile |
+|---|---|---|---|---|---|---|
+| tiny (d=128, 2 layers, batch 8x64) | 0.4M | **1.6 ms** | **1.7 ms** | 9.7 ms | 5.5 ms | 18 / 33 / 30 |
+| small (d=256, 4 layers, batch 16x128) | 3.9M | 14.2 ms | 11.4 ms | 18.6 ms | **9.8 ms** | 226 / 260 / 170 |
+| medium (d=512, 6 layers, batch 8x256) | 23.1M | 49.1 ms | 40.3 ms | 43.4 ms | **30.2 ms** | 748 / 820 / 627 |
+| large (d=768, 12 layers, batch 8x512) | 100.2M | 297 ms | 246 ms | 238 ms | **198 ms** | 4147 / 4592 / 3152 |
 
-dummygrad's advantage is per-op overhead (no Python, no dispatcher), which dominates small models. In fp16 at larger sizes v0.8.0 is behind. `main` has since kept activations in fp16 between matrix products, which made fp16 steps 16% (small), 14% (medium) and 7% (large) faster than before that change, in one session. Against PyTorch eager fp16 in another session (not `torch.compile`), `main` took 1.57 ms against 9.37 (tiny), 12.2 against 18.2 (small), 42.3 against 43.5 (medium) and 303 against 290 (large), with 10 to 45% less peak memory. The tables themselves have not been measured again. `./build/dg_bench_ops` times single operations: generation, attention with masks, sorting, scatter, FFT, convolutions.
+**fp32** (TF32 enabled on both sides; the T4 has none):
 
-**CPU**, on two 4-thread CI machines with OpenBLAS, v0.8.0 and `main` in the same job:
+| config | v0.8.0 | v0.9.0 | PyTorch eager | PyTorch compile |
+|---|---|---|---|---|
+| tiny | **1.6 ms** | **1.6 ms** | 7.3 ms | 4.6 ms |
+| small | 23.6 ms | 24.0 ms | 23.1 ms | **20.2 ms** |
+| medium | 114 ms | 121 ms | 107 ms | **101 ms** |
+| large | 887 ms | 852 ms | 854 ms | **808 ms** |
 
-| config | v0.8.0 | `main` | v0.8.0 | `main` |
+A T4 slows down as it heats up: in fp32 the same medium step took 102 ms at 54 °C and 130 ms at 81 °C, which is more than the differences between columns. With the two versions alternating in another fp32 session, v0.9.0 averaged 24.1 ms against v0.8.0's 24.7 (small), 116.3 against 116.4 (medium) and 925 against 942 (large), and PyTorch eager was level on small and 2 to 4% faster on medium.
+
+dummygrad's advantage is per-op overhead (no Python, no dispatcher), which dominates small models. From small up, fp16 is 21 to 24% faster than in v0.8.0; eager PyTorch is 3% ahead on large, and `torch.compile` is ahead everywhere but tiny. `./build/dg_bench_ops` times single operations: generation, attention with masks, sorting, scatter, FFT, convolutions.
+
+**CPU**, on two 4-thread CI machines with OpenBLAS, v0.8.0 and v0.9.0's CPU backend in the same job:
+
+| config | v0.8.0 | v0.9.0 | v0.8.0 | v0.9.0 |
 |---|---|---|---|---|
 | tiny | 51.0 ms | **18.9 ms** | 39.5 ms | **12.0 ms** |
 | small | 1086 ms | **460 ms** | 791 ms | **306 ms** |

@@ -4,7 +4,9 @@ All notable changes to dummygrad are documented here. Versions follow [Semantic 
 
 ## [Unreleased]
 
-The research release: higher-order autograd, the op, layer, optimizer, linear-algebra, FFT and distribution libraries of a research framework, and a threaded CPU backend. On a Kaggle T4 x2, `test_research` (985 checks, including about 240 ops, 13 optimizers and several whole modules on CUDA against the CPU), `test_engine` (269, including the two-GPU test) and `test_models` (22) pass.
+## [0.9.0] - 2026-11-25
+
+The research release: higher-order autograd, the op, layer, optimizer, linear-algebra, FFT and distribution libraries of a research framework, and a threaded CPU backend. On a Kaggle T4, training steps in fp16 are 21 to 24% faster than in v0.8.0 from 3.9M parameters up, with 20% less memory; fp32 steps and the tiny model are within 2%. On a Kaggle T4 x2, `test_research` (985 checks, including about 240 ops, 13 optimizers and several whole modules on CUDA against the CPU), `test_engine` (269, including the two-GPU test) and `test_models` (22) pass.
 
 ### Added
 - **Higher-order gradients.** `autograd::grad` returns gradients instead of accumulating them; `create_graph=true` records the gradient computation so it can be differentiated again, to any order. The existing ops support it too: matmul, linear, softmax, the norms, RoPE, attention, the losses. (`checkpoint`, `linalg::eigvals` and the third derivative of `digamma` do not, and say so.) `autograd::jacobian`, `hessian`, `hvp`, `vjp`, `jvp`, `backward` (several outputs, weighted), `checkpoint` (recompute instead of store, with replayed dropout) and `custom_function`.
@@ -37,7 +39,7 @@ The research release: higher-order autograd, the op, layer, optimizer, linear-al
 - **Cached generation:** 1.2 ms per token against 4.5 without a cache (batch 1), 2.1 against 65 (batch 16); T4, 23M parameters, half way through 64 new tokens after a 64-token prompt.
 - **Convolutions keep no columns** (memory and time not yet compared with before). The unfolded input, kernel-size times the input, was made for the whole batch and kept for backward; it is now made a few samples at a time, and again in backward. 1x1 convolutions use the input itself.
 - **GPU memory is split and joined**, so memory freed at one size serves others; a training step's repeated sizes are still served at once. Copies to the GPU up to 32 MB go through page-locked memory and do not wait for queued work.
-- **GPU (speed not yet compared with v0.8.0 in one session):** broadcast, strided-copy and RoPE kernels index with 32-bit division, or none for equal shapes; an activation several matmuls read is converted to fp16 once and saved once.
+- **GPU, fp32 (alternating with v0.8.0: small and large 2% faster, medium equal):** broadcast, strided-copy and RoPE kernels index with 32-bit division, or none for equal shapes; an activation several matmuls read is converted to fp16 once and saved once.
 
 ### Changed
 - **`mean`, `var` and `std_dev` take a real dimension.** `mean(x, 0)` of a 3-D tensor reduced the second-to-last dimension, and 1 the last; they now reduce dimensions 0 and 1. 2-D results are unchanged.
