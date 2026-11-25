@@ -31,6 +31,8 @@ set(DUMMYGRAD_SOURCES
     src/core/allocator.cpp
     src/core/profiler.cpp
     src/core/parallel.cpp
+    src/core/staging.cpp
+    src/core/mapped_file.cpp
     src/ops/ops.cpp
     src/kernels/kernels_host.cpp
     src/linalg/dense.cpp
@@ -61,7 +63,8 @@ if(ENABLE_CUDA)
         # pow of a negative base, infinities and subnormals must come out as on the CPU.
         set_source_files_properties(src/backends/cuda/cuda_ops.cu src/backends/cuda/cuda_core_ops.cu
                                     src/backends/cuda/cuda_attention.cu PROPERTIES COMPILE_OPTIONS "--use_fast_math")
-        list(APPEND DUMMYGRAD_SOURCES src/backends/cuda/cuda_ops.cu src/backends/cuda/cuda_core_ops.cu src/backends/cuda/cuda_attention.cu src/kernels/kernels_cuda.cu)
+        list(APPEND DUMMYGRAD_SOURCES src/backends/cuda/cuda_ops.cu src/backends/cuda/cuda_core_ops.cu src/backends/cuda/cuda_attention.cu
+             src/kernels/kernels_cuda.cu src/kernels/kernels_sort.cu src/kernels/kernels_fft.cu)
         message(STATUS "CUDA found: ${CMAKE_CUDA_COMPILER} (archs: ${CMAKE_CUDA_ARCHITECTURES}). Building with GPU support.")
     else()
         message(STATUS "CUDA compiler not found. Building CPU-only.")
@@ -114,6 +117,12 @@ if(ENABLE_CUDA AND CMAKE_CUDA_COMPILER)
     endif()
     target_link_libraries(dummygrad_engine PUBLIC CUDA::cudart CUDA::cublas CUDA::cublasLt)
     target_compile_definitions(dummygrad_engine PUBLIC USE_CUDA=1)
+    # Without cuFFT, Fourier transforms of GPU tensors run on the CPU
+    if(TARGET CUDA::cufft)
+        set_target_properties(CUDA::cufft PROPERTIES IMPORTED_GLOBAL TRUE)
+        target_link_libraries(dummygrad_engine PUBLIC CUDA::cufft)
+        target_compile_definitions(dummygrad_engine PUBLIC DUMMYGRAD_CUFFT=1)
+    endif()
 endif()
 
 # Configure Apple Silicon Metal and MetalPerformanceShaders on macOS
@@ -151,6 +160,10 @@ if(DUMMYGRAD_BUILD_EXAMPLES)
     target_link_libraries(research_tour PRIVATE dummygrad_engine)
     add_test(NAME example_research_tour COMMAND research_tour)
 
+    add_executable(generate examples/generate.cpp)
+    target_link_libraries(generate PRIVATE dummygrad_engine)
+    add_test(NAME example_generate COMMAND generate)
+
     add_executable(train_lm examples/train_lm.cpp)
     target_link_libraries(train_lm PRIVATE dummygrad_engine)
     add_test(NAME example_train_lm COMMAND train_lm)
@@ -163,6 +176,9 @@ endif()
 if(DUMMYGRAD_BUILD_BENCHMARKS)
     add_executable(dg_bench bench/bench.cpp)
     target_link_libraries(dg_bench PRIVATE dummygrad_engine)
+
+    add_executable(dg_bench_ops bench/bench_ops.cpp)
+    target_link_libraries(dg_bench_ops PRIVATE dummygrad_engine)
 endif()
 
 # Gradient-check test suite: `ctest --output-on-failure` or run ./test_engine directly
@@ -174,4 +190,8 @@ if(DUMMYGRAD_BUILD_TESTS)
     add_executable(test_research tests/test_research.cpp)
     target_link_libraries(test_research PRIVATE dummygrad_engine)
     add_test(NAME test_research COMMAND test_research)
+
+    add_executable(test_models tests/test_models.cpp)
+    target_link_libraries(test_models PRIVATE dummygrad_engine)
+    add_test(NAME test_models COMMAND test_models)
 endif()

@@ -2,12 +2,14 @@
 #include "functional.h"
 #include "ops.h"
 #include "autograd.h"
+#include "staging.h"
 #include "tpu/pjrt_client.h"
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
 #endif
 #include <unordered_map>
 #include <atomic>
+#include <cstring>
 #include <queue>
 #include <functional>
 #include <stdexcept>
@@ -424,7 +426,14 @@ std::shared_ptr<Tensor> Tensor::to(Device target_device, DType target_dtype, int
 
     if (this->device == Device::CPU && target_device == Device::CUDA) {
 #ifdef USE_CUDA
-        check_copy(cudaMemcpy(out->data_ptr<void>(), this->data_ptr<void>(), copy_bytes, cudaMemcpyHostToDevice), "host-to-device");
+        // Batches go through page-locked memory, which does not wait for the GPU; weights and datasets go directly
+        auto locked = copy_bytes > 0 && copy_bytes <= ((size_t)32 << 20) ? staging::allocate(copy_bytes) : nullptr;
+        if (locked) {
+            std::memcpy(locked.get(), this->data_ptr<void>(), copy_bytes);
+            staging::copy_to_gpu(out->data_ptr<void>(), locked, copy_bytes);
+        } else {
+            check_copy(cudaMemcpy(out->data_ptr<void>(), this->data_ptr<void>(), copy_bytes, cudaMemcpyHostToDevice), "host-to-device");
+        }
 #else
         throw std::runtime_error("Tensor::to: CUDA requested but dummygrad was built without CUDA support");
 #endif

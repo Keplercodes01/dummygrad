@@ -1061,8 +1061,8 @@ static std::string module_modes_and_zero_grad() {
 static_assert(!std::is_copy_constructible_v<ModernTransformer>, "modules must not be copyable");
 static_assert(std::is_move_constructible_v<ModernTransformer>, "modules must stay movable");
 
-// to(device) keeps each tensor's dtype, init functions honor theirs, and a safetensors dtype
-// dummygrad has no type for fails loudly instead of loading as Float32
+// to(device) keeps each tensor's dtype, init functions honor theirs, integer checkpoint tensors load by value,
+// and a dtype without a conversion fails loudly instead of loading as Float32
 static std::string module_dtypes_preserved() {
     Linear layer(3, 2);
     layer.to(Device::CPU, DType::Float16);
@@ -1072,15 +1072,18 @@ static std::string module_dtypes_preserved() {
         if (t->dtype == DType::Float32) return "an init function ignored its dtype";
     }
     const std::string path = "test_i32.safetensors";
-    {
-        std::string header = "{\"ids\":{\"dtype\":\"I32\",\"shape\":[2],\"data_offsets\":[0,8]}}";
+    auto write = [&](const std::string& dtype) {
+        std::string header = "{\"ids\":{\"dtype\":\"" + dtype + "\",\"shape\":[2],\"data_offsets\":[0,8]}}";
         std::ofstream out(path, std::ios::binary);
         uint64_t len = header.size();
         out.write(reinterpret_cast<const char*>(&len), sizeof(len));
         out << header;
-        int32_t ids[2] = {1, 2};
+        int32_t ids[2] = {1, -2};
         out.write(reinterpret_cast<const char*>(ids), sizeof(ids));
-    }
+    };
+    write("I32");
+    auto ids = io::load_safetensors(path).at("ids");
+    write("X32");
     std::string msg;
     try {
         io::load_safetensors(path);
@@ -1088,7 +1091,8 @@ static std::string module_dtypes_preserved() {
         msg = e.what();
     }
     std::remove(path.c_str());
-    return msg.find("unsupported dtype") != std::string::npos ? "" : "an I32 tensor loaded without an error";
+    if (ids->dtype != DType::Float32 || ids->to_vector() != std::vector<float>{1, -2}) return "an I32 tensor loaded with other values";
+    return msg.find("unsupported dtype") != std::string::npos ? "" : "an unknown dtype loaded without an error";
 }
 
 // Inputs that kernels would read out of bounds with must be rejected up front
@@ -2094,11 +2098,18 @@ static std::string amp_attention_parity(DType compute) {
         auto dq = std::make_shared<Tensor>(shape, Device::CUDA, DType::Float32, false);
         auto dk = std::make_shared<Tensor>(shape, Device::CUDA, DType::Float32, false);
         auto dv = std::make_shared<Tensor>(shape, Device::CUDA, DType::Float32, false);
+        cuda::AttentionShape s;
+        s.batch = B;
+        s.heads = H;
+        s.queries = s.keys = S;
+        s.head_dim = D;
+        s.causal = causal;
+        s.scale = scale;
         auto impl = cuda::attention_forward(q->data_ptr<float>(), k->data_ptr<float>(), v->data_ptr<float>(),
-                                            out->data_ptr<float>(), lse->data_ptr<float>(), B, H, S, D, causal, scale, dt);
+                                            out->data_ptr<float>(), lse->data_ptr<float>(), s, dt);
         cuda::attention_backward(q->data_ptr<float>(), k->data_ptr<float>(), v->data_ptr<float>(), out->data_ptr<float>(),
                                  dout->data_ptr<float>(), lse->data_ptr<float>(), dq->data_ptr<float>(),
-                                 dk->data_ptr<float>(), dv->data_ptr<float>(), B, H, S, D, causal, scale, impl, dt);
+                                 dk->data_ptr<float>(), dv->data_ptr<float>(), s, impl, dt);
         return Result{download(out), download(lse), download(dq), download(dk), download(dv)};
     };
     auto compare = [](const std::vector<float>& ref, const std::vector<float>& got, const std::string& what) -> std::string {

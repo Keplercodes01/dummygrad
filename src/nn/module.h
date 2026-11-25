@@ -138,10 +138,13 @@ public:
     // Train/eval mode for this module and all children (for layers like dropout that differ).
     void train(bool mode = true) {
         training_ = mode;
-        walk(nullptr, [mode](Module& m) { m.training_ = mode; });
+        walk(nullptr, [mode](const std::string&, Module& m) { m.training_ = mode; });
     }
     void eval() { train(false); }
     bool is_training() const { return training_; }
+
+    // Calls fn with every submodule and its name ("blocks.0.attn.W_q"), parents before children
+    void for_each_module(const std::function<void(const std::string&, Module&)>& fn) { walk(nullptr, fn); }
 
     // Freeze (false) or unfreeze (true) every parameter.
     void requires_grad_(bool requires_grad) {
@@ -202,7 +205,7 @@ protected:
 private:
     enum class Kind { Parameter, Buffer, NonPersistentBuffer };
     using TensorFn = std::function<void(const std::string&, std::shared_ptr<Tensor>&, Kind)>;
-    using ModuleFn = std::function<void(Module&)>;
+    using ModuleFn = std::function<void(const std::string&, Module&)>;
 
     struct Walker : ModuleVisitor {
         std::string prefix;
@@ -217,7 +220,7 @@ private:
             if (on_tensor) on_tensor(prefix + name, t, persistent ? Kind::Buffer : Kind::NonPersistentBuffer);
         }
         void module(const std::string& name, Module& m) override {
-            if (on_module) on_module(m);
+            if (on_module) on_module(prefix + name, m);
             std::string saved = prefix;
             prefix += name + ".";
             m.visit(*this);

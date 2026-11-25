@@ -1008,8 +1008,8 @@ static std::shared_ptr<Tensor> matmul_impl(const std::shared_ptr<Tensor>& _a, co
 }
 
 std::shared_ptr<Tensor> matmul(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b, DType compute,
-                               std::shared_ptr<Tensor>* saved_a, std::shared_ptr<Tensor>* saved_b) {
-    return matmul_impl(a, b, nullptr, compute, saved_a, saved_b);
+                               std::shared_ptr<Tensor>* saved_a, std::shared_ptr<Tensor>* saved_b, DType out_dtype) {
+    return matmul_impl(a, b, nullptr, compute, saved_a, saved_b, /*trans_b=*/false, out_dtype);
 }
 
 std::shared_ptr<Tensor> matmul_nt(const std::shared_ptr<Tensor>& a, const std::shared_ptr<Tensor>& b, DType compute,

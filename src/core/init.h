@@ -5,6 +5,16 @@
 
 inline thread_local std::mt19937 g_gen(std::random_device{}());
 
+// While one of these lives, xavier and kaiming leave their tensors uninitialized: for models whose weights are
+// about to be loaded, where drawing them would take longer than reading them
+inline thread_local int g_skip_init = 0;
+struct SkipInitGuard {
+    SkipInitGuard() { ++g_skip_init; }
+    ~SkipInitGuard() { --g_skip_init; }
+    SkipInitGuard(const SkipInitGuard&) = delete;
+    SkipInitGuard& operator=(const SkipInitGuard&) = delete;
+};
+
 inline void manual_seed(unsigned int seed) {
     g_gen.seed(seed);
     random_state().seed = seed;
@@ -38,7 +48,7 @@ inline std::shared_ptr<Tensor> xavier(std::vector<int64_t> shape, Device device 
     std::normal_distribution<float> dis(0.0f, std_val);
     float* ptr = t->data_ptr<float>();
     int64_t size = t->size();
-    for (int64_t i = 0; i < size; i++) {
+    for (int64_t i = 0; i < size && !g_skip_init; i++) {
         ptr[i] = dis(g_gen);
     }
     if (device != Device::CPU || dtype != DType::Float32) {
@@ -59,7 +69,7 @@ inline std::shared_ptr<Tensor> kaiming(std::vector<int64_t> shape, Device device
     std::normal_distribution<float> dis(0.0f, std_val);
     float* ptr = t->data_ptr<float>();
     int64_t size = t->size();
-    for (int64_t i = 0; i < size; i++) {
+    for (int64_t i = 0; i < size && !g_skip_init; i++) {
         ptr[i] = dis(g_gen);
     }
     if (device != Device::CPU || dtype != DType::Float32) {

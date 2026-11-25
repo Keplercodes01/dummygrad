@@ -6,114 +6,9 @@
 //
 // Exit code is 0 only if every test passes. An argument runs only tests whose name contains it.
 
-#include "dummy_core.h"
-#ifdef USE_CUDA
-#include <cuda_runtime.h>
-#endif
-
-#include <chrono>
-#include <cmath>
-#include <cstdio>
-#include <functional>
-#include <iostream>
-#include <random>
-#include <sstream>
-#include <string>
-#include <vector>
+#include "test_util.h"
 
 using Fn = std::function<TensorPtr(const TensorList&, Device)>;
-
-static std::string g_filter;
-static int g_passed = 0;
-static std::vector<std::string> g_failures;
-static std::mt19937 g_rng(7);
-
-static void run(const std::string& name, const std::function<std::string()>& body) {
-    if (!g_filter.empty() && name.find(g_filter) == std::string::npos) return;
-    std::string err;
-    try {
-        err = body();
-    } catch (const std::exception& e) {
-        err = std::string("threw: ") + e.what();
-    }
-    if (err.empty()) {
-        ++g_passed;
-    } else {
-        g_failures.push_back(name + ": " + err);
-        std::cout << "[FAIL] " << name << ": " << err << std::endl;
-    }
-}
-
-static bool has_cuda() {
-#ifdef USE_CUDA
-    int n = 0;
-    return cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
-#else
-    return false;
-#endif
-}
-
-// Values uniform on [lo, hi], at least min_abs away from 0 and from each other's kinks
-static TensorPtr input(const std::vector<int64_t>& shape, float lo = -1.0f, float hi = 1.0f, float min_abs = 0.0f) {
-    std::uniform_real_distribution<float> dist(lo, hi);
-    int64_t n = 1;
-    for (int64_t d : shape) n *= d;
-    std::vector<float> v((size_t)n);
-    for (auto& x : v) do { x = dist(g_rng); } while (std::fabs(x) < min_abs);
-    return tensor(v, shape);
-}
-// Shuffled, evenly spaced values, so maxima and orderings survive a finite-difference step
-static TensorPtr distinct(const std::vector<int64_t>& shape, float gap = 0.15f, float offset = 0.05f) {
-    int64_t n = 1;
-    for (int64_t d : shape) n *= d;
-    std::vector<float> v((size_t)n);
-    for (int64_t i = 0; i < n; ++i) v[(size_t)i] = gap * (float)(i - n / 2) + offset;
-    std::shuffle(v.begin(), v.end(), g_rng);
-    return tensor(v, shape);
-}
-
-static std::string near(const std::vector<float>& a, const std::vector<float>& b, float atol, float rtol = 0.0f) {
-    if (a.size() != b.size()) return "sizes " + std::to_string(a.size()) + " and " + std::to_string(b.size());
-    for (size_t i = 0; i < a.size(); ++i) {
-        if (std::isnan(a[i]) && std::isnan(b[i])) continue;
-        if (a[i] == b[i]) continue;
-        if (!(std::fabs(a[i] - b[i]) <= atol + rtol * std::max(std::fabs(a[i]), std::fabs(b[i])))) {
-            std::ostringstream os;
-            os << "element " << i << ": got " << a[i] << ", expected " << b[i];
-            return os.str();
-        }
-    }
-    return "";
-}
-static std::string near(const TensorPtr& a, const std::vector<float>& b, float atol = 1e-5f, float rtol = 1e-5f) { return near(a->to_vector(), b, atol, rtol); }
-// A template, so that a braced list is never taken for a tensor
-template <typename T, typename = std::enable_if_t<std::is_same_v<T, TensorPtr>>>
-static std::string near(const TensorPtr& a, const T& b, float atol = 1e-5f, float rtol = 1e-5f) {
-    if (a->shape != b->shape) return "shapes " + shape_string(a->shape) + " and " + shape_string(b->shape);
-    return near(a->to_vector(), b->to_vector(), atol, rtol);
-}
-static std::string scalar(const TensorPtr& a, float b, float atol = 1e-5f, float rtol = 1e-5f) { return near(std::vector<float>{a->item()}, {b}, atol, rtol); }
-static std::string shape_is(const TensorPtr& a, const std::vector<int64_t>& s) { return a->shape == s ? "" : "shape " + shape_string(a->shape) + ", expected " + shape_string(s); }
-static std::string expect_throw(const std::function<void()>& f, const std::string& what) {
-    try {
-        f();
-    } catch (const std::exception&) {
-        return "";
-    }
-    return what + " did not throw";
-}
-#define CHECK(expr)                             \
-    do {                                        \
-        std::string err_ = (expr);              \
-        if (!err_.empty()) return #expr ": " + err_; \
-    } while (0)
-
-static TensorPtr leaf_of(const TensorPtr& t) {
-    if (t->requires_grad) return t;
-    auto l = t->detach();
-    l->requires_grad = true;
-    return l;
-}
 
 struct OpTest {
     std::string name;
@@ -430,6 +325,27 @@ static void build_ops() {
         op("attention_qkv", {input({1, 2, 3, 4}), input({1, 2, 3, 4}), input({1, 2, 3, 4})}, [](const TensorList& x, Device) {
             return scaled_dot_product_attention(x[0], x[1], x[2], nullptr, 0.0f, true);
         });
+        op("attention_cross", {input({2, 3, 4}), input({2, 5, 4}), input({2, 5, 4})}, [](const TensorList& x, Device) {
+            return scaled_dot_product_attention(x[0], x[1], x[2]);
+        });
+        op("attention_masked", {input({2, 2, 3, 4}), input({2, 2, 3, 4}), input({2, 2, 3, 4})}, [](const TensorList& x, Device d) {
+            return scaled_dot_product_attention(x[0], x[1], x[2], tensor({0, -0.5f, -1e9f, 0.3f, 0, 0, -1e9f, 0.2f, 0}, {3, 3}, d));
+        });
+        op("attention_padding", {input({2, 2, 3, 4}), input({2, 2, 5, 4}), input({2, 2, 5, 4})}, [](const TensorList& x, Device d) {
+            return scaled_dot_product_attention(x[0], x[1], x[2], tensor({0, 0, 0, -1e9f, -1e9f, 0, -1e9f, 0, 0, 0}, {2, 1, 1, 5}, d));
+        });
+        op("attention_head_bias", {input({2, 2, 2, 4}), input({2, 2, 3, 4}), input({2, 2, 3, 4})}, [](const TensorList& x, Device d) {
+            return scaled_dot_product_attention(x[0], x[1], x[2], tensor({0.1f, 0.2f, 0.3f, -0.4f, 0.5f, 0.6f, 1, 2, 3, 4, 5, 6}, {2, 2, 3}, d), 0.0f, true);
+        });
+        op("attention_past", {input({1, 2, 2, 4}), input({1, 2, 5, 4}), input({1, 2, 5, 4})}, [](const TensorList& x, Device) {
+            return fused_attention(x[0], x[1], x[2], nullptr, true, 0.5f, 3);
+        });
+        op("attention_many_batch_dims", {input({2, 1, 2, 2, 3}), input({2, 1, 2, 3, 3}), input({2, 1, 2, 3, 3})}, [](const TensorList& x, Device d) {
+            return scaled_dot_product_attention(x[0], x[1], x[2], tensor({0, -1e9f, 0, 0.5f, 0, 0}, {2, 1, 1, 1, 3}, d));
+        });
+        op("attention_learned_bias", {input({2, 3, 4}), input({2, 3, 4}), input({2, 3, 4}), input({3, 3})}, [](const TensorList& x, Device) {
+            return scaled_dot_product_attention(x[0], x[1], x[2], x[3]);
+        });
         op("group_norm", {input({2, 4, 3})}, [](const TensorList& x, Device) { return GroupNorm(2, 4, 1e-5f, false).forward(x[0]); });
         op("instance_norm", {input({2, 2, 5})}, [](const TensorList& x, Device) { return InstanceNorm(2).forward(x[0]); });
         op("local_response_norm", {input({1, 5, 2}, 0.2f, 1.0f)}, [](const TensorList& x, Device) { return LocalResponseNorm(3, 1.0f).forward(x[0]); });
@@ -522,6 +438,20 @@ static void build_ops() {
     op("irfft_odd", {input({1, 4, 2})}, [](const TensorList& x, Device) { return fft::irfft(x[0], -1, 7); });
     op("fft_convolve", {input({5}), input({3})}, [](const TensorList& x, Device) { return fft::fft_convolve(x[0], x[1]); });
     op("stft", {input({1, 16})}, [](const TensorList& x, Device d) { return fft::stft(x[0], 8, 4, fft::hann_window(8)->to(d)); });
+
+    // Operators and indexing
+    op("operators", {input({2, 3}), input({3}, 0.5f, 1.5f)}, [](const TensorList& x, Device) { return (x[0] * x[1] - 2.0f) / (x[1] + 1.0f) - 0.5f * -x[0]; });
+    op("index_slices", {input({3, 4, 5})}, [](const TensorList& x, Device) { return x[0]->index({Slice(1), Ellipsis, Slice(std::nullopt, std::nullopt, -2)}); });
+    op("index_mixed", {input({3, 4, 5})}, [](const TensorList& x, Device) { return x[0]->index({1, NewAxis, Slice(0, 3, 2)}); });
+    op("index_rows", {input({3, 4})}, [](const TensorList& x, Device d) { return x[0]->index({tensor({2, 0, -1}, {3}, d)}); });
+    op("index_pairs", {input({3, 4, 2})}, [](const TensorList& x, Device d) { return x[0]->index({tensor({2, 0}, {2}, d), tensor({1, -1}, {2}, d)}); });
+    op("index_split", {input({3, 2, 4})}, [](const TensorList& x, Device d) { return x[0]->index({tensor({2, 0}, {2, 1}, d), Slice(), tensor({1, 3, 3}, {3}, d)}); });
+    op("index_middle", {input({2, 3, 4})}, [](const TensorList& x, Device d) { return x[0]->index({Slice(), tensor({2, 0}, {2}, d), tensor({1, 3}, {2}, d)}); });
+    op("index_mask", {input({2, 3})}, [](const TensorList& x, Device d) { return x[0]->index({Mask(tensor({1, 0, 1, 0, 1, 1}, {2, 3}, d))}); });
+    op("index_put_slice", {input({3, 4}), input({2, 1})}, [](const TensorList& x, Device) { return x[0]->index_put({Slice(0, 2), Slice(1)}, x[1]); });
+    op("index_put_add", {input({3, 4}), input({4})}, [](const TensorList& x, Device) { return x[0]->index_put({1}, x[1], true); });
+    op("index_put_rows", {input({3, 4}), input({2, 4})}, [](const TensorList& x, Device d) { return x[0]->index_put({tensor({2, 0}, {2}, d)}, x[1]); });
+    op("index_put_repeated", {input({4}), input({3})}, [](const TensorList& x, Device d) { return x[0]->index_put({tensor({1, 3, 1}, {3}, d)}, x[1], true); });
 
     // Distributions
     op("normal_log_prob", {input({4}), input({4}, 0.5f, 1.5f), input({4})}, [](const TensorList& x, Device) { return distributions::Normal(x[0], x[1]).log_prob(x[2]); });
@@ -727,6 +657,107 @@ static std::string values_indexing() {
     CHECK(expect_throw([] { index_select(zeros({3}), 0, tensor({-1}, {1})); }, "a negative index"));
     return "";
 }
+static std::string values_more() {
+    auto x = tensor({1, -2, 3, -4}, {2, 2}), y = tensor({2, 0.5f, -1, 3}, {2, 2});
+    CHECK(near(addcmul(x, y, y, 2.0f), {9, -1.5f, 5, 14}));
+    CHECK(near(addmm(x, y, eye(2), 2.0f, 3.0f), {8, -2.5f, 3, 1}));
+    CHECK(near(bmm(stack({x, y}, 0), stack({eye(2), eye(2)}, 0)), {1, -2, 3, -4, 2, 0.5f, -1, 3}));
+    CHECK(near(mv(x, tensor({1, 10}, {2})), {-19, -37}));
+    CHECK(scalar(dot(x, y), -14));
+    if (all(tensor({1, 0}, {2})) || !all(ones({3}))) return "all";
+    CHECK(near(clamp_max(x, 0.0f), {0, -2, 0, -4}));
+    CHECK(near(clamp_min(x, 0.0f), {1, 0, 3, 0}));
+    CHECK(near(hardtanh(x), {1, -1, 1, -1}));
+    CHECK(near(exp2(x), {2, 0.25f, 8, 0.0625f}));
+    CHECK(near(frac(tensor({1.5f, -1.25f, 2}, {3})), {0.5f, -0.25f, 0}));
+    CHECK(near(diag(tensor({1, 2}, {2})), {1, 0, 0, 2}));
+    CHECK(near(diag(x), {1, -4}));
+    CHECK(near(diff(tensor({1, 4, 9}, {3})), {3, 5}));
+    CHECK(near(full({2}, 3.0f), {3, 3}));
+    CHECK(near(full_like(y, 2.0f), {2, 2, 2, 2}));
+    CHECK(near(ones_like(y), {1, 1, 1, 1}));
+    CHECK(near(zeros_like(y), {0, 0, 0, 0}));
+    CHECK(scalar(scalar_tensor(7.0f), 7));
+    CHECK(near(logspace(0, 2, 3), {1, 10, 100}));
+    CHECK(near(tile(tensor({1, 2}, {2}), {2, 2}), {1, 2, 1, 2, 1, 2, 1, 2}));
+    CHECK(near(hstack({tensor({1}, {1}), tensor({2}, {1})}), {1, 2}));
+    CHECK(near(hstack({x, y}), {1, -2, 2, 0.5f, 3, -4, -1, 3}));
+    CHECK(shape_is(vstack({tensor({1, 2}, {2}), tensor({3, 4}, {2})}), {2, 2}));
+    CHECK(near(broadcast_to(tensor({1, 2}, {2}), {2, 2}), {1, 2, 1, 2}));
+    CHECK(near(expand_as(tensor({5}, {1}), x), {5, 5, 5, 5}));
+    CHECK(shape_is(unflatten(arange(0, 6), 0, {2, 3}), {2, 3}));
+    CHECK(near(index_fill(zeros({3}), 0, tensor({2, 0}, {2}), 5.0f), {5, 0, 5}));
+    CHECK(near(take_along_dim(x, tensor({1, 0}, {2, 1}), 1), {-2, 3}));
+    auto kth = kthvalue(tensor({3, 1, 2}, {3}), 2);
+    CHECK(scalar(kth.first, 2));
+    CHECK(scalar(kth.second, 2));
+    CHECK(scalar(min(x), -4));
+    CHECK(near(min(x, 1).first, {-2, -4}));
+    CHECK(near(min(x, 1).second, {1, 1}));
+    CHECK(near(bucketize(tensor({0.5f, 1, 2}, {3}), tensor({1, 2}, {2})), {0, 0, 1}));
+    CHECK(near(bucketize(tensor({0.5f, 1, 2}, {3}), tensor({1, 2}, {2}), true), {0, 1, 2}));
+    CHECK(near(argsort(tensor({3, 1, 2}, {3})), {1, 2, 0}));
+    CHECK(near(softmin(x), softmax(neg(x))));
+    CHECK(near(pairwise_distance(tensor({0, 0}, {1, 2}), tensor({3, 4}, {1, 2})), {5}, 1e-4f));
+    auto lp = log_softmax(x, 1);
+    CHECK(scalar(nll_loss(lp, tensor({1, 0}, {2})), -0.5f * (lp->to_vector()[1] + lp->to_vector()[2])));
+    CHECK(scalar(soft_margin_loss(tensor({1, -2}, {2}), tensor({1, 1}, {2})), 0.5f * (std::log1p(std::exp(-1.0f)) + std::log1p(std::exp(2.0f)))));
+    CHECK(scalar(multilabel_soft_margin_loss(tensor({1, -2}, {1, 2}), tensor({1, 0}, {1, 2})), 0.5f * (std::log1p(std::exp(-1.0f)) + std::log1p(std::exp(-2.0f)))));
+    CHECK(scalar(tetragamma(tensor({1}, {1})), -2.4041138f, 1e-4f));
+    CHECK(scalar(tetragamma(tensor({2}, {1})), -0.4041138f, 1e-4f));
+    CHECK(scalar(linalg::cond(diag(tensor({4, 2}, {2}))), 2));
+    CHECK(scalar(linalg::logdet(diag(tensor({2, 3}, {2}))), std::log(6.0f)));
+    CHECK(scalar(linalg::matrix_norm(x), std::sqrt(30.0f)));
+    CHECK(scalar(linalg::matrix_norm(x, linalg::MatrixNorm::One), 6));
+    CHECK(scalar(linalg::matrix_norm(x, linalg::MatrixNorm::Inf), 7));
+    CHECK(near(linalg::eigvalsh(diag(tensor({4, -1}, {2}))), {-1, 4}));
+    CHECK(near(conv_detail::add_channel_bias(zeros({1, 2, 2}), tensor({1, 2}, {2}), 1), {1, 1, 2, 2}));
+    CHECK(shape_is(upsample(zeros({1, 2, 3, 4}), 2.0), {1, 2, 6, 8}));
+    auto moved = to_device(leaf_of(x), Device::CPU);
+    if (!moved->requires_grad) return "to_device dropped the gradient";
+    set_index_checks(false);
+    auto unchecked = gather(x, 1, tensor({1, 0}, {2, 1}));
+    set_index_checks(true);
+    CHECK(near(unchecked, {-2, 3}));
+
+    // Complex numbers and transforms
+    auto z = tensor({3, 4, 0, 1}, {2, 2});
+    CHECK(near(fft::complex_abs(z), {5, 1}));
+    CHECK(scalar(select(fft::complex_angle(z), 0, 1), 1.57079633f));
+    CHECK(near(fft::complex_mul(tensor({1, 2}, {1, 2}), tensor({3, -1}, {1, 2})), {5, 5}));
+    CHECK(near(fft::conj(z), {3, -4, 0, -1}));
+    CHECK(near(fft::real(z), {3, 0}));
+    CHECK(near(fft::imag(z), {4, 1}));
+    auto signal = input({3, 4, 2});
+    CHECK(near(fft::ifftn(fft::fftn(signal, {0, 1}), {0, 1}), signal, 1e-5f));
+    auto image = input({4, 6});
+    CHECK(near(fft::irfft2(fft::rfft2(image)), image, 1e-5f));
+    CHECK(near(fft::fftshift(arange(0, 5), 0), {3, 4, 0, 1, 2}));
+    CHECK(near(fft::ifftshift(fft::fftshift(arange(0, 5), 0), 0), {0, 1, 2, 3, 4}));
+    CHECK(near(fft::rfftfreq(4), {0, 0.25f, 0.5f}));
+    CHECK(near(fft::hamming_window(4), {0.08f, 0.54f, 1.0f, 0.54f}));
+
+    // Random ops
+    manual_seed(12);
+    auto big = zeros({200, 100});
+    CHECK(scalar(mean(gumbel_like(big)), 0.5772f, 0.03f));
+    auto u = rand_like(big);
+    if (amin(u)->item() < 0.0f || amax(u)->item() >= 1.0f) return "rand_like range";
+    CHECK(scalar(std_dev(randn_like(big)), 1.0f, 0.02f));
+    auto kept = alpha_dropout(randn_like(big), 0.3f);
+    CHECK(scalar(mean(kept), 0.0f, 0.03f));
+    CHECK(scalar(std_dev(kept), 1.0f, 0.03f));
+    auto channels = feature_dropout(ones({50, 8, 3}), 0.5f)->to_vector();
+    auto paths = drop_path(ones({50, 24}), 0.5f)->to_vector();
+    bool dropped = false, stayed = false;
+    for (size_t i = 0; i < channels.size(); i += 3) {
+        if (channels[i] != channels[i + 1] || channels[i] != channels[i + 2] || (channels[i] != 0.0f && channels[i] != 2.0f)) return "feature_dropout splits a channel";
+        dropped = dropped || channels[i] == 0.0f;
+        stayed = stayed || channels[i] != 0.0f;
+    }
+    for (size_t i = 0; i < paths.size(); ++i) if (paths[i] != paths[i / 24 * 24] || (paths[i] != 0.0f && paths[i] != 2.0f)) return "drop_path splits a sample";
+    return dropped && stayed ? "" : "feature_dropout";
+}
 static std::string values_math() {
     CHECK(near(erfinv(erf(tensor({-1.5f, -0.2f, 0.7f, 2.0f}, {4}))), {-1.5f, -0.2f, 0.7f, 2.0f}, 2e-4f, 2e-4f));
     CHECK(near(digamma(tensor({1, 0.5f, -0.5f}, {3})), {-0.5772157f, -1.9635100f, 0.0364900f}, 1e-4f));
@@ -818,6 +849,23 @@ static std::string values_conv() {
 }
 
 // CTC against a sum over every alignment
+// The same convolution in one piece and a sample at a time, with and without groups
+static std::string conv_chunks() {
+    for (int64_t groups : {1, 2}) {
+        auto x = input({5, 4, 6, 5}), w = input({6, 4 / groups, 3, 2}), b = input({6}), g = input({5, 6, 3, 4});
+        auto run_once = [&](int64_t bytes) {
+            auto before = conv_detail::g_conv_column_bytes.exchange(bytes);
+            auto xl = leaf_of(x->detach()), wl = leaf_of(w->detach()), bl = leaf_of(b->detach());
+            auto y = conv_nd(xl, wl, bl, {2, 1}, {1, 0}, {1}, groups);
+            y->backward(g);
+            conv_detail::g_conv_column_bytes = before;
+            return TensorList{y->detach(), xl->grad, wl->grad, bl->grad};
+        };
+        auto whole = run_once((int64_t)1 << 40), pieces = run_once(1);
+        for (size_t i = 0; i < whole.size(); ++i) CHECK(near(pieces[i], whole[i], 1e-5f, 1e-5f));
+    }
+    return "";
+}
 static std::string values_ctc() {
     auto lp = log_softmax(input({5, 1, 3}), 2);
     auto v = lp->to_vector();
@@ -1083,6 +1131,88 @@ static std::string layer_transformer() {
     CHECK(near(attn.forward(src, changed, nullptr, padding), base, 1e-6f));
     sum(y)->backward();
     for (auto& [name, p] : model.named_parameters()) if (!p->grad) return "no gradient for " + name;
+    return "";
+}
+static std::string layer_more() {
+    manual_seed(14);
+    auto x = tensor({1, -2, 3, -4}, {2, 2});
+    CHECK(near(LeakyReLU(0.1f).forward(x), {1, -0.2f, 3, -0.4f}));
+    CHECK(near(ELU().forward(x), {1, std::exp(-2.0f) - 1, 3, std::exp(-4.0f) - 1}));
+    CHECK(near(Softplus().forward(tensor({0}, {1})), {std::log(2.0f)}));
+    CHECK(near(Softmax().forward(x), softmax(x, -1)));
+    CHECK(near(LogSoftmax(0).forward(x), log(softmax(x, 0))));
+    PReLU prelu_layer;
+    CHECK(near(prelu_layer.forward(x), {1, -0.5f, 3, -1}));
+    sum(prelu_layer.forward(x))->backward();
+    CHECK(near(prelu_layer.weight->grad, {-6}));
+    CHECK(near(GLU().forward(tensor({2, 0}, {1, 2})), {1}));
+    CHECK(shape_is(Unflatten(1, {2, 3}).forward(zeros({4, 6})), {4, 2, 3}));
+    CHECK(near(AdaptiveMaxPool({1}).forward(tensor({1, 5, 2}, {1, 1, 3})), {5}));
+    CHECK(near(PixelShuffle(2).forward(reshape(arange(0, 4), {1, 4, 1, 1})), {0, 1, 2, 3}));
+    CHECK(near(Pad({1, 2}).forward(tensor({7}, {1, 1})), {0, 7, 0, 0}));
+    CHECK(near(MaxPool(2).forward(tensor({1, 4, 3, 2}, {1, 1, 4})), {4, 3}));
+    CHECK(near(AvgPool(2).forward(tensor({1, 4, 3, 2}, {1, 1, 4})), {2.5f, 2.5f}));
+    // Dropout layers do nothing in eval mode
+    FeatureDropout fd(0.5f);
+    AlphaDropout ad(0.5f);
+    DropPath dp(0.5f);
+    for (Layer* l : std::vector<Layer*>{&fd, &ad, &dp}) {
+        l->eval();
+        CHECK(near(l->forward(x), x, 0.0f, 0.0f));
+        l->train();
+        bool changed = false;
+        for (int i = 0; i < 20; ++i) changed = changed || !near(l->forward(x), x, 1e-6f).empty();
+        if (!changed) return "a dropout layer never drops";
+    }
+    ModuleList<Linear> list;
+    list.emplace_back(2, 3);
+    list.emplace_back(3, 1);
+    if (list.size() != 2 || list.parameters().size() != 4 || list.named_parameters()[2].first != "1.weight") return "ModuleList";
+    CHECK(shape_is(list[1].forward(list[0].forward(x)), {2, 1}));
+
+    // Cells against their equations
+    auto in = input({2, 3}), h = input({2, 4});
+    RNNCell rnn(3, 4);
+    CHECK(near(rnn.forward(in, h), tanh(matmul(in, rnn.weight_ih) + matmul(h, rnn.weight_hh) + rnn.bias)));
+    GRUCell gru(3, 4);
+    auto xg = chunk(matmul(in, gru.weight_ih) + gru.bias_ih, 3, 1), hg = chunk(matmul(h, gru.weight_hh) + gru.bias_hh, 3, 1);
+    auto r = sigmoid(xg[0] + hg[0]), z = sigmoid(xg[1] + hg[1]);
+    auto n = tanh(xg[2] + r * hg[2]);
+    CHECK(near(gru.forward(in, h), (1.0f - z) * n + z * h));
+
+    // Encoder and decoder layers, norms before and after
+    for (bool first : {false, true}) {
+        TransformerOptions o;
+        o.d_model = 8;
+        o.n_heads = 2;
+        o.d_ff = 16;
+        o.dropout = 0.0f;
+        o.norm_first = first;
+        auto src = input({2, 4, 8}), tgt = input({2, 3, 8});
+        TransformerEncoderLayer enc(o);
+        TransformerDecoderLayer dec(o);
+        auto e = enc.forward(src);
+        auto a = enc.self_attn.forward(src, src);
+        auto feed = [&](const TensorPtr& t) { return enc.fc2.forward(relu(enc.fc1.forward(t))); };
+        TensorPtr want;
+        if (first) {
+            auto n1 = enc.norm1.forward(src);
+            auto t = src + enc.self_attn.forward(n1, n1);
+            want = t + feed(enc.norm2.forward(t));
+        } else {
+            auto t = enc.norm1.forward(src + a);
+            want = enc.norm2.forward(t + feed(t));
+        }
+        CHECK(near(e, want, 1e-5f));
+        // The decoder looks at all of the memory and at no later target
+        auto d = dec.forward(tgt, e);
+        auto later = tgt->clone();
+        later->data_ptr<float>()[2 * 8] += 1.0f;
+        CHECK(near(contiguous(narrow(dec.forward(later, e), 1, 0, 2)), contiguous(narrow(d, 1, 0, 2)), 1e-6f));
+        auto other = e->detach()->clone();
+        other->data_ptr<float>()[3 * 8] += 1.0f;
+        if (near(dec.forward(tgt, other), d, 1e-6f).empty()) return "the decoder ignores its memory";
+    }
     return "";
 }
 static std::string layer_misc() {
@@ -1508,6 +1638,50 @@ static std::vector<DeviceTest> device_tests() {
         sum(square(y))->backward();
         return cat({x->grad, a.W->grad}, 0);
     }, 1e-4f, 5e-3f);
+    add_test("sort/ties_and_nan", [](Device d) {
+        auto x = tensor({3, NAN, -0.0f, 0, INFINITY, 3, -INFINITY, 1, NAN, -2, 0, 3}, {3, 4}, d);
+        auto flat = [](const TensorPtr& t) { return reshape(contiguous(t), {t->size()}); };
+        return cat({flat(argsort(x, 1)), flat(argsort(x, 1, true)), flat(argsort(x, 0)), flat(argsort(reshape(x, {12}), 0)), flat(argsort(reshape(x, {12}), 0, true)), flat(topk(x, 2, 0).second)}, 0);
+    }, 0.0f, 0.0f);
+    add_test("sort/large", [](Device d) {
+        manual_seed(41);
+        auto x = floor(normal({20, 300, 7}, 0.0f, 50.0f, d));
+        auto s = sort(x, 1);
+        auto t = topk(x, 5, 1);
+        return cat({s.first, s.second, t.first, t.second, argsort(x, 0, true), argsort(x, -1)}, 1);
+    }, 0.0f, 0.0f);
+    add_test("scatter/index_add", [](Device d) {
+        manual_seed(42);
+        auto at = randint(0, 50, {2000}, d);
+        return cat({index_add(ones({50, 8}, d), 0, at, normal({2000, 8}, 0, 1, d)), transpose(index_add(zeros({8, 50}, d), 1, at, normal({8, 2000}, 0, 1, d), 0.5f), 0, 1)}, 0);
+    }, 1e-3f);
+    add_test("scatter/add_long", [](Device d) {
+        manual_seed(43);
+        auto x = scatter_add(ones({37}, d), 0, randint(0, 37, {3000}, d), normal({3000}, 0, 1, d));
+        auto y = scatter_add(zeros({4, 5}, d), 1, randint(0, 5, {4, 200}, d), normal({4, 200}, 0, 1, d));
+        auto z = scatter_add(zeros({300, 3}, d), 0, randint(0, 300, {2, 3}, d), ones({2, 3}, d));
+        return cat({x, reshape(y, {20}), reshape(z, {900})}, 0);
+    }, 1e-3f);
+    add_test("scatter/last_wins", [](Device d) {
+        manual_seed(44);
+        auto x = scatter(zeros({40}, d), 0, randint(0, 40, {500}, d), arange(0, 500, 1, d));
+        auto y = scatter(zeros({6, 30}, d), 0, randint(0, 6, {100, 30}, d), reshape(arange(0, 3000, 1, d), {100, 30}));
+        return cat({x, reshape(y, {180})}, 0);
+    }, 0.0f, 0.0f);
+    for (int64_t n : {1, 8, 12, 17, 30}) {
+        add_test("fft/" + std::to_string(n), [n](Device d) {
+            manual_seed(45);
+            auto z = normal({3, n, 4, 2}, 0.0f, 1.0f, d);
+            return cat({fft::fft(z, 1), fft::ifft(z, 1), fft::fft(z, 0), fft::ifft(z, 2)}, 0);
+        }, 1e-4f);
+    }
+    add_test("fft/spectral_layer", [](Device d) {
+        manual_seed(46);
+        auto x = leaf_of(normal({2, 16}, 0.0f, 1.0f, d)), w = leaf_of(normal({9, 2}, 0.0f, 1.0f, d));
+        auto y = fft::irfft(fft::complex_mul(fft::rfft(x), w));
+        sum(square(y))->backward();
+        return cat({reshape(y, {32}), reshape(x->grad, {32}), reshape(w->grad, {18})}, 0);
+    }, 1e-3f);
     add_test("distributions", [](Device d) {
         auto l = tensor({0.1f, -0.4f, 0.7f}, {3}, d);
         distributions::Normal n(l, ones({3}, d));
@@ -1545,9 +1719,11 @@ int main(int argc, char** argv) {
     run("values/shapes", values_shapes);
     run("values/reductions", values_reductions);
     run("values/indexing", values_indexing);
+    run("values/more", values_more);
     run("values/math", values_math);
     run("values/einsum", values_einsum);
     run("values/conv", values_conv);
+    run("values/conv_chunks", conv_chunks);
     run("values/ctc", values_ctc);
     run("values/losses", values_losses);
     run("values/random", values_random);
@@ -1560,12 +1736,11 @@ int main(int argc, char** argv) {
     run("layers/sequential", layer_sequential);
     run("layers/recurrent", layer_recurrent);
     run("layers/transformer", layer_transformer);
+    run("layers/more", layer_more);
     run("layers/misc", layer_misc);
     run("optim/optimizers", optimizers);
     run("optim/schedules", schedules);
     run("optim/averaging", averaging);
 
-    std::cout << "\n" << g_passed << " passed, " << g_failures.size() << " failed\n";
-    for (const auto& f : g_failures) std::cout << "  FAILED " << f << "\n";
-    return g_failures.empty() ? 0 : 1;
+    return report();
 }

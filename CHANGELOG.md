@@ -4,7 +4,7 @@ All notable changes to dummygrad are documented here. Versions follow [Semantic 
 
 ## [Unreleased]
 
-The research release: higher-order autograd, the op, layer, optimizer, linear-algebra, FFT and distribution libraries of a research framework, and a threaded CPU backend. On a Kaggle T4 x2, `test_research` (914 checks, including about 220 ops, 13 optimizers and several whole modules on CUDA against the CPU) and `test_engine` (268, including the two-GPU test) pass.
+The research release: higher-order autograd, the op, layer, optimizer, linear-algebra, FFT and distribution libraries of a research framework, and a threaded CPU backend. On a Kaggle T4 x2, `test_research` (985 checks, including about 240 ops, 13 optimizers and several whole modules on CUDA against the CPU), `test_engine` (269, including the two-GPU test) and `test_models` (22) pass.
 
 ### Added
 - **Higher-order gradients.** `autograd::grad` returns gradients instead of accumulating them; `create_graph=true` records the gradient computation so it can be differentiated again, to any order. The existing ops support it too: matmul, linear, softmax, the norms, RoPE, attention, the losses. (`checkpoint`, `linalg::eigvals` and the third derivative of `digamma` do not, and say so.) `autograd::jacobian`, `hessian`, `hvp`, `vjp`, `jvp`, `backward` (several outputs, weighted), `checkpoint` (recompute instead of store, with replayed dropout) and `custom_function`.
@@ -19,13 +19,24 @@ The research release: higher-order autograd, the op, layer, optimizer, linear-al
 - **`fft::`**: fft, ifft, rfft, irfft (any length, any dimension), 2-D and n-D, stft, istft, convolution, windows; differentiable, on the host.
 - **`distributions::`**: 20 distributions with log_prob, sampling, reparameterized sampling where one exists, entropy and moments; KL divergences.
 - **Random numbers** from a counter-based generator (Philox): `rand`, `normal`, `randint`, `randperm`, `bernoulli`, `multinomial`, `dropout`, `gumbel_softmax` give the same values on every device and thread count for a seed.
-- `test_research`: gradients, and for nearly all of them second derivatives, of about 220 ops against finite differences; CUDA against the CPU; values against definitions. Some ops and layers, mostly thin compositions, have no test of their own yet. `examples/research_tour.cpp`.
+- `test_research`: gradients, and for nearly all of them second derivatives, of about 220 ops against finite differences; CUDA against the CPU; values against definitions. `examples/research_tour.cpp`.
+- **Operators and indexing.** `+ - * /` and their assignment forms (which rebind); `Tensor::index` with integers, `Slice`, `Ellipsis`, `NewAxis`, index tensors and `Mask`, following PyTorch; `index_put`; `std::cout << tensor`.
+- **Text generation.** `KVCache`, `forward_cached` on `GPT` and `ModernTransformer`, `generate` (temperature, top-k, top-p, min-p, repetition penalty, end tokens, streaming), `beam_search`.
+- **Pretrained models.** `load_llama` (Llama, Mistral, Qwen2; sharded checkpoints, grouped queries, linear and Llama 3 RoPE scaling), `save_llama`, `load_gpt2`; `ModernTransformerConfig` with optional biases, head width and untied output; `Linear` without a bias; `SkipInitGuard`.
+- **Tokenizers.** Byte-level BPE, trained (`Tokenizer::train`) or read from `tokenizer.json`; sentencepiece-style BPE read from `tokenizer.json`.
+- **LoRA** (`add_lora`, `merge_lora`, `save_lora`, `load_lora`) and **`MixtureOfExperts`** with a load-balancing loss.
+- **Data.** `Dataset`, `DataLoader::prefetch`, `TokenLoader`, `Prefetcher`; token files are memory-mapped.
+- `json::parse`, `MappedFile`, `io::SafeTensorsFile`, `Module::for_each_module`, `fused_attention`. `examples/generate.cpp`, `bench/bench_ops.cpp`, `test_models`.
 - `-DDUMMYGRAD_USE_BLAS=OFF`, `set_num_threads`, `DUMMYGRAD_NUM_THREADS`.
 
 ### Faster
 - **fp16 on the GPU: 6 to 16% faster, with 17 to 18% less memory.** Under autocast, the outputs of the linears inside attention and feed-forward blocks, relu/gelu/silu, products of equal shapes, RoPE, GQA repetition and attention stay in half precision instead of going back to fp32 between matrix products (`Linear::forward_autocast`, `native_half`). Both gradients of a product come from one kernel. T4, against the code before it in the same session: small 14.0 to 11.7 ms, medium 47.8 to 41.2, large 315 to 294, tiny unchanged; a second session agrees.
 - **CPU: 2.4 to 3.3 times faster training steps** than v0.8.0 on 4-thread CI machines (OpenBLAS, both versions in one job): tiny 51.0 to 18.9 ms and small 1086 to 460 ms on one, 39.5 to 12.0 and 791 to 306 on another. Kernels run on a thread pool and vectorize (including `exp`, `log` and `tanh`), a shared weight's matmul is one GEMM over the whole batch, Linear adds its bias in place, the tied LM head multiplies by the transpose without copying, and backward runs on the calling thread.
 - Without a BLAS, a packed, vectorized, threaded matrix multiply replaces the triple loop.
+- **On the GPU instead of the host:** sorting (`sort`, `argsort`, `topk`, `median`, `quantile`) by radix sort, `index_add`, `scatter` and long `scatter_add` by sorting their targets (deterministic), `fft` through cuFFT.
+- **Cached generation:** 1.2 ms per token against 4.5 without a cache (batch 1), 2.1 against 65 (batch 16); T4, 23M parameters, half way through 64 new tokens after a 64-token prompt.
+- **Convolutions keep no columns** (memory and time not yet compared with before). The unfolded input, kernel-size times the input, was made for the whole batch and kept for backward; it is now made a few samples at a time, and again in backward. 1x1 convolutions use the input itself.
+- **GPU memory is split and joined**, so memory freed at one size serves others; a training step's repeated sizes are still served at once. Copies to the GPU up to 32 MB go through page-locked memory and do not wait for queued work.
 - **GPU (speed not yet compared with v0.8.0 in one session):** broadcast, strided-copy and RoPE kernels index with 32-bit division, or none for equal shapes; an activation several matmuls read is converted to fp16 once and saved once.
 
 ### Changed
@@ -34,6 +45,9 @@ The research release: higher-order autograd, the op, layer, optimizer, linear-al
 - Ops built with `make_op` throw when a tensor saved for backward was modified in place.
 - 1-D operands and partially broadcast batch dimensions work in `matmul` on every device.
 - Running out of GPU memory returns cached blocks and retries before throwing.
+- `load_safetensors` converts F64, integer and boolean tensors to Float32 instead of refusing them, and refuses malformed headers.
+- `TokenDataset::tokens()` returns a copy; `SelfAttention`, `MultiHeadAttention` and `scaled_dot_product_attention` share `fused_attention`.
+- `cuda::attention_forward` and `attention_backward` take an `AttentionShape`. Masked, cross- and cached attention are one op on the GPU and keep no score matrices for backward. That is not faster: a padded [8, 8, 256, 64] call with its backward takes 2.5 ms against 2.3 as separate ops in fp32 and 2.0 against 2.0 in fp16, with more scratch memory during the call.
 
 ### Fixed
 - Tensors in static storage crashed the program on exit (the allocator was destroyed first).

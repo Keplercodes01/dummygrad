@@ -1,8 +1,8 @@
 #pragma once
 // Fourier transforms (torch.fft) and the short-time Fourier transform. Complex tensors are real tensors
 // with a trailing dimension of 2 holding (real, imaginary); dims count the dimensions before it. Like
-// PyTorch's, forward transforms are unnormalized and inverse ones divide by n. Transforms run on the
-// host in double precision (GPU tensors are copied there and back) and are differentiable to any order.
+// PyTorch's, forward transforms are unnormalized and inverse ones divide by n. On the CPU they run in double
+// precision, on a GPU through cuFFT in single precision. They are differentiable to any order.
 
 #include "functional.h"
 #include "linalg/dense.h"
@@ -17,6 +17,13 @@ inline TensorPtr transform_last(const TensorPtr& x_in, bool inverse) {
     auto x = op_detail::dense(x_in);
     if (x->ndim() < 2 || x->shape.back() != 2) throw std::invalid_argument("fft: complex input must have a trailing dimension of 2");
     int64_t n = x->shape[(size_t)x->ndim() - 2], rows = x->size() / std::max<int64_t>(1, 2 * n);
+#if defined(USE_CUDA) && defined(DUMMYGRAD_CUFFT)
+    if (x->device == Device::CUDA) {
+        auto y = op_detail::empty(x->shape, x->device);
+        kern::gpu::fft(x->data_ptr<float>(), y->data_ptr<float>(), rows, n, inverse);
+        return make_op("fft", y, {x}, {}, [inverse](const OpContext&, const TensorPtr& g) -> TensorList { return {transform_last(g, !inverse)}; });
+    }
+#endif
     auto v = x->to_vector();
     std::vector<float> out(v.size());
     parallel_for(0, rows, std::max<int64_t>(1, 2048 / std::max<int64_t>(1, n)), [&](int64_t b, int64_t e) {

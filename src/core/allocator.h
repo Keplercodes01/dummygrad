@@ -2,7 +2,9 @@
 #include <cstddef>
 #include <unordered_map>
 #include <vector>
+#include <memory>
 #include <mutex>
+#include "block_pool.h"
 #include "types.h"
 
 class Allocator {
@@ -28,9 +30,8 @@ public:
 };
 
 // GPU memory held by tensors and by the caching allocator, summed over devices, in bytes.
-// in_use counts live blocks (rounded to 512 bytes), like torch.cuda.memory_allocated; reserved
-// adds the cached free blocks, like torch.cuda.memory_reserved; peak_in_use is the highest
-// in_use since the last reset_peak_memory_stats().
+// in_use counts live blocks, like torch.cuda.memory_allocated; reserved adds the cached free ones, like
+// torch.cuda.memory_reserved; peak_in_use is the highest in_use since the last reset_peak_memory_stats().
 #define DUMMYGRAD_HAS_MEMORY_STATS 1  // lets tools built against several versions (bench.cpp) check
 struct MemoryStats {
     size_t in_use = 0;
@@ -42,25 +43,20 @@ void reset_peak_memory_stats();
 
 class CUDACachingAllocator : public Allocator {
 private:
-    // Pools are per device: a block cudaMalloc'd on one GPU must never be reused on another
-    std::unordered_map<int, std::unordered_map<size_t, std::vector<void*>>> free_blocks;
-    std::unordered_map<void*, int> ptr_device;
+    // One pool per device: memory of one GPU must never be handed out for another
+    std::unordered_map<int, std::unique_ptr<BlockPool>> pools;
     std::mutex mtx;
-    MemoryStats stats;  // guarded by mtx
-    size_t round_up(size_t bytes) { return (bytes + 511) & ~511; }
+    size_t peak_in_use = 0;  // guarded by mtx
+    BlockPool& pool(int device);
+    MemoryStats stats_locked() const;
 public:
-    MemoryStats memory_stats() {
-        std::lock_guard<std::mutex> lock(mtx);
-        return stats;
-    }
-    void reset_peak() {
-        std::lock_guard<std::mutex> lock(mtx);
-        stats.peak_in_use = stats.in_use;
-    }
+    MemoryStats memory_stats();
+    void reset_peak();
     static CUDACachingAllocator& get() { static auto* instance = new CUDACachingAllocator; return *instance; }
     ~CUDACachingAllocator() override { empty_cache(); }
     void* allocate(size_t bytes) override;
     void free(void* ptr, size_t bytes) override;
+    // Returns memory no tensor uses to the driver
     void empty_cache() override;
 };
 

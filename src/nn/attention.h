@@ -3,54 +3,8 @@
 #include "functional.h"
 #include "linear.h"
 #include "modern_layers.h"
-
-#ifdef USE_CUDA
-// Backward of the CUDA attention kernel; q, k, v, out are contiguous [batch, heads, seq, head_dim]
-struct FlashAttentionBackward : public Node {
-    // The same gradients from explicit scores (memory quadratic in the sequence length)
-    std::vector<std::shared_ptr<Tensor>> apply_graph(const std::vector<std::shared_ptr<Tensor>>& grads) override {
-        auto qv = graph_input(*this, 0, q), kv = graph_input(*this, 1, k), vv = graph_input(*this, 2, v);
-        auto scores = mul_scalar(matmul(qv, transpose(kv, -2, -1)), scale);
-        if (causal) scores = causal_mask(scores);
-        auto p = softmax(scores);
-        auto gp = matmul(grads[0], transpose(vv, -2, -1));
-        auto gs = mul_scalar(mul(p, sub(gp, sum(mul(gp, p), -1, true))), scale);
-        return {matmul(gs, kv), matmul(transpose(gs, -2, -1), qv), matmul(transpose(p, -2, -1), grads[0])};
-    }
-
-    std::shared_ptr<Tensor> q, k, v, out, lse;
-    int batch_size, num_heads, seq_len, d_k;
-    bool causal;
-    float scale;
-    cuda::AttentionImpl impl;  // what the forward ran, so backward reads matching statistics
-    DType compute;             // GEMM precision the forward ran with (autocast)
-
-    FlashAttentionBackward(std::shared_ptr<Tensor> q, std::shared_ptr<Tensor> k, std::shared_ptr<Tensor> v,
-                           std::shared_ptr<Tensor> out, std::shared_ptr<Tensor> lse,
-                           int batch_size, int num_heads, int seq_len, int d_k, bool causal, float scale,
-                           cuda::AttentionImpl impl, DType compute)
-        : q(std::move(q)), k(std::move(k)), v(std::move(v)), out(std::move(out)), lse(std::move(lse)),
-          batch_size(batch_size), num_heads(num_heads), seq_len(seq_len), d_k(d_k), causal(causal), scale(scale),
-          impl(impl), compute(compute) {}
-
-    void release_variables() override {
-        q = nullptr; k = nullptr; v = nullptr; out = nullptr; lse = nullptr;
-    }
-
-    std::vector<std::shared_ptr<Tensor>> apply(const std::vector<std::shared_ptr<Tensor>>& grads) override {
-        if (grads.empty() || !grads[0] || !q || !k || !v || !out) return {nullptr, nullptr, nullptr};
-        auto grad_out = grads[0]->to(out->dtype);
-        auto gq = std::make_shared<Tensor>(q->shape, q->device, q->dtype, false);
-        auto gk = std::make_shared<Tensor>(k->shape, k->device, k->dtype, false);
-        auto gv = std::make_shared<Tensor>(v->shape, v->device, v->dtype, false);
-        cuda::attention_backward(q->data_ptr<void>(), k->data_ptr<void>(), v->data_ptr<void>(),
-                                 out->data_ptr<void>(), grad_out->data_ptr<void>(), lse->data_ptr<float>(),
-                                 gq->data_ptr<void>(), gk->data_ptr<void>(), gv->data_ptr<void>(),
-                                 batch_size, num_heads, seq_len, d_k, causal, scale, impl, compute, q->dtype);
-        return {gq, gk, gv};
-    }
-};
-#endif
+#include "fused_attention.h"
+#include "kv_cache.h"
 
 // Single-Head Self-Attention
 class SelfAttention : public Module {
@@ -83,44 +37,7 @@ public:
         // Scaled dot-product attention
         float scale = 1.0f / std::sqrt(static_cast<float>(d_k));
 
-        std::shared_ptr<Tensor> out;
-#ifdef USE_CUDA
-        if (x->device == Device::CUDA && !mask) {
-            DG_PROFILE_OP("attention");
-            auto Q_4d = make_contiguous(reshape(Q, {B, 1, S, d_k}));
-            auto K_4d = make_contiguous(reshape(K, {B, 1, S, d_k}));
-            auto V_4d = make_contiguous(reshape(V, {B, 1, S, d_k}));
-            // Q/K/V carry the weights' requires_grad even when the input x does not
-            bool qkv_grad = grad_enabled() && (Q->requires_grad || K->requires_grad || V->requires_grad);
-            auto out_4d = std::make_shared<Tensor>(Q_4d->shape, Device::CUDA, DType::Float32, qkv_grad);
-            auto lse = std::make_shared<Tensor>(std::vector<int64_t>{B, 1, S}, Device::CUDA, DType::Float32, false);
-            DType compute = autocast_dtype();
-            auto impl = cuda::attention_forward(Q_4d->data_ptr<float>(), K_4d->data_ptr<float>(), V_4d->data_ptr<float>(),
-                                                out_4d->data_ptr<float>(), lse->data_ptr<float>(), B, 1, S, d_k, causal, scale,
-                                                compute);
-            if (qkv_grad) {
-                auto grad_fn = std::make_shared<FlashAttentionBackward>(Q_4d, K_4d, V_4d, saved_output(out_4d), lse,
-                                                                        B, 1, S, d_k, causal, scale, impl, compute);
-                grad_fn->add_next_edge(get_grad_edge(Q).function);
-                grad_fn->add_next_edge(get_grad_edge(K).function);
-                grad_fn->add_next_edge(get_grad_edge(V).function);
-                out_4d->grad_fn = grad_fn;
-            }
-            out = reshape(out_4d, {B, S, d_k});
-        } else {
-            auto scores = mul_scalar(matmul(Q, transpose(K, -2, -1)), scale);
-            if (mask) scores = add(scores, mask);
-            else if (causal) scores = causal_mask(scores); 
-            auto weights = softmax(scores); 
-            out = matmul(weights, V);
-        }
-#else
-        auto scores = mul_scalar(matmul(Q, transpose(K, -2, -1)), scale);
-        if (mask) scores = add(scores, mask);
-        else if (causal) scores = causal_mask(scores); 
-        auto weights = softmax(scores); 
-        out = matmul(weights, V);
-#endif
+        auto out = fused_attention(Q, K, V, mask, causal && !mask, scale);
 
         if (is_2d) {
             out = reshape(out, {S, d_k});
@@ -228,39 +145,59 @@ public:
     int d_k;
     bool causal;
 
-    // Number of key/value heads (n_kv_heads, or n_heads when 0) after checking the head layout:
-    // n_heads must divide d_model and the kv heads must divide n_heads, or the attention kernels
-    // would index past K and V
-    static int checked_kv_heads(int d_model, int n_heads, int n_kv_heads) {
-        if (n_heads <= 0 || d_model <= 0 || d_model % n_heads != 0) {
+    struct Options {
+        int n_kv_heads = 0;  // key and value heads (0: n_heads)
+        bool causal = false;
+        bool qkv_bias = true, out_bias = true;
+        int head_dim = 0;    // width of one head (0: d_model / n_heads)
+    };
+
+    // Width of one head, after checking the layout: the kv heads must divide the heads, or the attention
+    // kernels would index past K and V
+    static int checked_head_dim(int d_model, int n_heads, const Options& o) {
+        if (n_heads <= 0 || d_model <= 0 || o.head_dim < 0 || (o.head_dim == 0 && d_model % n_heads != 0)) {
             throw std::invalid_argument("MultiHeadAttention: d_model (" + std::to_string(d_model) +
                                         ") must be a positive multiple of n_heads (" + std::to_string(n_heads) + ")");
         }
-        int kv = n_kv_heads > 0 ? n_kv_heads : n_heads;
-        if (n_kv_heads < 0 || kv > n_heads || n_heads % kv != 0) {
-            throw std::invalid_argument("MultiHeadAttention: n_kv_heads (" + std::to_string(n_kv_heads) +
+        int kv = o.n_kv_heads > 0 ? o.n_kv_heads : n_heads;
+        if (o.n_kv_heads < 0 || kv > n_heads || n_heads % kv != 0) {
+            throw std::invalid_argument("MultiHeadAttention: n_kv_heads (" + std::to_string(o.n_kv_heads) +
                                         ") must divide n_heads (" + std::to_string(n_heads) + ")");
         }
-        return kv;
+        return o.head_dim > 0 ? o.head_dim : d_model / n_heads;
     }
 
     MultiHeadAttention(int d_model, int n_heads, int n_kv_heads = 0, bool causal = false)
-        : W_q(d_model, d_model),
-          W_k(d_model, checked_kv_heads(d_model, n_heads, n_kv_heads) * (d_model / n_heads)),
-          W_v(d_model, (n_kv_heads > 0 ? n_kv_heads : n_heads) * (d_model / n_heads)),
-          W_o(d_model, d_model),
+        : MultiHeadAttention(d_model, n_heads, make_options(n_kv_heads, causal)) {}
+
+    // W_q comes first, so a bad layout throws before anything is allocated
+    MultiHeadAttention(int d_model, int n_heads, const Options& o)
+        : W_q(d_model, n_heads * checked_head_dim(d_model, n_heads, o), 0.0f, o.qkv_bias),
+          W_k(d_model, (o.n_kv_heads > 0 ? o.n_kv_heads : n_heads) * checked_head_dim(d_model, n_heads, o), 0.0f, o.qkv_bias),
+          W_v(d_model, (o.n_kv_heads > 0 ? o.n_kv_heads : n_heads) * checked_head_dim(d_model, n_heads, o), 0.0f, o.qkv_bias),
+          W_o(n_heads * checked_head_dim(d_model, n_heads, o), d_model, 0.0f, o.out_bias),
           d_model(d_model),
           n_heads(n_heads),
-          n_kv_heads(n_kv_heads > 0 ? n_kv_heads : n_heads),
-          d_k(d_model / n_heads),
-          causal(causal) {}
+          n_kv_heads(o.n_kv_heads > 0 ? o.n_kv_heads : n_heads),
+          d_k(checked_head_dim(d_model, n_heads, o)),
+          causal(o.causal) {}
 
+    static Options make_options(int n_kv_heads, bool causal) {
+        Options o;
+        o.n_kv_heads = n_kv_heads;
+        o.causal = causal;
+        return o;
+    }
+
+    // Queries attend to this call's tokens, or with a cache to those of earlier calls as well (inference; the
+    // cache decides start_pos, and a mask must then cover every key: [.., S, cached + S])
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x_in,
                                     const std::shared_ptr<Tensor>& mask = nullptr,
                                     const std::shared_ptr<Tensor>& cos_freqs = nullptr,
                                     const std::shared_ptr<Tensor>& sin_freqs = nullptr,
-                                    int start_pos = 0) {
+                                    int start_pos = 0, KVCache* cache = nullptr) {
         if (!x_in) throw std::runtime_error("MultiHeadAttention: input tensor is null");
+        if (cache) start_pos = (int)cache->length;
         if (x_in->ndim() < 2) throw std::runtime_error("MultiHeadAttention: input must be at least 2D (S, D) or (B, S, D)");
         auto x = x_in;
         bool is_2d = (x->ndim() == 2);
@@ -291,6 +228,17 @@ public:
         auto K_split = transpose(K_4d, 1, 2);
         auto V_split = transpose(reshape(V, {B, S, n_kv_heads, d_k}), 1, 2);
 
+        // With a cache, the queries see the tokens of earlier calls too
+        int64_t past = 0;
+        if (cache) {
+            past = cache->length;
+            auto stored = cache->append(K_split, V_split);
+            if (past > 0) {
+                K_split = stored.first;
+                V_split = stored.second;
+            }
+        }
+
         // Grouped Query Attention (GQA): each kv head serves a group of query heads
         if (n_kv_heads < n_heads) {
             int64_t group = n_heads / n_kv_heads;
@@ -301,55 +249,10 @@ public:
         // Scaled dot product
         float scale = 1.0f / std::sqrt(static_cast<float>(d_k));
 
-        std::shared_ptr<Tensor> attn_out;
-#ifdef USE_CUDA
-        if (x->device == Device::CUDA && !mask) {
-            DG_PROFILE_OP("attention");
-            // The tiled kernels and a mix of dtypes run in fp32
-            bool half_io = native_half(Q_split) && native_half(K_split) && native_half(V_split) &&
-                           cuda::attention_impl(S, d_k) == cuda::AttentionImpl::Gemm;
-            if (!half_io) {
-                Q_split = float32_input(Q_split);
-                K_split = float32_input(K_split);
-                V_split = float32_input(V_split);
-            }
-            DType io = Q_split->dtype;
-            auto Q_c = make_contiguous(Q_split);
-            auto K_c = make_contiguous(K_split);
-            auto V_c = make_contiguous(V_split);
-            // Q/K/V carry the weights' requires_grad even when the input x does not
-            bool qkv_grad = grad_enabled() && (Q_split->requires_grad || K_split->requires_grad || V_split->requires_grad);
-            attn_out = std::make_shared<Tensor>(Q_split->shape, Device::CUDA, io, qkv_grad);
-            auto lse = std::make_shared<Tensor>(std::vector<int64_t>{B, n_heads, S}, Device::CUDA, DType::Float32, false);
-            DType compute = autocast_dtype();
-            auto impl = cuda::attention_forward(Q_c->data_ptr<void>(), K_c->data_ptr<void>(), V_c->data_ptr<void>(),
-                                                attn_out->data_ptr<void>(), lse->data_ptr<float>(), B, n_heads, S, d_k,
-                                                causal, scale, compute, io);
-            if (qkv_grad) {
-                auto grad_fn = std::make_shared<FlashAttentionBackward>(Q_c, K_c, V_c, saved_output(attn_out), lse,
-                                                                        B, n_heads, S, d_k, causal, scale, impl, compute);
-                grad_fn->add_next_edge(get_grad_edge(Q_split).function);
-                grad_fn->add_next_edge(get_grad_edge(K_split).function);
-                grad_fn->add_next_edge(get_grad_edge(V_split).function);
-                attn_out->grad_fn = grad_fn;
-            }
-        } else {
-            auto scores = mul_scalar(matmul(Q_split, transpose(K_split, -2, -1)), scale);
-            if (mask) scores = add(scores, mask);
-            else if (causal) scores = causal_mask(scores);
-            auto weights = softmax(scores);
-            attn_out = matmul(weights, V_split); // [B, n_heads, S, d_k]
-        }
-#else
-        auto scores = mul_scalar(matmul(Q_split, transpose(K_split, -2, -1)), scale);
-        if (mask) scores = add(scores, mask);
-        else if (causal) scores = causal_mask(scores);
-        auto weights = softmax(scores);
-        attn_out = matmul(weights, V_split); // [B, n_heads, S, d_k]
-#endif
+        auto attn_out = fused_attention(Q_split, K_split, V_split, mask, causal && !mask, scale, past);  // [B, n_heads, S, d_k]
 
-        // Transpose back to [B, S, n_heads, d_k] -> Reshape to [B, S, d_model]
-        auto merged = reshape(transpose(attn_out, 1, 2), {B, S, d_model});
+        // Transpose back to [B, S, n_heads, d_k] -> Reshape to [B, S, n_heads * d_k]
+        auto merged = reshape(transpose(attn_out, 1, 2), {B, S, n_heads * d_k});
 
         // Final output projection
         auto out = W_o.forward(merged);

@@ -186,10 +186,31 @@ public:
 //    Applies continuous coordinate rotation to Query and Key representations.
 // ============================================================================
 
+// Stretching RoPE to longer contexts, as Hugging Face configs describe it
+struct RopeScaling {
+    enum class Type { None, Linear, Llama3 };
+    Type type = Type::None;
+    float factor = 1.0f;
+    float low_freq_factor = 1.0f, high_freq_factor = 4.0f;  // Llama3
+    float original_max_positions = 8192.0f;                 // Llama3
+
+    // The rotation frequency to use instead of freq
+    float apply(float freq) const {
+        if (type == Type::None) return freq;
+        if (type == Type::Linear) return freq / factor;
+        const float wavelength = 2.0f * 3.14159265358979323846f / freq;
+        const float low = original_max_positions / low_freq_factor, high = original_max_positions / high_freq_factor;
+        if (wavelength < high) return freq;
+        if (wavelength > low) return freq / factor;
+        float smooth = (original_max_positions / wavelength - low_freq_factor) / (high_freq_factor - low_freq_factor);
+        return (1.0f - smooth) * freq / factor + smooth * freq;
+    }
+};
+
 // Precomputes the cosine and sine tables for RoPE
 // Returns a pair of Tensors: {cos_freqs, sin_freqs}, each of shape [max_seq_len, dim / 2]
 inline std::pair<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>> precompute_freqs_cis(
-    int dim, int max_seq_len, float theta = 10000.0f
+    int dim, int max_seq_len, float theta = 10000.0f, const RopeScaling& scaling = {}
 ) {
     int half_dim = dim / 2;
     auto cos_t = std::make_shared<Tensor>(std::vector<int64_t>{max_seq_len, half_dim});
@@ -199,7 +220,7 @@ inline std::pair<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>> precompute_fr
     float* sin_ptr = sin_t->data_ptr<float>();
 
     for (int i = 0; i < half_dim; ++i) {
-        float freq = 1.0f / std::pow(theta, static_cast<float>(2 * i) / static_cast<float>(dim));
+        float freq = scaling.apply(1.0f / std::pow(theta, static_cast<float>(2 * i) / static_cast<float>(dim)));
         for (int m = 0; m < max_seq_len; ++m) {
             float val = static_cast<float>(m) * freq;
             cos_ptr[m * half_dim + i] = std::cos(val);
@@ -360,10 +381,10 @@ public:
     Linear w_down;
 
     // hidden_features is typically int(2.0f / 3.0f * 4.0f * in_features), rounded to multiple of 256
-    SwiGLU(int in_features, int hidden_features = 0)
-        : w_gate(in_features, hidden_features > 0 ? hidden_features : static_cast<int>(8.0f * in_features / 3.0f)),
-          w_up(in_features,   hidden_features > 0 ? hidden_features : static_cast<int>(8.0f * in_features / 3.0f)),
-          w_down(hidden_features > 0 ? hidden_features : static_cast<int>(8.0f * in_features / 3.0f), in_features) {}
+    SwiGLU(int in_features, int hidden_features = 0, bool bias = true)
+        : w_gate(in_features, hidden_features > 0 ? hidden_features : static_cast<int>(8.0f * in_features / 3.0f), 0.0f, bias),
+          w_up(in_features,   hidden_features > 0 ? hidden_features : static_cast<int>(8.0f * in_features / 3.0f), 0.0f, bias),
+          w_down(hidden_features > 0 ? hidden_features : static_cast<int>(8.0f * in_features / 3.0f), in_features, 0.0f, bias) {}
 
     std::shared_ptr<Tensor> forward(const std::shared_ptr<Tensor>& x) {
         // 1. Gate projection with SiLU activation

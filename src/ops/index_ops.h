@@ -68,8 +68,7 @@ inline kern::GatherPlan gather_plan(const std::vector<int64_t>& x_shape, const s
 
 inline TensorPtr gather(const TensorPtr& x, int dim, const TensorPtr& index);
 
-// x with src added at the positions gather(x, dim, index) reads. Deterministic. On CUDA, an index
-// longer than 64 along dim is summed on the host.
+// x with src added at the positions gather(x, dim, index) reads. Deterministic.
 inline TensorPtr scatter_add(const TensorPtr& x_in, int dim_in, const TensorPtr& index_in, const TensorPtr& src_in) {
     DG_PROFILE_OP("scatter_add");
     auto x = op_detail::dense(x_in);
@@ -85,14 +84,14 @@ inline TensorPtr scatter_add(const TensorPtr& x_in, int dim_in, const TensorPtr&
     auto plan = op_detail::gather_plan(x->shape, index->shape, dim, "scatter_add");
     op_detail::check_index(index, plan.limit, "scatter_add");
     auto out = op_detail::empty(x->shape, x->device);
-    if (x->device == Device::CUDA && plan.n > 0 && index->shape[(size_t)dim] > 64) {
-        auto h = make_contiguous(x)->to(Device::CPU)->detach();
-        kern::host::scatter_add_scan(h->data_ptr<float>(), index->to(Device::CPU)->data_ptr<float>(), src->to(Device::CPU)->data_ptr<float>(), plan);
-        out = h->to(x->device)->detach();
-    } else {
-        ops::make_contiguous(*out, *x);
-        if (plan.n > 0) DG_KERNEL(x->device, scatter_add_scan(out->data_ptr<float>(), index->data_ptr<float>(), src->data_ptr<float>(), plan));
-    }
+    ops::make_contiguous(*out, *x);
+#ifdef USE_CUDA
+    // Scanning costs x's size times the index length, sorting depends on the index alone
+    bool sorted = x->device == Device::CUDA && (index->shape.empty() || index->shape[(size_t)dim] > 64 || index->size() * 16 < x->size());
+    if (sorted) kern::gpu::scatter_add_sorted(out->data_ptr<float>(), index->data_ptr<float>(), src->data_ptr<float>(), plan);
+    else
+#endif
+    if (plan.n > 0) DG_KERNEL(x->device, scatter_add_scan(out->data_ptr<float>(), index->data_ptr<float>(), src->data_ptr<float>(), plan));
     return make_op("scatter_add", out, {x, src}, {}, [dim, index](const OpContext& c, const TensorPtr& g) -> TensorList {
         return {g, c.needs(1) ? gather(g, dim, index) : nullptr};
     });
@@ -125,25 +124,28 @@ inline TensorPtr scatter(const TensorPtr& x_in, int dim_in, const TensorPtr& ind
     if (src->shape != index->shape) throw std::invalid_argument("scatter: src and index must have the same shape");
     auto plan = op_detail::gather_plan(x->shape, index->shape, dim, "scatter");
     op_detail::check_index(index, plan.limit, "scatter");
-    // Last write wins only if writes happen in order, so this runs on the host
-    auto h = std::make_shared<Tensor>(x->shape, Device::CPU, DType::Float32, false);
-    auto xh = x->device == Device::CPU ? x : x->to(Device::CPU);
-    ops::make_contiguous(*h, *xh);
-    auto ih = index->to(Device::CPU), sh = src->to(Device::CPU);
-    const float* ip = ih->data_ptr<float>();
-    const float* sp = sh->data_ptr<float>();
-    float* op = h->data_ptr<float>();
-    std::vector<int64_t> coord(x->shape.size(), 0);
-    for (int64_t i = 0; i < plan.n; ++i) {
-        int64_t off = (int64_t)ip[i] * plan.x_stride[dim];
-        for (int d = 0; d < (int)x->ndim(); ++d) if (d != dim) off += coord[(size_t)d] * plan.x_stride[d];
-        op[off] = sp[i];
-        for (int d = (int)x->ndim() - 1; d >= 0; --d) {
-            if (++coord[(size_t)d] < index->shape[(size_t)d]) break;
-            coord[(size_t)d] = 0;
+    auto out = op_detail::empty(x->shape, x->device);
+    ops::make_contiguous(*out, *x);
+#ifdef USE_CUDA
+    if (x->device == Device::CUDA) kern::gpu::scatter_sorted(out->data_ptr<float>(), index->data_ptr<float>(), src->data_ptr<float>(), plan);
+    else
+#endif
+    {
+        // In order, one after the other: the last write wins
+        const float* ip = index->data_ptr<float>();
+        const float* sp = src->data_ptr<float>();
+        float* op = out->data_ptr<float>();
+        std::vector<int64_t> coord(x->shape.size(), 0);
+        for (int64_t i = 0; i < plan.n; ++i) {
+            int64_t off = (int64_t)ip[i] * plan.x_stride[dim];
+            for (int d = 0; d < (int)x->ndim(); ++d) if (d != dim) off += coord[(size_t)d] * plan.x_stride[d];
+            op[off] = sp[i];
+            for (int d = (int)x->ndim() - 1; d >= 0; --d) {
+                if (++coord[(size_t)d] < index->shape[(size_t)d]) break;
+                coord[(size_t)d] = 0;
+            }
         }
     }
-    auto out = x->device == Device::CPU ? h : h->to(x->device)->detach();
     return make_op("scatter", out, {x, src}, {}, [dim, index](const OpContext& c, const TensorPtr& g) -> TensorList {
         return {c.needs(0) ? scatter(g, dim, index, op_detail::filled(index->shape, g->device, 0.0f)) : nullptr,
                 c.needs(1) ? gather(g, dim, index) : nullptr};
@@ -184,19 +186,27 @@ inline TensorPtr index_add(const TensorPtr& x_in, int dim_in, const TensorPtr& i
     auto expected = x->shape;
     if (!expected.empty()) expected[(size_t)dim] = M;
     if (index->ndim() != 1 || src->shape != expected) throw std::invalid_argument("index_add: src must match x except along dim, where it has one row per index");
-    // Positions grouped by the row they add to (stable, so sums are in index order)
-    auto ids = op_detail::host_floats(index);
-    std::vector<int> starts((size_t)s.K + 1, 0), positions((size_t)M);
-    for (float f : ids) {
-        if (!(f >= 0.0f && f < (float)s.K)) throw std::out_of_range("index_add: index " + std::to_string(f) + " is out of range for size " + std::to_string(s.K));
-        starts[(size_t)f + 1]++;
-    }
-    for (size_t k = 0; k < (size_t)s.K; ++k) starts[k + 1] += starts[k];
-    auto next = starts;
-    for (int64_t m = 0; m < M; ++m) positions[(size_t)next[(size_t)ids[(size_t)m]]++] = (int)m;
     auto out = op_detail::empty(x->shape, x->device);
     ops::make_contiguous(*out, *x);
-    if (M > 0 && x->size() > 0) DG_KERNEL(x->device, index_add(out->data_ptr<float>(), src->data_ptr<float>(), positions, starts, s.outer, s.K, s.inner, M));
+#ifdef USE_CUDA
+    if (x->device == Device::CUDA) {
+        op_detail::check_index(index, s.K, "index_add");
+        kern::gpu::index_add_sorted(out->data_ptr<float>(), src->data_ptr<float>(), index->data_ptr<float>(), s.outer, s.K, s.inner, M);
+    } else
+#endif
+    {
+        // Positions grouped by the row they add to (stable, so sums are in index order)
+        auto ids = op_detail::host_floats(index);
+        std::vector<int> starts((size_t)s.K + 1, 0), positions((size_t)M);
+        for (float f : ids) {
+            if (!(f >= 0.0f && f < (float)s.K)) throw std::out_of_range("index_add: index " + std::to_string(f) + " is out of range for size " + std::to_string(s.K));
+            starts[(size_t)f + 1]++;
+        }
+        for (size_t k = 0; k < (size_t)s.K; ++k) starts[k + 1] += starts[k];
+        auto next = starts;
+        for (int64_t m = 0; m < M; ++m) positions[(size_t)next[(size_t)ids[(size_t)m]]++] = (int)m;
+        if (M > 0 && x->size() > 0) kern::host::index_add(out->data_ptr<float>(), src->data_ptr<float>(), positions, starts, s.outer, s.K, s.inner, M);
+    }
     return make_op("index_add", out, {x, src}, {}, [dim, index](const OpContext& c, const TensorPtr& g) -> TensorList {
         return {g, c.needs(1) ? index_select(g, dim, index) : nullptr};
     });
@@ -244,7 +254,7 @@ inline TensorPtr masked_select(const TensorPtr& x, const TensorPtr& mask) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Sorting and searching. The order is found on the host; values flow through gather, so gradients do too.
+// Sorting and searching. Values flow through gather, so gradients do too.
 // ---------------------------------------------------------------------------------------------
 
 namespace op_detail {
@@ -252,6 +262,16 @@ namespace op_detail {
 inline TensorPtr sorted_index(const TensorPtr& x, int dim, int64_t k, bool descending) {
     auto s = split_at(x->shape, dim);
     if (s.K > (1 << 24)) throw std::invalid_argument("sort: dimensions past 2^24 cannot be indexed by float32 indices");
+#ifdef USE_CUDA
+    if (x->device == Device::CUDA) {
+        auto d = make_contiguous(strided(x)->detach());
+        auto index_shape = x->shape;
+        if (!index_shape.empty()) index_shape[(size_t)dim] = k;
+        auto index = empty(index_shape, x->device);
+        kern::gpu::sort_index(d->data_ptr<float>(), index->data_ptr<float>(), s.outer, s.K, s.inner, k, descending);
+        return index;
+    }
+#endif
     auto v = host_floats(x);
     auto shape = x->shape;
     if (!shape.empty()) shape[(size_t)dim] = k;
