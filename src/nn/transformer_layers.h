@@ -3,6 +3,7 @@
 // query, key and value inputs. The language-model blocks (fused attention, RoPE, GQA) are in attention.h
 // and models/transformer.h.
 
+#include "fused_attention.h"
 #include "layers.h"
 #include "layernorm.h"
 
@@ -13,10 +14,10 @@ inline std::shared_ptr<Tensor> scaled_dot_product_attention(const std::shared_pt
                                                             float dropout_p = 0.0f, bool is_causal = false, bool training = true,
                                                             std::shared_ptr<Tensor>* weights_out = nullptr) {
     DG_PROFILE_OP("scaled_dot_product_attention");
-    auto scores = mul_scalar(matmul(q, transpose(k, -2, -1)), 1.0f / std::sqrt((float)q->shape.back()));
-    if (attn_mask) scores = add(scores, attn_mask);
-    if (is_causal) scores = causal_mask(scores);
-    auto p = softmax(scores);
+    float scale = 1.0f / std::sqrt((float)q->shape.back());
+    if (!weights_out && !(training && dropout_p > 0.0f)) return fused_attention(q, k, v, attn_mask, is_causal, scale);
+    auto scores = mul_scalar(matmul(q, transpose(k, -2, -1)), scale);
+    auto p = softmax(attention_detail::mask_scores(scores, attn_mask, is_causal, 0));
     if (weights_out) *weights_out = p;
     return matmul(dropout(p, dropout_p, training), v);
 }
@@ -48,8 +49,8 @@ public:
             blocked = reshape(blocked, {blocked->shape[0], 1, 1, blocked->shape[1]});
             mask = mask ? add(mask, blocked) : blocked;
         }
-        auto out = scaled_dot_product_attention(heads(W_q.forward(query)), heads(W_k.forward(context)), heads(W_v.forward(context)), mask,
-                                                dropout_p, is_causal, training_, weights_out);
+        auto out = scaled_dot_product_attention(heads(W_q.forward_autocast(query)), heads(W_k.forward_autocast(context)),
+                                                heads(W_v.forward_autocast(context)), mask, dropout_p, is_causal, training_, weights_out);
         return W_o.forward(reshape(transpose(out, 1, 2), {query->shape[0], query->shape[1], d_model}));
     }
     void visit(ModuleVisitor& v) override {

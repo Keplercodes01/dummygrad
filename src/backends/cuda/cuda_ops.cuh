@@ -174,11 +174,12 @@ namespace cuda {
     bool unscale_and_check(const std::vector<float*>& buffers, const std::vector<int64_t>& sizes, float inv_scale);
 
     // ---- cuda_attention.cu: attention (cuBLAS GEMM path or tiled kernels, deterministic backward) ----
-    // q, k, v, out, dout, dq, dk, dv are [batch * heads, seq_len, head_dim]; lse is [batch * heads, seq_len].
-    // seq_len <= attention_gemm_max_seq() runs as batched GEMMs (any head dim); longer sequences use the
-    // tiled kernels (head dims up to 128, zero-padded to 16/32/64/128), or the GEMM path a chunk of
-    // heads at a time for larger head dims. Every path is deterministic. Forward returns the
-    // implementation it used; pass it to backward.
+    // softmax(scale * q k^T + mask) v. q, out, dout and dq are [batch * heads, queries, head_dim]; k, v, dk and dv
+    // [batch * heads, keys, head_dim]; lse is [batch * heads, queries].
+    // Batched GEMMs (any lengths, head dim and mask) run everything but long unmasked self-attention, which takes the
+    // tiled kernels past attention_gemm_max_seq() (head dims up to 128, zero-padded to 16/32/64/128). Every path
+    // is deterministic. Forward returns the implementation it used; pass it to backward, which skips null outputs on
+    // the GEMM path.
     // compute (see AutocastGuard) is the precision of the GEMM path's products: Float16/BFloat16 round
     // Q, K, V, dO and the probabilities P / score gradients dS for tensor cores, while scores, softmax,
     // lse stay fp32. q, k, v, out, dout, dq, dk and dv are io elements: Float32, or on the GEMM path the
@@ -188,13 +189,21 @@ namespace cuda {
     // scores for a chunk of heads (at most 256 MB); 0 forces the tiled kernels, whose memory is linear in seq.
     void set_attention_gemm_max_seq(int seq_len);
     int attention_gemm_max_seq();
-    AttentionImpl attention_impl(int seq_len, int head_dim);  // what attention_forward will use
+    struct AttentionShape {
+        int batch = 1, heads = 1;
+        int queries = 0, keys = 0;  // sequence lengths
+        int head_dim = 0;
+        float scale = 1.0f;
+        bool causal = false;        // query i sees keys j <= i + past
+        int past = 0;
+        const float* mask = nullptr;             // added to the scores
+        int64_t mask_stride[4] = {0, 0, 0, 0};   // of batch, head, query and key; 0 where the mask repeats
+    };
+    AttentionImpl attention_impl(const AttentionShape& s);  // what attention_forward will use
     AttentionImpl attention_forward(const void* q, const void* k, const void* v, void* out, float* lse,
-                                    int batch, int heads, int seq_len, int head_dim, bool causal, float scale,
-                                    DType compute = DType::Float32, DType io = DType::Float32);
+                                    const AttentionShape& s, DType compute = DType::Float32, DType io = DType::Float32);
     void attention_backward(const void* q, const void* k, const void* v, const void* out, const void* dout,
-                            const float* lse, void* dq, void* dk, void* dv,
-                            int batch, int heads, int seq_len, int head_dim, bool causal, float scale, AttentionImpl impl,
+                            const float* lse, void* dq, void* dk, void* dv, const AttentionShape& s, AttentionImpl impl,
                             DType compute = DType::Float32, DType io = DType::Float32);
 
     // Rotary Position Embeddings (RoPE)

@@ -121,6 +121,20 @@ namespace host {
 #ifdef USE_CUDA
 namespace gpu {
 #include "kernels_decl.inc"
+
+// kernels_sort.cu
+// Order of x [outer, K, inner] along K: index[o, r, i] is the position of the r-th element, for r < k. Equal elements
+// keep their order, NaN counts as the largest.
+void sort_index(const float* x, float* index, int64_t outer, int64_t K, int64_t inner, int64_t k, bool descending);
+// index_add for indices on the GPU
+void index_add_sorted(float* out, const float* src, const float* index, int64_t outer, int64_t K, int64_t inner, int64_t M);
+// src written (the last of several wins) or added at the positions gather reads, sorted by position
+void scatter_sorted(float* out, const float* index, const float* src, const GatherPlan& g);
+void scatter_add_sorted(float* out, const float* index, const float* src, const GatherPlan& g);
+#ifdef DUMMYGRAD_CUFFT
+// Unnormalized transforms of complex rows [rows, n, 2] (kernels_fft.cu)
+void fft(const float* x, float* out, int64_t rows, int64_t n, bool inverse);
+#endif
 }
 #endif
 

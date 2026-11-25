@@ -98,11 +98,3 @@ private:
         return out;
     }
 };
-
-// Scores of S new queries against past + S keys: a query sees every past token and the new ones up to itself
-inline std::shared_ptr<Tensor> cached_causal_mask(int64_t S, int64_t past, Device device) {
-    std::vector<float> m((size_t)(S * (past + S)), 0.0f);
-    for (int64_t i = 0; i < S; ++i)
-        for (int64_t j = past + i + 1; j < past + S; ++j) m[(size_t)(i * (past + S) + j)] = -1e9f;
-    return op_detail::from_values(m, {S, past + S}, device);
-}

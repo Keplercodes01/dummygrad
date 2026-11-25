@@ -62,7 +62,8 @@ if(ENABLE_CUDA)
         # pow of a negative base, infinities and subnormals must come out as on the CPU.
         set_source_files_properties(src/backends/cuda/cuda_ops.cu src/backends/cuda/cuda_core_ops.cu
                                     src/backends/cuda/cuda_attention.cu PROPERTIES COMPILE_OPTIONS "--use_fast_math")
-        list(APPEND DUMMYGRAD_SOURCES src/backends/cuda/cuda_ops.cu src/backends/cuda/cuda_core_ops.cu src/backends/cuda/cuda_attention.cu src/kernels/kernels_cuda.cu)
+        list(APPEND DUMMYGRAD_SOURCES src/backends/cuda/cuda_ops.cu src/backends/cuda/cuda_core_ops.cu src/backends/cuda/cuda_attention.cu
+             src/kernels/kernels_cuda.cu src/kernels/kernels_sort.cu src/kernels/kernels_fft.cu)
         message(STATUS "CUDA found: ${CMAKE_CUDA_COMPILER} (archs: ${CMAKE_CUDA_ARCHITECTURES}). Building with GPU support.")
     else()
         message(STATUS "CUDA compiler not found. Building CPU-only.")
@@ -115,6 +116,12 @@ if(ENABLE_CUDA AND CMAKE_CUDA_COMPILER)
     endif()
     target_link_libraries(dummygrad_engine PUBLIC CUDA::cudart CUDA::cublas CUDA::cublasLt)
     target_compile_definitions(dummygrad_engine PUBLIC USE_CUDA=1)
+    # Without cuFFT, Fourier transforms of GPU tensors run on the CPU
+    if(TARGET CUDA::cufft)
+        set_target_properties(CUDA::cufft PROPERTIES IMPORTED_GLOBAL TRUE)
+        target_link_libraries(dummygrad_engine PUBLIC CUDA::cufft)
+        target_compile_definitions(dummygrad_engine PUBLIC DUMMYGRAD_CUFFT=1)
+    endif()
 endif()
 
 # Configure Apple Silicon Metal and MetalPerformanceShaders on macOS

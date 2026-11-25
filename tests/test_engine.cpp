@@ -2098,11 +2098,18 @@ static std::string amp_attention_parity(DType compute) {
         auto dq = std::make_shared<Tensor>(shape, Device::CUDA, DType::Float32, false);
         auto dk = std::make_shared<Tensor>(shape, Device::CUDA, DType::Float32, false);
         auto dv = std::make_shared<Tensor>(shape, Device::CUDA, DType::Float32, false);
+        cuda::AttentionShape s;
+        s.batch = B;
+        s.heads = H;
+        s.queries = s.keys = S;
+        s.head_dim = D;
+        s.causal = causal;
+        s.scale = scale;
         auto impl = cuda::attention_forward(q->data_ptr<float>(), k->data_ptr<float>(), v->data_ptr<float>(),
-                                            out->data_ptr<float>(), lse->data_ptr<float>(), B, H, S, D, causal, scale, dt);
+                                            out->data_ptr<float>(), lse->data_ptr<float>(), s, dt);
         cuda::attention_backward(q->data_ptr<float>(), k->data_ptr<float>(), v->data_ptr<float>(), out->data_ptr<float>(),
                                  dout->data_ptr<float>(), lse->data_ptr<float>(), dq->data_ptr<float>(),
-                                 dk->data_ptr<float>(), dv->data_ptr<float>(), B, H, S, D, causal, scale, impl, dt);
+                                 dk->data_ptr<float>(), dv->data_ptr<float>(), s, impl, dt);
         return Result{download(out), download(lse), download(dq), download(dk), download(dv)};
     };
     auto compare = [](const std::vector<float>& ref, const std::vector<float>& got, const std::string& what) -> std::string {
