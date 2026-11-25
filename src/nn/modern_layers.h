@@ -3,6 +3,7 @@
 #include "functional.h"
 #include "module.h"
 #include "linear.h"
+#include "layernorm.h"
 #include "ops.h"
 #include <cmath>
 #include <vector>
@@ -20,45 +21,57 @@
 namespace rmsnorm_detail {
 
 inline void forward_host(const float* x, const float* gamma, float* out, float* inv_rms, int64_t rows, int64_t cols, float eps) {
-    for (int64_t row = 0; row < rows; ++row) {
-        const float* xr = x + row * cols;
-        float sum_sq = 0.0f;
-        for (int64_t j = 0; j < cols; ++j) sum_sq += xr[j] * xr[j];
-        float irms = 1.0f / std::sqrt(sum_sq / (float)cols + eps);
-        inv_rms[row] = irms;
-        for (int64_t j = 0; j < cols; ++j) out[row * cols + j] = xr[j] * irms * gamma[j];
-    }
+    parallel_for(0, rows, row_grain(cols), [=](int64_t begin, int64_t end) {
+        for (int64_t row = begin; row < end; ++row) {
+            const float* xr = x + row * cols;
+            float* o = out + row * cols;
+            float irms = 1.0f / std::sqrt(lane_sum(cols, [=](int64_t j) { return xr[j] * xr[j]; }) / (float)cols + eps);
+            inv_rms[row] = irms;
+            for (int64_t j = 0; j < cols; ++j) o[j] = xr[j] * irms * gamma[j];
+        }
+    });
 }
 
 // dx = irms * (u - x * irms^2 * mean(u * x)) with u = grad * gamma;  dgamma = sum_rows(grad * x * irms)
 inline void backward_host(const float* grad, const float* x, const float* gamma, const float* inv_rms,
                           float* gx, float* ggamma, int64_t rows, int64_t cols) {
-    if (ggamma) std::fill(ggamma, ggamma + cols, 0.0f);
-    for (int64_t row = 0; row < rows; ++row) {
-        const float* xr = x + row * cols;
-        const float* gr = grad + row * cols;
-        float irms = inv_rms[row];
-        if (ggamma) {
-            for (int64_t j = 0; j < cols; ++j) ggamma[j] += gr[j] * xr[j] * irms;
-        }
-        if (gx) {
-            float dot = 0.0f;
-            for (int64_t j = 0; j < cols; ++j) dot += gr[j] * gamma[j] * xr[j];
-            float factor = irms * irms * dot / (float)cols;
-            for (int64_t j = 0; j < cols; ++j) gx[row * cols + j] = irms * (gr[j] * gamma[j] - xr[j] * factor);
-        }
+    if (gx) {
+        parallel_for(0, rows, row_grain(cols), [=](int64_t begin, int64_t end) {
+            for (int64_t row = begin; row < end; ++row) {
+                const float* xr = x + row * cols;
+                const float* gr = grad + row * cols;
+                float* o = gx + row * cols;
+                float irms = inv_rms[row];
+                float dot = lane_sum(cols, [=](int64_t j) { return gr[j] * gamma[j] * xr[j]; });
+                float factor = irms * irms * dot / (float)cols;
+                for (int64_t j = 0; j < cols; ++j) o[j] = irms * (gr[j] * gamma[j] - xr[j] * factor);
+            }
+        });
     }
+    if (!ggamma) return;
+    // Columns split over threads, rows in order: the sums do not depend on the thread count
+    parallel_for(0, cols, std::max<int64_t>(16, 32768 / std::max<int64_t>(1, rows)), [=](int64_t b, int64_t e) {
+        std::fill(ggamma + b, ggamma + e, 0.0f);
+        for (int64_t row = 0; row < rows; ++row) {
+            const float* xr = x + row * cols;
+            const float* gr = grad + row * cols;
+            float irms = inv_rms[row];
+            for (int64_t j = b; j < e; ++j) ggamma[j] += gr[j] * xr[j] * irms;
+        }
+    });
 }
 
 }  // namespace rmsnorm_detail
 
 struct RMSNormBackward : public Node {
+    inline std::vector<std::shared_ptr<Tensor>> apply_graph(const std::vector<std::shared_ptr<Tensor>>& grads) override;
     std::shared_ptr<Tensor> x, gamma, inv_rms;
     int64_t rows, cols;
+    float eps;
 
     RMSNormBackward(std::shared_ptr<Tensor> x, std::shared_ptr<Tensor> gamma, std::shared_ptr<Tensor> inv_rms,
-                    int64_t rows, int64_t cols)
-        : x(std::move(x)), gamma(std::move(gamma)), inv_rms(std::move(inv_rms)), rows(rows), cols(cols) {}
+                    int64_t rows, int64_t cols, float eps)
+        : x(std::move(x)), gamma(std::move(gamma)), inv_rms(std::move(inv_rms)), rows(rows), cols(cols), eps(eps) {}
 
     void release_variables() override {
         x.reset();
@@ -95,6 +108,16 @@ struct RMSNormBackward : public Node {
         return {gx, gg};
     }
 };
+
+inline TensorList RMSNormBackward::apply_graph(const TensorList& g) {
+    auto xv = reshape(graph_input(*this, 0, x), {rows, cols});
+    auto gm = graph_input(*this, 1, gamma);
+    auto u = reshape(g[0], {rows, cols});
+    auto irms = rsqrt(add_scalar(mean(square(xv), -1, true), eps));
+    auto ug = mul(u, gm);
+    auto dx = mul(irms, sub(ug, mul(xv, mul(square(irms), mean(mul(ug, xv), -1, true)))));
+    return {reshape(dx, x->shape), reshape(sum(mul(u, mul(xv, irms)), 0, false), gamma->shape)};
+}
 
 // RMSNorm over the last dimension: x / sqrt(mean(x^2) + eps) * gamma
 class RMSNorm : public Module {
@@ -146,7 +169,7 @@ public:
         bool req_grad = needs_grad(x) || needs_grad(gamma);
         out->requires_grad = req_grad;
         if (req_grad) {
-            auto grad_fn = std::make_shared<RMSNormBackward>(x, gamma, inv_rms, rows, cols);
+            auto grad_fn = std::make_shared<RMSNormBackward>(x, gamma, inv_rms, rows, cols, eps);
             grad_fn->add_next_edge(get_grad_edge(x).function);
             grad_fn->add_next_edge(get_grad_edge(gamma).function);
             out->grad_fn = grad_fn;
@@ -192,30 +215,30 @@ namespace rope_detail {
 // rotates by the negative angle (the backward pass: R(-theta) = R(theta)^T)
 inline void rotate_host(const float* in, const float* cos_t, const float* sin_t, float* out, int batch_size, int seq_len,
                         int n_heads, int head_dim, int start_pos, bool inverse) {
-    int half_dim = head_dim / 2;
-    float sign = inverse ? -1.0f : 1.0f;
-    for (int b = 0; b < batch_size; ++b) {
-        for (int s = 0; s < seq_len; ++s) {
-            int64_t freq_offset = (int64_t)(start_pos + s) * half_dim;
-            for (int h = 0; h < n_heads; ++h) {
-                int64_t base = ((int64_t)(b * seq_len + s) * n_heads + h) * head_dim;
-                for (int j = 0; j < half_dim; ++j) {
-                    float c = cos_t[freq_offset + j];
-                    float sn = sign * sin_t[freq_offset + j];
-                    float x0 = in[base + 2 * j];
-                    float x1 = in[base + 2 * j + 1];
-                    out[base + 2 * j] = x0 * c - x1 * sn;
-                    out[base + 2 * j + 1] = x0 * sn + x1 * c;
+    const int64_t half_dim = head_dim / 2, heads = n_heads, seq = seq_len, start = start_pos;
+    const float sign = inverse ? -1.0f : 1.0f;
+    parallel_for(0, (int64_t)batch_size * seq, std::max<int64_t>(1, 16384 / std::max<int64_t>(1, heads * head_dim)), [=](int64_t begin, int64_t end) {
+        for (int64_t row = begin; row < end; ++row) {
+            const float* c = cos_t + (start + row % seq) * half_dim;
+            const float* s = sin_t + (start + row % seq) * half_dim;
+            for (int64_t h = 0; h < heads; ++h) {
+                const float* x = in + (row * heads + h) * 2 * half_dim;
+                float* o = out + (row * heads + h) * 2 * half_dim;
+                for (int64_t j = 0; j < half_dim; ++j) {
+                    float x0 = x[2 * j], x1 = x[2 * j + 1], sn = sign * s[j];
+                    o[2 * j] = x0 * c[j] - x1 * sn;
+                    o[2 * j + 1] = x0 * sn + x1 * c[j];
                 }
             }
         }
-    }
+    });
 }
 
 }  // namespace rope_detail
 
 // Autograd Node for Rotary Position Embedding. Needs only the tables and the input's shape.
 struct RoPEBackward : public Node {
+    inline std::vector<std::shared_ptr<Tensor>> apply_graph(const std::vector<std::shared_ptr<Tensor>>& grads) override;
     std::vector<int64_t> x_shape;
     std::shared_ptr<Tensor> cos_freqs, sin_freqs;
     int start_pos;
@@ -319,6 +342,11 @@ inline std::shared_ptr<Tensor> apply_rotary_emb(
     return out;
 }
 
+// The gradient rotates back: the same rotation with the sign of the sines flipped
+inline TensorList RoPEBackward::apply_graph(const TensorList& g) {
+    return {reshape(apply_rotary_emb(g[0], cos_freqs, neg(sin_freqs), start_pos), x_shape)};
+}
+
 // ============================================================================
 // 3. SwiGLU (Swish Gated Linear Unit)
 //    Standard Feed-Forward Network in modern LLMs (LLaMA 3, PaLM, Mistral).
@@ -393,7 +421,11 @@ inline float clip_grad_norm_(const std::vector<std::shared_ptr<Tensor>>& paramet
 #endif
         auto h = (g->device == Device::CPU) ? g : g->cpu();
         const float* d = h->data_ptr<float>();
-        for (int64_t i = 0; i < h->size(); ++i) total_sq += (double)d[i] * (double)d[i];
+        total_sq += parallel_sum(h->size(), [=](int64_t b, int64_t e) {
+            double acc = 0.0;
+            for (int64_t i = b; i < e; ++i) acc += (double)d[i] * (double)d[i];
+            return acc;
+        });
     }
 #ifdef USE_CUDA
     total_sq += cuda::sum_of_squares(device_grads, device_sizes);
@@ -409,7 +441,7 @@ inline float clip_grad_norm_(const std::vector<std::shared_ptr<Tensor>>& paramet
             if (g->device == Device::CUDA) continue;
             if (g->device == Device::CPU || g->device == Device::MPS) {
                 float* d = g->data_ptr<float>();
-                for (int64_t i = 0; i < g->size(); ++i) d[i] *= scale;
+                host_loop(g->size(), [=](int64_t i) { d[i] *= scale; });
             } else {
                 NoGradGuard no_grad;
                 ops::make_contiguous(*g, *mul_scalar(g, scale));

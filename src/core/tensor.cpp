@@ -243,9 +243,68 @@ void Tensor::backward(bool retain_graph) {
         this->grad->fill_(1.0f);
     }
     if (this->grad_fn) {
-        AutogradEngine::get().execute(this->grad_fn, this->shape, this->device, this->dtype, retain_graph);
+        auto seed = std::make_shared<Tensor>(this->shape, this->device, this->dtype, false);
+        seed->fill_(1.0f);
+        AutogradEngine::Options options;
+        options.retain_graph = retain_graph;
+        AutogradEngine::get().execute({{this->grad_fn, std::move(seed)}}, options);
         if (!retain_graph) this->grad_fn = nullptr;
     }
+}
+
+void Tensor::backward(const std::shared_ptr<Tensor>& gradient, bool retain_graph, bool create_graph) {
+    autograd::backward({shared_from_this()}, {gradient}, retain_graph, create_graph);
+    if (!retain_graph && !create_graph) this->grad_fn = nullptr;
+}
+
+std::shared_ptr<Tensor> Tensor::detach() const {
+    return std::make_shared<Tensor>(storage, shape, strides, global_offset, device, dtype, false);
+}
+
+std::shared_ptr<Tensor> Tensor::clone() {
+    auto self = shared_from_this();
+    auto out = std::make_shared<Tensor>(shape, device, dtype, false);
+    ops::make_contiguous(*out, *this);
+    out->requires_grad = needs_grad(self);
+    if (out->requires_grad) {
+        auto grad_fn = std::make_shared<ContiguousBackward>();
+        grad_fn->add_next_edge(get_grad_edge(self).function);
+        out->grad_fn = grad_fn;
+    }
+    return out;
+}
+
+std::vector<float> Tensor::to_vector() const {
+    auto self = std::const_pointer_cast<Tensor>(shared_from_this());
+    auto host = make_contiguous(self)->to(Device::CPU, DType::Float32);
+    const float* p = host->data_ptr<float>();
+    return std::vector<float>(p, p + host->size());
+}
+
+float Tensor::item() const {
+    if (size() != 1) throw std::runtime_error("item: tensor has " + std::to_string(size()) + " elements, not 1");
+    return to_vector()[0];
+}
+
+std::shared_ptr<Tensor> Tensor::requires_grad_(bool value) {
+    if (!value && grad_fn) throw std::runtime_error("requires_grad_(false): only leaf tensors can be frozen; use detach()");
+    requires_grad = value;
+    return shared_from_this();
+}
+
+void Tensor::register_hook(std::function<std::shared_ptr<Tensor>(const std::shared_ptr<Tensor>&)> hook) {
+    if (!requires_grad) throw std::runtime_error("register_hook: tensor does not require grad");
+    GradModeGuard enable(true);
+    get_grad_edge(shared_from_this()).function->pre_hooks.push_back(std::move(hook));
+}
+
+void Tensor::retain_grad() {
+    if (!grad_fn) return;  // leaves keep their gradient anyway
+    std::weak_ptr<Tensor> self = shared_from_this();
+    register_hook([self](const std::shared_ptr<Tensor>& g) -> std::shared_ptr<Tensor> {
+        if (auto t = self.lock()) t->grad = g;
+        return nullptr;
+    });
 }
 
 std::shared_ptr<Tensor> Tensor::to(Device target_device, int device_id) {

@@ -3,7 +3,8 @@ project(dummygrad VERSION 0.8.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native")
+# -fno-math-errno and -fno-trapping-math change no results: they let sqrt and floor vectorize
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -fno-math-errno -fno-trapping-math")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Tests and examples are built by default only when dummygrad is the top-level project,
@@ -15,6 +16,7 @@ else()
 endif()
 
 option(ENABLE_CUDA "Enable NVIDIA CUDA GPU acceleration" ON)
+option(DUMMYGRAD_USE_BLAS "Use a BLAS library for CPU matrix products when one is found" ON)
 option(DUMMYGRAD_BUILD_TESTS "Build the gradient-check test suite (test_engine)" ${DUMMYGRAD_IS_TOP_LEVEL})
 option(DUMMYGRAD_BUILD_EXAMPLES "Build the examples (quickstart, custom_op, train_lm, train_colab)" ${DUMMYGRAD_IS_TOP_LEVEL})
 option(DUMMYGRAD_BUILD_BENCHMARKS "Build the training-step benchmark (dg_bench)" ${DUMMYGRAD_IS_TOP_LEVEL})
@@ -28,8 +30,11 @@ set(DUMMYGRAD_SOURCES
     src/core/tensor.cpp
     src/core/allocator.cpp
     src/core/profiler.cpp
+    src/core/parallel.cpp
     src/ops/ops.cpp
+    src/kernels/kernels_host.cpp
     src/backends/cpu/cpu_ops.cpp
+    src/backends/cpu/cpu_gemm.cpp
     src/backends/tpu/pjrt_client.cpp
 )
 
@@ -50,7 +55,7 @@ if(ENABLE_CUDA)
         enable_language(CUDA)
         set(CMAKE_CUDA_STANDARD 17)
         set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --use_fast_math")
-        list(APPEND DUMMYGRAD_SOURCES src/backends/cuda/cuda_ops.cu src/backends/cuda/cuda_core_ops.cu src/backends/cuda/cuda_attention.cu)
+        list(APPEND DUMMYGRAD_SOURCES src/backends/cuda/cuda_ops.cu src/backends/cuda/cuda_core_ops.cu src/backends/cuda/cuda_attention.cu src/kernels/kernels_cuda.cu)
         message(STATUS "CUDA found: ${CMAKE_CUDA_COMPILER} (archs: ${CMAKE_CUDA_ARCHITECTURES}). Building with GPU support.")
     else()
         message(STATUS "CUDA compiler not found. Building CPU-only.")
@@ -85,8 +90,10 @@ endif()
 target_link_libraries(dummygrad_engine PUBLIC Threads::Threads)
 
 # Optional BLAS (OpenBLAS / oneMKL / MKL / Netlib) for fast CPU linear algebra
-find_package(BLAS QUIET)
-if(BLAS_FOUND)
+if(DUMMYGRAD_USE_BLAS)
+    find_package(BLAS QUIET)
+endif()
+if(DUMMYGRAD_USE_BLAS AND BLAS_FOUND)
     message(STATUS "BLAS found: ${BLAS_LIBRARIES}")
     target_link_libraries(dummygrad_engine PRIVATE ${BLAS_LIBRARIES})
     target_compile_definitions(dummygrad_engine PUBLIC USE_BLAS=1)

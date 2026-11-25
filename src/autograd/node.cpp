@@ -42,3 +42,11 @@ std::vector<std::shared_ptr<Tensor>> AccumulateGrad::apply(const std::vector<std
     }
     return {};
 }
+
+// The gradient keeps its graph: p->grad can itself be differentiated
+std::vector<std::shared_ptr<Tensor>> AccumulateGrad::apply_graph(const std::vector<std::shared_ptr<Tensor>>& grads) {
+    if (auto var = variable.lock()) {
+        if (!grads.empty() && grads[0]) var->grad = var->grad ? add(var->grad, grads[0]) : grads[0];
+    }
+    return {};
+}

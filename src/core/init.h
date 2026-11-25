@@ -7,6 +7,8 @@ inline thread_local std::mt19937 g_gen(std::random_device{}());
 
 inline void manual_seed(unsigned int seed) {
     g_gen.seed(seed);
+    random_state().seed = seed;
+    random_state().stream = 0;
 }
 
 // random init

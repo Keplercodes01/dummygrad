@@ -39,6 +39,25 @@ jobs:
       - name: Benchmark smoke run
         run: ./build/dg_bench tiny && ./build/dg_bench small --seconds 5
 
+  # The built-in matrix multiply, used when no BLAS is found
+  no-blas:
+    name: ubuntu-latest (CPU, no BLAS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=OFF -DDUMMYGRAD_USE_BLAS=OFF
+
+      - name: Build
+        run: cmake --build build -j 4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Benchmark smoke run
+        run: ./build/dg_bench tiny && ./build/dg_bench small --seconds 5
+
   # No GPU on hosted runners: compile the CUDA backend and everything that includes it, so kernel
   # and header errors surface here instead of on a GPU machine. Running it happens on Colab.
   cuda-build:

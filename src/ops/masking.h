@@ -31,6 +31,7 @@ namespace masking {
 // 1. Sliding Window Attention Mask Backward Autograd Node
 // ----------------------------------------------------------------------------
 struct SlidingWindowMaskBackward : public Node {
+    inline std::vector<std::shared_ptr<Tensor>> apply_graph(const std::vector<std::shared_ptr<Tensor>>& grads) override;
     int r, c, batch_size, window_size;
 
     SlidingWindowMaskBackward(int r, int c, int batch_size, int window_size)
@@ -138,6 +139,7 @@ inline std::shared_ptr<Tensor> sliding_window_mask(const std::shared_ptr<Tensor>
 // 2. Prefix-LM / Causal-with-Prefix Mask Backward Autograd Node
 // ----------------------------------------------------------------------------
 struct PrefixCausalMaskBackward : public Node {
+    inline std::vector<std::shared_ptr<Tensor>> apply_graph(const std::vector<std::shared_ptr<Tensor>>& grads) override;
     int r, c, batch_size, prefix_len;
 
     PrefixCausalMaskBackward(int r, int c, int batch_size, int prefix_len)
@@ -350,6 +352,14 @@ inline std::shared_ptr<Tensor> document_causal_mask(const std::shared_ptr<Tensor
         return mask->to(doc_ids->device);
     }
     return mask;
+}
+
+// The gradient passes where the mask kept a score (masking zeros leaves 0 there, -1e9 elsewhere)
+inline TensorList SlidingWindowMaskBackward::apply_graph(const TensorList& g) {
+    return {mul(g[0], eq(sliding_window_mask(zeros_like(g[0]), window_size), 0.0f))};
+}
+inline TensorList PrefixCausalMaskBackward::apply_graph(const TensorList& g) {
+    return {mul(g[0], eq(prefix_causal_mask(zeros_like(g[0]), prefix_len), 0.0f))};
 }
 
 } // namespace masking

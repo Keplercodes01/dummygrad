@@ -7,6 +7,7 @@
 #include <vector>
 #include <memory>
 #include <iostream>
+#include <functional>
 
 #include <type_traits>
 
@@ -109,7 +110,27 @@ public:
     void show() const;
     void show_grad() const;
 
+    // From a one-element tensor: accumulates d(this)/d(leaf) into every leaf's grad. See also
+    // autograd::grad (returns gradients) and autograd::backward (several outputs).
     void backward(bool retain_graph = false);
+    // From any shape, with gradient (this tensor's shape) weighting its elements
+    void backward(const std::shared_ptr<Tensor>& gradient, bool retain_graph = false, bool create_graph = false);
+
+    // The same memory without the history: gradients stop here
+    std::shared_ptr<Tensor> detach() const;
+    // A copy with its own memory, connected to the graph
+    std::shared_ptr<Tensor> clone();
+    // The value of a one-element tensor, from any device and float dtype
+    float item() const;
+    std::vector<float> to_vector() const;
+    bool is_leaf() const { return !grad_fn; }
+    std::shared_ptr<Tensor> requires_grad_(bool value = true);
+
+    // Calls hook with the gradient of this tensor whenever backward computes it. A returned tensor
+    // replaces the gradient; null leaves it. For a parameter, the hook sees each backward pass's total.
+    void register_hook(std::function<std::shared_ptr<Tensor>(const std::shared_ptr<Tensor>&)> hook);
+    // Keeps the gradient of a non-leaf tensor in grad
+    void retain_grad();
 };
 
 // Host<->accelerator copies made through Tensor::to, counted process-wide. Every copy inside a

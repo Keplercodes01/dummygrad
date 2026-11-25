@@ -18,3 +18,17 @@ struct NoGradGuard {
     NoGradGuard(const NoGradGuard&) = delete;
     NoGradGuard& operator=(const NoGradGuard&) = delete;
 };
+
+// RAII: sets the grad mode either way and restores it
+struct GradModeGuard {
+    bool previous;
+    explicit GradModeGuard(bool enabled) : previous(g_grad_enabled) { g_grad_enabled = enabled; }
+    ~GradModeGuard() { g_grad_enabled = previous; }
+    GradModeGuard(const GradModeGuard&) = delete;
+    GradModeGuard& operator=(const GradModeGuard&) = delete;
+};
+
+// RAII: records graphs again inside a NoGradGuard
+struct EnableGradGuard : GradModeGuard {
+    EnableGradGuard() : GradModeGuard(true) {}
+};
