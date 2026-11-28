@@ -4,10 +4,14 @@ All notable changes to dummygrad are documented here. Versions follow [Semantic 
 
 ## [Unreleased]
 
+### Added
+- **Sanitizers in CI.** The three CPU suites run under AddressSanitizer with LeakSanitizer and UndefinedBehaviorSanitizer, and under ThreadSanitizer with 4 threads (clang, no BLAS, so that every kernel is instrumented). On the first run they found one bug (below): no memory errors, no leaks, no data races.
+
 ### Fixed
 - **Sampling:** `min_p` above 1 removed every candidate and then read an empty list (undefined behaviour). `sample_logits` now requires `min_p` and `top_p` in [0, 1], `top_k >= 0` and options that are not NaN, and throws on NaN or +inf logits instead of returning the last token (greedy decoding skipped NaN). `-inf` logits (masked tokens) are allowed and never drawn. `beam_search` throws on NaN logits, which used to reach `std::sort` with an invalid comparison.
 - **LoRA under autocast:** an adapted layer returned fp32, so attention after adapted `W_q`/`W_v` ran Q, K and V in fp32. Its output is now rounded to the autocast dtype like an unadapted layer's. The adapter is scaled at rank width, not output width. `merge_lora` on a half-precision weight (after `model.to(device, Float16)`) threw on the dtype; the merge is now formed in fp32 and rounded once.
 - **Tokenizer:** a `post_processor` naming a token missing from the vocabulary put id -1 at the start of every encoding; it now throws when the file is read, and reads the template's `special_tokens` ids when given. Finding special tokens searched the rest of the text again after every match (quadratic in the number of matches); each token's search now moves forward once. Repeated words are merged once per `encode` call (a bounded word cache).
+- The vectorized CPU `exp` converted NaN to an integer (undefined behaviour; on x86 the result happened to be NaN anyway). Found by UBSan.
 - **Positions as floats:** `nonzero`, `masked_select`, `unique`, `searchsorted`, `bincount`, `randperm` and `multinomial` throw past 2^24, where float32 positions and counts round, instead of returning rounded positions. `unique` treats NaN as one value, the largest (its sort used an invalid comparison); `bincount` rejects NaN and values past 2^24 (the cast was undefined).
 
 ## [0.9.0] - 2026-11-25

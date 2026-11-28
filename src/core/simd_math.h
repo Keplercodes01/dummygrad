@@ -37,8 +37,9 @@ DG_FORCE_INLINE float exp(float x) {
     y = y * r + 1.6666665459e-1f;
     y = y * r + 5.0000001201e-1f;
     y = y * (r * r) + r + 1.0f;
-    // 2^n as two factors, so n = 128 and subnormal results come out right
-    int32_t ni = (int32_t)n;
+    // 2^n as two factors, so n = 128 and subnormal results come out right. Converting NaN to an
+    // integer is undefined, so NaN converts as 0; y is NaN then, and so is the result.
+    int32_t ni = (int32_t)(n != n ? 0.0f : n);
     int32_t n1 = ni >> 1, n2 = ni - n1;
     return y * from_bits((uint32_t)(n1 + 127) << 23) * from_bits((uint32_t)(n2 + 127) << 23);
 }
