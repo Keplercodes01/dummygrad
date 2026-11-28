@@ -655,6 +655,20 @@ static std::string values_indexing() {
     CHECK(near(quantile(tensor({1, 2, 3, 4}, {4}), 0.5f, 0), {2.5f}));
     CHECK(expect_throw([] { gather(zeros({3}), 0, tensor({3}, {1})); }, "an out-of-range index"));
     CHECK(expect_throw([] { index_select(zeros({3}), 0, tensor({-1}, {1})); }, "a negative index"));
+    // NaN is one value, the largest (sorting it used an invalid comparison)
+    auto un = unique(tensor({NAN, 2, NAN, 1}, {4}));
+    if (un.values->size() != 3 || !std::isnan(un.values->to_vector()[2])) return "unique with NaN";
+    CHECK(near(un.inverse, {2, 1, 2, 0}));
+    CHECK(near(un.counts, {1, 1, 2}));
+    CHECK(expect_throw([] { bincount(tensor({1, NAN}, {2})); }, "bincount of NaN"));
+    CHECK(expect_throw([] { bincount(tensor({1e30f}, {1})); }, "bincount of a value too large to be an id"));
+    // Past 2^24, float32 positions would round: an error, not a wrong answer. An expanded view costs no memory.
+    const int64_t past = (int64_t(1) << 24) + 1;
+    auto big = expand(zeros({1}), {past});
+    CHECK(expect_throw([&] { nonzero(big); }, "nonzero past 2^24"));
+    CHECK(expect_throw([&] { masked_select(big, big); }, "masked_select past 2^24"));
+    CHECK(expect_throw([&] { unique(big); }, "unique past 2^24"));
+    CHECK(expect_throw([&] { randperm(past); }, "randperm past 2^24"));
     return "";
 }
 static std::string values_more() {

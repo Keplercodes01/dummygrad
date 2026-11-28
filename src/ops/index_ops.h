@@ -14,6 +14,13 @@ inline void set_index_checks(bool enabled) { g_index_checks = enabled; }
 
 namespace op_detail {
 
+// Positions and counts held in float32 are exact up to 2^24; past it they would round silently
+inline void check_float_count(int64_t n, const char* who) {
+    if (n > (int64_t(1) << 24)) {
+        throw std::invalid_argument(std::string(who) + ": " + std::to_string(n) + " is past 2^24, where float32 positions and counts are no longer exact");
+    }
+}
+
 inline void check_index(const TensorPtr& index, int64_t limit, const char* who) {
     if (limit > (1 << 24)) throw std::invalid_argument(std::string(who) + ": dimensions past 2^24 cannot be indexed by float32 indices");
     if (!g_index_checks || index->size() == 0) return;
@@ -234,6 +241,7 @@ inline TensorPtr take(const TensorPtr& x, const TensorPtr& index) {
 }
 // Positions of nonzero elements as rows of coordinates: [count, ndim]
 inline TensorPtr nonzero(const TensorPtr& x) {
+    for (int64_t d : x->shape) op_detail::check_float_count(d, "nonzero");
     auto v = op_detail::host_floats(x);
     std::vector<float> coords;
     int64_t count = 0;
@@ -247,6 +255,7 @@ inline TensorPtr nonzero(const TensorPtr& x) {
 // The elements where mask (x's shape) is nonzero, as a vector
 inline TensorPtr masked_select(const TensorPtr& x, const TensorPtr& mask) {
     if (mask->shape != x->shape) throw std::invalid_argument("masked_select: mask and tensor must have the same shape");
+    op_detail::check_float_count(x->size(), "masked_select");
     auto m = op_detail::host_floats(mask);
     std::vector<float> at;
     for (size_t i = 0; i < m.size(); ++i) if (m[i] != 0.0f) at.push_back((float)i);
@@ -382,14 +391,18 @@ struct UniqueResult {
     TensorPtr inverse;  // for every element, its position in values
     TensorPtr counts;
 };
+// NaN is one value, the largest
 inline UniqueResult unique(const TensorPtr& x) {
+    op_detail::check_float_count(x->size(), "unique");
     auto v = op_detail::host_floats(x);
     auto values = v;
-    std::sort(values.begin(), values.end());
-    values.erase(std::unique(values.begin(), values.end()), values.end());
+    auto less = [](float a, float b) { return std::isnan(a) ? false : std::isnan(b) ? true : a < b; };
+    auto same = [](float a, float b) { return a == b || (std::isnan(a) && std::isnan(b)); };
+    std::sort(values.begin(), values.end(), less);
+    values.erase(std::unique(values.begin(), values.end(), same), values.end());
     std::vector<float> inverse(v.size()), counts(values.size(), 0.0f);
     for (size_t i = 0; i < v.size(); ++i) {
-        size_t at = (size_t)(std::lower_bound(values.begin(), values.end(), v[i]) - values.begin());
+        size_t at = (size_t)(std::lower_bound(values.begin(), values.end(), v[i], less) - values.begin());
         inverse[i] = (float)at;
         counts[at] += 1.0f;
     }
@@ -399,6 +412,7 @@ inline UniqueResult unique(const TensorPtr& x) {
 // Where each value would go in a sorted 1-D sequence: before equal entries, or after them with right
 inline TensorPtr searchsorted(const TensorPtr& sorted, const TensorPtr& values, bool right = false) {
     if (sorted->ndim() != 1) throw std::invalid_argument("searchsorted: the sorted sequence must be 1-D");
+    op_detail::check_float_count(sorted->size(), "searchsorted");
     auto s = op_detail::host_floats(sorted), v = op_detail::host_floats(values);
     std::vector<float> at(v.size());
     for (size_t i = 0; i < v.size(); ++i) {
@@ -414,9 +428,11 @@ inline TensorPtr bincount(const TensorPtr& x, const TensorPtr& weights = nullptr
     std::vector<float> w;
     if (weights) w = op_detail::host_floats(weights);
     if (weights && w.size() != v.size()) throw std::invalid_argument("bincount: one weight per element is needed");
+    if (!weights) op_detail::check_float_count(x->size(), "bincount");
     int64_t n = minlength;
     for (float f : v) {
-        if (f < 0.0f) throw std::invalid_argument("bincount: values must be non-negative integers");
+        // Also NaN and values too large to be ids, which would make the cast below undefined
+        if (!(f >= 0.0f && f <= (float)(int64_t(1) << 24))) throw std::invalid_argument("bincount: values must be integers in [0, 2^24], got " + std::to_string(f));
         n = std::max(n, (int64_t)f + 1);
     }
     std::vector<float> counts((size_t)n, 0.0f);

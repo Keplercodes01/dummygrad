@@ -343,7 +343,30 @@ static std::string sampling() {
     CHECK(near(q, {(float)(std::exp(0.5) / z), (float)(std::exp(-2.0) / z), (float)(1.0 / z)}, 1e-3f));
     o.repetition_penalty = 1.0f;
     const float inf[2] = {INFINITY, 0.0f};
-    return expect_throw([&] { sample_logits(inf, 2, o, {}, 0.5); }, "infinite logits");
+    CHECK(expect_throw([&] { sample_logits(inf, 2, o, {}, 0.5); }, "infinite logits"));
+    // A masked (-inf) token is never drawn, greedy or not
+    const float masked[3] = {-INFINITY, 0.0f, -INFINITY};
+    for (double u : {0.0, 0.5, 0.999}) {
+        if (sample_logits(masked, 3, o, {}, u) != 1) return "drew a masked token";
+    }
+    const float none[2] = {-INFINITY, -INFINITY}, nan[3] = {0.0f, NAN, 1.0f};
+    CHECK(expect_throw([&] { sample_logits(none, 2, o, {}, 0.5); }, "every logit -inf"));
+    CHECK(expect_throw([&] { sample_logits(nan, 3, o, {}, 0.5); }, "a NaN logit"));
+    GenerateOptions bad = o;
+    bad.temperature = 0.0f;
+    CHECK(expect_throw([&] { sample_logits(nan, 3, bad, {}, 0.5); }, "a NaN logit, greedy"));
+    for (int k = 0; k < 5; ++k) {
+        bad = o;
+        if (k == 0) bad.min_p = 1.5f;  // used to remove every candidate
+        if (k == 1) bad.top_p = 1.5f;
+        if (k == 2) bad.top_k = -1;
+        if (k == 3) bad.temperature = NAN;
+        if (k == 4) bad.min_p = -0.1f;
+        CHECK(expect_throw([&] { sample_logits(logits.data(), 4, bad, {}, 0.5); }, "invalid options " + std::to_string(k)));
+    }
+    bad = o;
+    bad.min_p = 1.0f;  // only the most likely token
+    return near(shares(bad, logits), {0, 1, 0, 0}, 1e-3f);
 }
 
 // Against every possible continuation
@@ -394,7 +417,10 @@ static std::string beams() {
     greedy.max_new_tokens = 5;
     greedy.temperature = 0.0f;
     auto a = beam_search(model, id_tensor(prompt, {2}), one)[0].tokens;
-    return near(std::vector<float>(a.begin(), a.end()), generate(model, id_tensor(prompt, {2}), greedy)->to_vector(), 0.0f);
+    CHECK(near(std::vector<float>(a.begin(), a.end()), generate(model, id_tensor(prompt, {2}), greedy)->to_vector(), 0.0f));
+    // NaN logits used to reach std::sort with an invalid comparison
+    model.token_emb.weight->fill_(NAN);
+    return expect_throw([&] { beam_search(model, id_tensor(prompt, {2}), one); }, "NaN logits in beam search");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -763,6 +789,30 @@ static std::string tokenizer_training() {
     if (with.size() != 3 || with[1] != tok.token_id("<|end|>")) return "a special token was not recognized";
     if (tok.decode(with) != "ab" || tok.decode(with, true) != "a<|end|>b") return "decoding special tokens";
     if (tok.encode("<|end|>", /*special=*/false).size() < 3) return "a special token was recognized without being asked for";
+    // Many special tokens, back to back and among words, and the longer of two that start at one place
+    auto two = Tokenizer::train(text, 300, {"<|end|>", "<|end|>!"});
+    int64_t end = two.token_id("<|end|>"), bang = two.token_id("<|end|>!");
+    std::string many;
+    std::vector<int64_t> want;
+    for (int i = 0; i < 200; ++i) {
+        many += i % 3 == 0 ? "<|end|>!" : "<|end|>";
+        want.push_back(i % 3 == 0 ? bang : end);
+        if (i % 2) {
+            many += " the cat";
+            auto words = two.encode(" the cat");
+            want.insert(want.end(), words.begin(), words.end());
+        }
+    }
+    if (two.encode(many) != want) return "a run of special tokens was split differently";
+    // Each word encodes as it does alone (the word cache)
+    std::string repeated;
+    std::vector<int64_t> alone;
+    for (int i = 0; i < 50; ++i) {
+        repeated += " the mat sat";
+        auto w = two.encode(" the mat sat");
+        alone.insert(alone.end(), w.begin(), w.end());
+    }
+    if (two.encode(repeated) != alone) return "repeated words encode differently";
     // The most frequent pair is merged first: "th" or "he" or " t", whichever the count says
     auto tiny = Tokenizer::train("ababab ababab", 257);
     if (tiny.token_id("ab") != 256) return "the first merge is not ab";
@@ -805,6 +855,16 @@ static std::string tokenizer_files() {
     auto got = spm.encode("hi hi\xc3\xa9");
     if (got != std::vector<int64_t>{8, 8, 2, 3}) return "sentencepiece-style ids";
     if (spm.decode(got) != "hi hi\xc3\xa9") return "sentencepiece-style decoding: " + spm.decode(got);
+    // A post_processor naming a token the vocabulary lacks used to put id -1 in every encoding
+    auto templated = [&](const std::string& name) {
+        write_file(dir.path + "/template.json",
+                   "{\"added_tokens\": [], \"normalizer\": null, \"pre_tokenizer\": {\"type\": \"ByteLevel\", \"add_prefix_space\": false, \"use_regex\": true},"
+                   " \"post_processor\": {\"type\": \"TemplateProcessing\", \"single\": [{\"SpecialToken\": {\"id\": \"" + name + "\", \"type_id\": 0}},"
+                   " {\"Sequence\": {\"id\": \"A\", \"type_id\": 0}}]}, \"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 0, \"b\": 1}, \"merges\": []}}");
+        return Tokenizer::from_file(dir.path + "/template.json");
+    };
+    if (templated("b").encode("a") != std::vector<int64_t>{1, 0}) return "a post_processor token";
+    CHECK(expect_throw([&] { templated("<missing>"); }, "a post_processor token missing from the vocabulary"));
     write_file(dir.path + "/bad.json", "{\"model\": {\"type\": \"WordPiece\"}}");
     return expect_throw([&] { Tokenizer::from_file(dir.path + "/bad.json"); }, "an unsupported tokenizer");
 }
@@ -870,7 +930,34 @@ static std::string lora() {
     bool differs = false;
     auto y = l.forward(x);
     for (int k = 0; k < 20; ++k) differs = differs || !near(l.forward(x), y, 1e-6f).empty();
-    return differs ? "" : "LoRA dropout never dropped";
+    if (!differs) return "LoRA dropout never dropped";
+
+    // Merging into a half-precision weight (model.to(device, Float16)) used to throw on the dtype
+    for (Device d : devices()) {
+        Linear h(4, 3);
+        h.enable_lora(2, 2.0f);
+        h.lora_B->fill_(0.25f);
+        h.to(d, DType::Float16);
+        auto xd = ones({2, 4})->to(d);
+        auto adapted = h.forward(xd)->detach();
+        h.merge_lora();
+        if (h.W->dtype != DType::Float16 || h.lora_A) return "merge_lora changed the weight's dtype or kept the adapter";
+        CHECK(near(h.forward(xd), adapted, 1e-2f, 1e-2f));
+    }
+    // Under autocast, an adapted layer's output stays in half precision, so attention after it does too
+    if (has_cuda()) {
+        Linear g(8, 6);
+        g.enable_lora(2, 2.0f);
+        g.lora_B->fill_(0.1f);
+        g.to(Device::CUDA);
+        auto xc = randn({3, 8}, Device::CUDA, DType::Float32, false);
+        auto full = g.forward(xc)->detach();
+        AutocastGuard ac(DType::Float16);
+        auto half = g.forward_autocast(xc);
+        if (half->dtype != DType::Float16) return "an adapted layer under autocast returned fp32";
+        CHECK(near(half, full, 2e-2f, 2e-2f));
+    }
+    return "";
 }
 
 static std::string no_bias_linear() {

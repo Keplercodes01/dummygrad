@@ -28,9 +28,14 @@ public:
         return lora_A ? add(y, lora_delta(x)) : y;
     }
 
-    // Under autocast on a GPU, the output stays in the autocast dtype; otherwise the same as forward
+    // Under autocast on a GPU, the output stays in the autocast dtype; otherwise the same as forward.
+    // With an adapter, the sum is formed in fp32 (there is no half-precision add) and rounded once, so
+    // the ops that follow (attention on adapted W_q, W_v) still run in half precision.
     std::shared_ptr<Tensor> forward_autocast(const std::shared_ptr<Tensor>& x) {
-        return lora_A ? forward(x) : linear(x, W, b, autocast_dtype());
+        DType ac = autocast_dtype();
+        if (!lora_A) return linear(x, W, b, ac);
+        auto y = forward(x);
+        return (y->device == Device::CUDA && ac != DType::Float32) ? cast(y, ac) : y;
     }
 
     // Adds an adapter of the given rank; B starts at zero, so the output does not change until it trains
@@ -50,11 +55,13 @@ public:
         lora_dropout = dropout_p;
     }
 
-    // Adds the adapter into W and removes it
+    // Adds the adapter into W and removes it. The sum is formed in fp32 and rounded once to W's dtype.
     void merge_lora() {
         if (!lora_A) return;
         NoGradGuard no_grad;
-        ops::make_contiguous(*W, *add(W, mul_scalar(matmul(lora_A, lora_B), lora_scale)));
+        auto merged = add(W, mul_scalar(matmul(float32_input(lora_A), float32_input(lora_B)), lora_scale));
+        if (merged->dtype != W->dtype) merged = merged->to(W->device, W->dtype);
+        ops::make_contiguous(*W, *merged);
         lora_A = lora_B = nullptr;
     }
 
@@ -69,7 +76,8 @@ public:
 
 private:
     std::shared_ptr<Tensor> lora_delta(const std::shared_ptr<Tensor>& x) {
+        // Scaled at rank width, the narrowest point
         auto in = dropout(x, lora_dropout, training_);
-        return mul_scalar(matmul(matmul(in, lora_A), lora_B), lora_scale);
+        return matmul(mul_scalar(matmul(in, lora_A), lora_scale), lora_B);
     }
 };
