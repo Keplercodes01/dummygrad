@@ -72,6 +72,18 @@ int64_t room_for(const Model& model, int64_t prompt, int64_t wanted, const char*
     return std::min<int64_t>(wanted, model.max_seq_len - prompt + 1);
 }
 
+// Logits may be -inf (a masked token) but not NaN or +inf, and some token must be possible
+inline void check_logits(const float* l, int64_t vocab, const char* who) {
+    bool possible = false;
+    for (int64_t t = 0; t < vocab; ++t) {
+        if (std::isnan(l[t]) || l[t] == std::numeric_limits<float>::infinity()) {
+            throw std::runtime_error(std::string(who) + ": logit " + std::to_string(t) + " is " + std::to_string(l[t]));
+        }
+        possible = possible || l[t] > -std::numeric_limits<float>::infinity();
+    }
+    if (!possible) throw std::runtime_error(std::string(who) + ": every logit is -inf");
+}
+
 inline TensorPtr id_column(const std::vector<int64_t>& ids, Device device) {
     std::vector<float> f(ids.begin(), ids.end());
     return op_detail::from_values(f, {(int64_t)ids.size(), 1}, device);
@@ -81,7 +93,12 @@ inline TensorPtr id_column(const std::vector<int64_t>& ids, Device device) {
 
 // Draws a token from one row of logits. u is uniform on [0, 1); seen lists the tokens to penalize.
 inline int64_t sample_logits(const float* logits, int64_t vocab, const GenerateOptions& o, const std::vector<int64_t>& seen, double u) {
-    if (o.temperature < 0.0f || o.repetition_penalty <= 0.0f) throw std::invalid_argument("generate: temperature must be >= 0 and repetition_penalty > 0");
+    // Written so that NaN options fail too
+    if (!(o.temperature >= 0.0f) || !(o.repetition_penalty > 0.0f)) throw std::invalid_argument("generate: temperature must be >= 0 and repetition_penalty > 0");
+    if (!(o.min_p >= 0.0f && o.min_p <= 1.0f) || !(o.top_p >= 0.0f && o.top_p <= 1.0f) || o.top_k < 0) {
+        throw std::invalid_argument("generate: min_p and top_p must be in [0, 1] and top_k >= 0");
+    }
+    if (vocab < 1) throw std::invalid_argument("generate: no logits");
     std::vector<float> l(logits, logits + vocab);
     if (o.repetition_penalty != 1.0f) {
         std::vector<char> done((size_t)vocab, 0);
@@ -91,6 +108,7 @@ inline int64_t sample_logits(const float* logits, int64_t vocab, const GenerateO
             l[(size_t)t] = l[(size_t)t] > 0.0f ? l[(size_t)t] / o.repetition_penalty : l[(size_t)t] * o.repetition_penalty;
         }
     }
+    generate_detail::check_logits(l.data(), vocab, "generate");  // after the penalty, which can overflow
     if (o.temperature == 0.0f || o.top_k == 1) return (int64_t)(std::max_element(l.begin(), l.end()) - l.begin());
 
     // Candidates: (probability, token), the most likely ones when top_k asks for them
@@ -101,12 +119,13 @@ inline int64_t sample_logits(const float* logits, int64_t vocab, const GenerateO
         std::nth_element(c.begin(), c.begin() + o.top_k, c.end(), better);
         c.resize((size_t)o.top_k);
     }
+    // Finite: check_logits saw a finite logit, and the k kept include the largest
     double top = -std::numeric_limits<double>::infinity();
     for (const auto& p : c) top = std::max(top, p.first);
-    if (!std::isfinite(top)) throw std::runtime_error("generate: the logits are not finite");
     double total = 0.0;
     for (auto& p : c) total += p.first = std::exp((p.first - top) / (double)o.temperature);
     if (o.min_p > 0.0f) {
+        // The most likely token has weight 1 >= min_p, so at least one stays
         c.erase(std::remove_if(c.begin(), c.end(), [&](const auto& p) { return p.first < (double)o.min_p; }), c.end());
         total = 0.0;
         for (const auto& p : c) total += p.first;
@@ -132,6 +151,10 @@ inline int64_t sample_logits(const float* logits, int64_t vocab, const GenerateO
     for (const auto& p : c) {
         sum += p.first;
         if (target < sum) return p.second;
+    }
+    // Rounding left target past the sum: the last token that can be drawn
+    for (auto it = c.rbegin(); it != c.rend(); ++it) {
+        if (it->first > 0.0) return it->second;
     }
     return c.back().second;
 }
@@ -225,6 +248,7 @@ std::vector<BeamResult> beam_search(Model& model, const std::shared_ptr<Tensor>&
         size_t keep = (size_t)o.num_beams * (1 + o.eos.size());
         for (size_t b = 0; b < beams.size(); ++b) {
             const float* row = logits.data() + (int64_t)b * vocab;
+            generate_detail::check_logits(row, vocab, "beam_search");  // NaN would break the sorts below
             double top = (double)*std::max_element(row, row + vocab), sum = 0.0;
             for (int64_t t = 0; t < vocab; ++t) sum += std::exp((double)row[t] - top);
             double log_total = top + std::log(sum);

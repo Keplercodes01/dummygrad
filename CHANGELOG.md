@@ -4,6 +4,12 @@ All notable changes to dummygrad are documented here. Versions follow [Semantic 
 
 ## [Unreleased]
 
+### Fixed
+- **Sampling:** `min_p` above 1 removed every candidate and then read an empty list (undefined behaviour). `sample_logits` now requires `min_p` and `top_p` in [0, 1], `top_k >= 0` and options that are not NaN, and throws on NaN or +inf logits instead of returning the last token (greedy decoding skipped NaN). `-inf` logits (masked tokens) are allowed and never drawn. `beam_search` throws on NaN logits, which used to reach `std::sort` with an invalid comparison.
+- **LoRA under autocast:** an adapted layer returned fp32, so attention after adapted `W_q`/`W_v` ran Q, K and V in fp32. Its output is now rounded to the autocast dtype like an unadapted layer's. The adapter is scaled at rank width, not output width. `merge_lora` on a half-precision weight (after `model.to(device, Float16)`) threw on the dtype; the merge is now formed in fp32 and rounded once.
+- **Tokenizer:** a `post_processor` naming a token missing from the vocabulary put id -1 at the start of every encoding; it now throws when the file is read, and reads the template's `special_tokens` ids when given. Finding special tokens searched the rest of the text again after every match (quadratic in the number of matches); each token's search now moves forward once. Repeated words are merged once per `encode` call (a bounded word cache).
+- **Positions as floats:** `nonzero`, `masked_select`, `unique`, `searchsorted`, `bincount`, `randperm` and `multinomial` throw past 2^24, where float32 positions and counts round, instead of returning rounded positions. `unique` treats NaN as one value, the largest (its sort used an invalid comparison); `bincount` rejects NaN and values past 2^24 (the cast was undefined).
+
 ## [0.9.0] - 2026-11-25
 
 The research release: higher-order autograd, the op, layer, optimizer, linear-algebra, FFT and distribution libraries of a research framework, and a threaded CPU backend. On a Kaggle T4, training steps in fp16 are 21 to 24% faster than in v0.8.0 from 3.9M parameters up, with 20% less memory; fp32 steps and the tiny model are within 2%. On a Kaggle T4 x2, `test_research` (985 checks, including about 240 ops, 13 optimizers and several whole modules on CUDA against the CPU), `test_engine` (269, including the two-GPU test) and `test_models` (22) pass.

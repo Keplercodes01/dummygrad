@@ -61,6 +61,8 @@ inline TensorPtr randint(int64_t lo, int64_t hi, const std::vector<int64_t>& sha
 }
 // A random permutation of 0 .. n - 1
 inline TensorPtr randperm(int64_t n, Device device = Device::CPU) {
+    if (n < 0) throw std::invalid_argument("randperm: n must be >= 0");
+    op_detail::check_float_count(n, "randperm");
     std::mt19937_64 rng((uint64_t)random_state().seed * 0x9e3779b97f4a7c15ULL + next_random_stream());
     std::vector<float> p((size_t)n);
     for (int64_t i = 0; i < n; ++i) p[(size_t)i] = (float)i;
@@ -81,6 +83,7 @@ inline TensorPtr multinomial(const TensorPtr& weights_in, int64_t num, bool repl
     auto w = op_detail::dense(weights_in);
     if (w->ndim() < 1) throw std::invalid_argument("multinomial: weights need a class dimension");
     int64_t classes = w->shape.back(), rows = w->size() / std::max<int64_t>(1, classes);
+    op_detail::check_float_count(classes, "multinomial");
     if (!replacement) {
         // The largest keys log(w) + Gumbel are a sample without replacement
         if (num > classes) throw std::invalid_argument("multinomial: more draws than classes needs replacement");

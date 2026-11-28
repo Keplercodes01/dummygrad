@@ -247,23 +247,33 @@ public:
     std::vector<int64_t> encode(const std::string& text, bool special = true) const {
         std::vector<int64_t> ids;
         if (special) ids.insert(ids.end(), prefix_.begin(), prefix_.end());
+        WordCache cache;
+        // Where each special token next occurs. A position is searched again only once the text before it
+        // has been consumed, so every token's search moves forward through the text once.
+        std::vector<const std::pair<const std::string, int64_t>*> specials;
+        std::vector<size_t> next_at;
+        if (special) {
+            for (const auto& s : special_) {
+                specials.push_back(&s);
+                next_at.push_back(text.find(s.first));
+            }
+        }
         bool first = true;
         for (size_t i = 0; i < text.size();) {
             // The next special token, and the longest of those that start there
             size_t at = std::string::npos;
             const std::pair<const std::string, int64_t>* found = nullptr;
-            if (special) {
-                for (const auto& s : special_) {
-                    size_t p = text.find(s.first, i);
-                    if (p == std::string::npos) continue;
-                    if (p < at || (p == at && s.first.size() > found->first.size())) {
-                        at = p;
-                        found = &s;
-                    }
+            for (size_t k = 0; k < specials.size(); ++k) {
+                if (next_at[k] != std::string::npos && next_at[k] < i) next_at[k] = text.find(specials[k]->first, i);
+                size_t p = next_at[k];
+                if (p == std::string::npos) continue;
+                if (p < at || (p == at && specials[k]->first.size() > found->first.size())) {
+                    at = p;
+                    found = specials[k];
                 }
             }
             size_t end = found ? at : text.size();
-            if (end > i) encode_plain(text.substr(i, end - i), first, ids);
+            if (end > i) encode_plain(text.substr(i, end - i), first, ids, cache);
             first = false;
             if (!found) break;
             ids.push_back(found->second);
@@ -562,14 +572,42 @@ private:
         for (const auto* v : all) {
             if (v->get_string("type", "") != "TemplateProcessing") continue;
             bool after = false;
+            const json::Value* named = v->find("special_tokens");  // name -> {"ids": [...]}, when given
             for (const auto& part : v->at("single").array) {
-                if (part.has("Sequence")) after = true;
-                else if (const auto* s = part.find("SpecialToken")) (after ? suffix_ : prefix_).push_back(token_id(s->at("id").as_string()));
+                if (part.has("Sequence")) {
+                    after = true;
+                    continue;
+                }
+                const auto* s = part.find("SpecialToken");
+                if (!s) continue;
+                const std::string& name = s->at("id").as_string();
+                auto& out = after ? suffix_ : prefix_;
+                const json::Value* entry = named && named->is_object() ? named->find(name) : nullptr;
+                const json::Value* listed = entry ? entry->find("ids") : nullptr;
+                std::vector<int64_t> found;
+                if (listed && listed->is_array()) {
+                    for (const auto& id : listed->array) found.push_back(id.as_int());
+                } else {
+                    found.push_back(token_id(name));
+                }
+                for (int64_t id : found) {
+                    if (id < 0 || id >= (int64_t)tokens_.size()) {
+                        throw std::runtime_error("Tokenizer: the post_processor adds \"" + name + "\", which is not in the vocabulary");
+                    }
+                    out.push_back(id);
+                }
             }
         }
     }
 
-    void encode_plain(const std::string& text_in, bool first, std::vector<int64_t>& ids) const {
+    // The ids of words already encoded during one call of encode: text repeats words, and merging is the
+    // costly part. Bounded, so that text of few repeats cannot grow it without end.
+    struct WordCache {
+        static constexpr size_t kMaxWords = 1 << 16;
+        std::unordered_map<std::string, std::vector<int64_t>> ids;
+    };
+
+    void encode_plain(const std::string& text_in, bool first, std::vector<int64_t>& ids, WordCache& cache) const {
         using namespace tokenizer_detail;
         std::string text = text_in;
         if (metaspace_) {
@@ -578,7 +616,16 @@ private:
         } else if (prefix_space_ && text[0] != ' ') {
             text = " " + text;
         }
-        for (const auto& word : splitter_.split(text)) encode_word(word, ids);
+        for (const auto& word : splitter_.split(text)) {
+            auto hit = cache.ids.find(word);
+            if (hit != cache.ids.end()) {
+                ids.insert(ids.end(), hit->second.begin(), hit->second.end());
+                continue;
+            }
+            size_t start = ids.size();
+            encode_word(word, ids);
+            if (cache.ids.size() < WordCache::kMaxWords) cache.ids.emplace(word, std::vector<int64_t>(ids.begin() + (std::ptrdiff_t)start, ids.end()));
+        }
     }
 
     void encode_word(const std::string& word, std::vector<int64_t>& ids) const {
