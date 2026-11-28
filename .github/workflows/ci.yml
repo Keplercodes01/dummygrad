@@ -70,6 +70,55 @@ jobs:
             $bench/dg_bench tiny && $bench/dg_bench small --seconds 5
           done
 
+  # The CPU suites built with sanitizers: memory errors and leaks (ASan), undefined behaviour
+  # (UBSan: overflow, bad casts such as NaN to an integer, misalignment), and data races between
+  # the thread pool, the Prefetcher and the backward workers (TSan). Without a BLAS, so that every
+  # matrix product is instrumented too (OpenBLAS's own threads would be false races for TSan).
+  sanitizers:
+    name: ubuntu-latest (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ASan + UBSan
+            flags: -fsanitize=address,undefined
+          - name: TSan
+            flags: -fsanitize=thread
+    env:
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1:detect_stack_use_after_return=1
+      UBSAN_OPTIONS: print_stacktrace=1
+      TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+      DUMMYGRAD_NUM_THREADS: 4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_CUDA=OFF -DDUMMYGRAD_USE_BLAS=OFF
+          -DDUMMYGRAD_BUILD_EXAMPLES=OFF -DDUMMYGRAD_BUILD_BENCHMARKS=OFF
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          "-DCMAKE_CXX_FLAGS=${{ matrix.flags }} -fno-omit-frame-pointer -g"
+          "-DCMAKE_EXE_LINKER_FLAGS=${{ matrix.flags }}"
+
+      - name: Build
+        run: cmake --build build -j 4
+
+      # Every suite runs, and UBSan reports and goes on, so that one finding does not hide the next
+      - name: Test
+        working-directory: build
+        run: |
+          status=0
+          for t in test_engine test_research test_models; do
+            echo "== $t"
+            ./$t 2>&1 | tee $t.log
+            [ "${PIPESTATUS[0]}" = 0 ] || status=1
+            if grep -q "runtime error:" $t.log; then status=1; fi
+          done
+          echo "== UBSan findings"
+          cat *.log | grep -h "runtime error:" | sort | uniq -c | sort -rn || true
+          exit $status
+
   # No GPU on hosted runners: compile the CUDA backend and everything that includes it, so kernel
   # and header errors surface here instead of on a GPU machine. Running it happens on Colab.
   cuda-build:
